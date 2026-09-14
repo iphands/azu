@@ -1,5 +1,6 @@
 #include "rendering/PreviewRenderer.h"
 #include <Eigen/Core>
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 
@@ -104,6 +105,24 @@ void main() {
 }
 )glsl";
 
+const char* PreviewRenderer::CAGE_VERT = R"glsl(
+#version 330 core
+layout(location = 0) in vec3 aPos;
+uniform mat4 uMVP;
+void main() {
+    gl_Position = uMVP * vec4(aPos, 1.0);
+}
+)glsl";
+
+const char* PreviewRenderer::CAGE_FRAG = R"glsl(
+#version 330 core
+uniform vec3 uColor;
+out vec4 FragColor;
+void main() {
+    FragColor = vec4(uColor, 1.0);
+}
+)glsl";
+
 // ---------------------------------------------------------------------------
 
 PreviewRenderer::PreviewRenderer() = default;
@@ -117,6 +136,8 @@ PreviewRenderer::~PreviewRenderer() {
     if (mesh_vbo_pos_) { glDeleteBuffers(1, &mesh_vbo_pos_); }
     if (mesh_vbo_norm_) { glDeleteBuffers(1, &mesh_vbo_norm_); }
     if (mesh_ebo_) { glDeleteBuffers(1, &mesh_ebo_); }
+    if (cage_vao_) { glDeleteVertexArrays(1, &cage_vao_); }
+    if (cage_vbo_) { glDeleteBuffers(1, &cage_vbo_); }
 }
 
 void PreviewRenderer::initialize() {
@@ -128,9 +149,17 @@ void PreviewRenderer::initialize() {
 
     pc_shader_.load(POINTCLOUD_VERT, POINTCLOUD_FRAG);
     mesh_shader_.load(MESH_VERT, MESH_FRAG);
+    cage_shader_.load(CAGE_VERT, CAGE_FRAG);
 
     initPointCloudBuffers();
     initMeshBuffers();
+    initCageBuffers();
+
+    GLfloat lw_range[2] = {1.0f, 1.0f};
+    glGetFloatv(GL_LINE_WIDTH_RANGE, lw_range);
+    // Clamp to avoid INVALID_VALUE; core-profile drivers commonly report [1,1],
+    // so the cage usually stays 1px — real thick outlines need geometry shaders.
+    cage_line_width_ = std::min(2.0f, lw_range[1]);
 
     initialized_ = true;
 }
@@ -155,6 +184,8 @@ void PreviewRenderer::render() {
         // Mesh mode selected but no extraction yet (or empty) — keep showing live depth cloud.
         renderPointCloud();
     }
+
+    renderCage();
 }
 
 void PreviewRenderer::initPointCloudBuffers() {
@@ -320,6 +351,58 @@ void PreviewRenderer::renderMesh() {
     glBindVertexArray(0);
 
     mesh_shader_.disuse();
+}
+
+void PreviewRenderer::setVolumeBox(const Eigen::Vector3f& origin, const Eigen::Vector3f& size) {
+    cage_origin_ = origin;
+    cage_size_   = size;
+}
+
+// 12 cube edges as line segments in unit space; scaled/translated by uMVP.
+static const float CUBE_EDGES[24 * 3] = {
+    0,0,0,  1,0,0,   1,0,0,  1,1,0,   1,1,0,  0,1,0,   0,1,0,  0,0,0,
+    0,0,1,  1,0,1,   1,0,1,  1,1,1,   1,1,1,  0,1,1,   0,1,1,  0,0,1,
+    0,0,0,  0,0,1,   1,0,0,  1,0,1,   1,1,0,  1,1,1,   0,1,0,  0,1,1,
+};
+
+void PreviewRenderer::initCageBuffers() {
+    glGenVertexArrays(1, &cage_vao_);
+    glGenBuffers(1, &cage_vbo_);
+    glBindVertexArray(cage_vao_);
+    glBindBuffer(GL_ARRAY_BUFFER, cage_vbo_);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(CUBE_EDGES), CUBE_EDGES, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
+    glBindVertexArray(0);
+}
+
+void PreviewRenderer::renderCage() {
+    if (!cage_visible_ || !cage_shader_.isValid() || cage_size_.minCoeff() <= 0.0f) return;
+
+    float aspect = static_cast<float>(viewport_w_) / static_cast<float>(viewport_h_);
+    Eigen::Matrix4f V = camera_.viewMatrix();
+    Eigen::Matrix4f P = camera_.projectionMatrix(aspect);
+    const Eigen::Matrix4f F = kinectToOpenGL();
+    Eigen::Matrix4f M = Eigen::Matrix4f::Identity();
+    M(0,0) = cage_size_.x();  M(0,3) = cage_origin_.x();
+    M(1,1) = cage_size_.y();  M(1,3) = cage_origin_.y();
+    M(2,2) = cage_size_.z();  M(2,3) = cage_origin_.z();
+    const Eigen::Matrix4f MVP = P * V * F * M;
+
+    cage_shader_.use();
+    cage_shader_.setUniformMat4("uMVP", MVP.data());
+    if (cage_outside_) cage_shader_.setUniformVec3("uColor", 0.98f, 0.67f, 0.27f);
+    else               cage_shader_.setUniformVec3("uColor", 0.353f, 0.624f, 1.0f);
+
+    glDepthFunc(GL_LEQUAL);
+    glLineWidth(cage_line_width_);
+    glBindVertexArray(cage_vao_);
+    glDrawArrays(GL_LINES, 0, 24);
+    glBindVertexArray(0);
+    glDepthFunc(GL_LESS);
+    glLineWidth(1.0f);
+
+    cage_shader_.disuse();
 }
 
 } // namespace rendering

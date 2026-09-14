@@ -36,6 +36,12 @@ public:
     /** Clear uploaded point cloud and mesh (e.g. after reset scan). */
     void clearGeometry();
 
+    /** TSDF volume cage indicator: min corner and extent (state only, no GL). */
+    void setVolumeBox(const Eigen::Vector3f& origin, const Eigen::Vector3f& size);
+    void setVolumeBoxVisible(bool visible) { cage_visible_ = visible; }
+    /** Amber tint when the tracked camera pose has left the volume. */
+    void setVolumeBoxOutside(bool outside) { cage_outside_ = outside; }
+
     Camera& camera() { return camera_; }
 
 private:
@@ -45,6 +51,15 @@ private:
     bool         initialized_ = false;
 
     Camera  camera_;
+
+    // Volume cage (state valid pre-init; buffers built in initialize())
+    Eigen::Vector3f cage_origin_{0.0f, 0.0f, 0.0f};
+    Eigen::Vector3f cage_size_{0.0f, 0.0f, 0.0f};
+    bool cage_visible_ = true;
+    bool cage_outside_ = false;
+    float cage_line_width_ = 1.0f;
+    unsigned int cage_vao_ = 0, cage_vbo_ = 0;
+    ShaderProgram cage_shader_;
 
     // Point cloud GL objects
     unsigned int pc_vao_ = 0, pc_vbo_pos_ = 0, pc_vbo_col_ = 0;
@@ -58,14 +73,18 @@ private:
 
     void initPointCloudBuffers();
     void initMeshBuffers();
+    void initCageBuffers();
     void renderPointCloud();
     void renderMesh();
+    void renderCage();
 
     // Shader sources
     static const char* POINTCLOUD_VERT;
     static const char* POINTCLOUD_FRAG;
     static const char* MESH_VERT;
     static const char* MESH_FRAG;
+    static const char* CAGE_VERT;
+    static const char* CAGE_FRAG;
 };
 
 } // namespace rendering
