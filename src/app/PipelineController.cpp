@@ -615,6 +615,11 @@ void PipelineController::trackingLoop() {
       metrics_.tracking_fps = (dt > 0.0f) ? (1.0f / dt) : 0.0f;
       metrics_.icp_error = icp_result.error;
       metrics_.tracking_ok = icp_result.tracking_ok;
+      if (icp_result.valid_live_points > 0) {
+          metrics_.icp_overlap_pct = 100.0f * static_cast<float>(icp_result.valid_model_points)
+                                           / static_cast<float>(icp_result.valid_live_points);
+          metrics_.icp_valid_model = icp_result.valid_model_points;
+      }
     }
 
         if (!icp_result.tracking_ok) {

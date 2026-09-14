@@ -39,6 +39,18 @@ struct PipelineMetrics {
     int      integrated_frames  = 0;
     float    icp_error          = 0.0f;
     bool     tracking_ok        = true;
+    // Fraction of live depth points that found a model correspondence this
+    // frame (100*valid_model/valid_live). Range [0,100]; -1 means "ICP has not
+    // run yet" — 0 is a real reading once ICP counted >=1 live point. Two CUDA/
+    // CPU divergences make CUDA read lower at identical geometry: valid_live
+    // counts pre-ref-z-check on GPU, post both checks on CPU; and GPU gates
+    // model normals at ||n||^2>0.9 (ICPTracker_cuda.cu) vs CPU reject-only.
+    // The UI bands are calibrated for CUDA.
+    float    icp_overlap_pct    = -1.0f;
+    // Raw correspondence count driving overlap_pct; UI shows "warming up"
+    // (neutral grey) below ~5000 because a young volume legitimately overlaps
+    // little. -1 = not measured yet.
+    int      icp_valid_model    = -1;
     float    volume_usage_pct   = 0.0f;
     size_t   mesh_triangles     = 0;
     float    mesh_extract_pct   = 0.0f;

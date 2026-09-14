@@ -289,6 +289,11 @@ void MainWindow::updateGlobalStyle() {
         QLabel[status="running"] { color: #4f4; }
         QLabel[status="stopped"] { color: #fa4; }
 
+        QLabel[overlap="good"] { color: #4f4; }
+        QLabel[overlap="warn"] { color: #fa4; }
+        QLabel[overlap="bad"] { color: #f44; }
+        QLabel[overlap="warming"] { color: #888; }
+
         QScrollBar:vertical { background: #1e1f24; width: 10px; }
         QScrollBar::handle:vertical { background: #444; border-radius: 5px; min-height: 20px; }
         QScrollBar::add-line, QScrollBar::sub-line { background: none; }
