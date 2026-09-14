@@ -82,6 +82,13 @@ void TSDFVolume::setParams(const TSDFParams& p) {
     bool resized = (p.resolution != params_.resolution);
     params_ = p;
     if (resized) {
+        // KIN-FORK: extractGlobalPointCloud* allocates d_pc_* scratch lazily
+        // (if(!ptr)) and never resizes -> stale small buffers become OOB once
+        // the volume grows. Drop them so the next extract re-allocates at the
+        // new size (same guard shape as ~TSDFVolume above).
+#if defined(CUDA_ENABLED) || defined(HIP_ENABLED)
+        freeGPU();
+#endif
         size_t total = static_cast<size_t>(params_.resolution) * params_.resolution * params_.resolution;
         voxels_.resize(total);
         unlocked_reset(); // already holding the lock — do NOT call reset() here

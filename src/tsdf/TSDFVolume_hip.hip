@@ -104,6 +104,10 @@ void TSDFVolume::freeGPU() {
     d_voxels_.reset();
     d_pc_is_valid_.reset();
     d_pc_offsets_.reset();
+    // KIN-FORK: points/colors must die with the rest — extractGlobalPointCloudGPU
+    // reallocs via if(!ptr), so surviving old-size buffers mean OOB writes on grow.
+    d_pc_out_points_.reset();
+    d_pc_out_colors_.reset();
     gpu_valid_ = false;
 }
 
