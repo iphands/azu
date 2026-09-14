@@ -1,4 +1,6 @@
 #include <QApplication>
+#include <QColor>
+#include <QPalette>
 #include <QSurfaceFormat>
 #include <QStyleFactory>
 #include <cctype>
@@ -28,7 +30,9 @@ int main(int argc, char* argv[]) {
     fmt.setSwapBehavior(QSurfaceFormat::DoubleBuffer);
     QSurfaceFormat::setDefaultFormat(fmt);
 
-    QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
+    // Qt5 line removed for the Qt6 port: Qt::AA_EnableHighDpiScaling was
+    // removed from Qt — high-DPI scaling is always enabled in Qt 6.
+
     QApplication app(argc, argv);
     app.setApplicationName("KinectFusionQt");
     app.setApplicationVersion("1.0.0");
