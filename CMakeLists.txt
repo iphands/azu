@@ -44,6 +44,15 @@ include(CheckLanguage)
 set(CUDA_AVAILABLE FALSE)
 set(HIP_AVAILABLE  FALSE)
 
+# KIN-FORK: must be defined BEFORE enable_language(CUDA) — otherwise nvcc
+# detection seeds the cache with Turing "75" and every kernel faults on this
+# box's Blackwell/Ada cards as "unsupported toolchain". CACHE without FORCE:
+# -D / build.sh --arch= still win.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 89 120 CACHE STRING
+        "KIN-FORK default: RTX 4060 (89) + Blackwell (120); 120 needs nvcc >= 12.8")
+endif()
+
 if(NOT GPU_BACKEND STREQUAL "CPU")
 
     # ---- HIP / ROCm ----
@@ -90,16 +99,13 @@ endif()
 # ---- Dependency Resolution ----
 find_package(PkgConfig REQUIRED)
 
-list(APPEND CMAKE_PREFIX_PATH "/usr/lib64/cmake/Qt5" "/usr/lib/cmake/Qt5")
-find_package(Qt5 QUIET COMPONENTS Widgets OpenGL)
-if(NOT Qt5_FOUND)
-    pkg_check_modules(QT5_COMPONENTS QUIET Qt5Widgets Qt5OpenGL)
-    if(QT5_COMPONENTS_FOUND)
-        message(STATUS "Qt5 found via pkg-config")
-        set(Qt5_FOUND TRUE)
-    else()
-        message(FATAL_ERROR "Qt5 not found. Install qt5-qtbase-devel.")
-    endif()
+# Qt6 (Qt5 support dropped: Gentoo no longer ships Qt5; OpenGLWidgets is a
+# separate module in Qt6 — QOpenGLWidget moved out of Qt::OpenGL)
+find_package(Qt6 6.2 QUIET COMPONENTS Widgets OpenGL OpenGLWidgets)
+if(NOT Qt6_FOUND)
+    message(FATAL_ERROR
+        "Qt6 not found. On Gentoo: emerge dev-qt/qtbase with USE=\"widgets opengl\" "
+        "(Qt6::OpenGLWidgets ships inside qtbase).")
 endif()
 
 set(CMAKE_AUTOMOC ON)
@@ -110,8 +116,9 @@ pkg_check_modules(FREENECT QUIET libfreenect)
 if(FREENECT_FOUND)
     add_compile_definitions(HAVE_FREENECT)
     message(STATUS "libfreenect found — Kinect capture enabled")
+    set(KINECT_IO_SUMMARY "TRUE")
 else()
-    message(WARNING "libfreenect not found — building without Kinect capture")
+    set(KINECT_IO_SUMMARY "FALSE — sensorless build (install libfreenect + cmake --install, ensure pkg-config finds libfreenect.pc, reconfigure)")
 endif()
 
 find_package(OpenGL REQUIRED)
@@ -194,8 +201,9 @@ endif()
 
 # ---- Link Libraries ----
 target_link_libraries(KinectFusionQt PRIVATE
-    Qt5::Widgets
-    Qt5::OpenGL
+    Qt6::Widgets
+    Qt6::OpenGL
+    Qt6::OpenGLWidgets
     ${OPENGL_LIBRARIES}
     ${FREENECT_LIBRARIES}
     Threads::Threads
