@@ -56,6 +56,16 @@ void MetricsPanel::setupUI() {
     g_track->addWidget(new QLabel("ICP Error:", this), 1, 0);
     lbl_icp_error_ = makeLabel("--");
     g_track->addWidget(lbl_icp_error_, 1, 1);
+
+    g_track->addWidget(new QLabel("Overlap:", this), 2, 0);
+    lbl_icp_overlap_ = makeLabel("--");
+    lbl_icp_overlap_->setProperty("class", "StatusLabel");
+    lbl_icp_overlap_->setToolTip(tr(
+        "Share of live depth points that matched the model.\n"
+        ">40% healthy · 10–40% losing grip · <10% tracking will drop.\n"
+        "Recovering: slow down, re-aim at geometry you already scanned, and stay inside\n"
+        "the blue capture-volume box."));
+    g_track->addWidget(lbl_icp_overlap_, 2, 1);
     root->addWidget(grp_track);
 
     // Volume group
@@ -123,6 +133,25 @@ void MetricsPanel::update(const app::PipelineMetrics& m) {
     lbl_volume_usage_->setText(QString::number(m.volume_usage_pct, 'f', 1) + " %");
     lbl_mesh_triangles_->setText(QString::number(m.mesh_triangles));
     lbl_icp_error_->setText(QString::number(m.icp_error, 'f', 4));
+
+    QString overlap_text;
+    const char* overlap_band;
+    if (m.icp_overlap_pct < 0.0f) {
+        overlap_text = "--";
+        overlap_band = "warming";
+    } else if (m.icp_valid_model < 5000) {
+        overlap_text = QStringLiteral("building… %1k")
+                           .arg(m.icp_valid_model / 1000.0, 0, 'f', 1);
+        overlap_band = "warming";
+    } else {
+        overlap_text = QString::number(m.icp_overlap_pct, 'f', 0) + " %";
+        overlap_band = m.icp_overlap_pct > 40.0f ? "good"
+                     : m.icp_overlap_pct > 10.0f ? "warn" : "bad";
+    }
+    lbl_icp_overlap_->setText(overlap_text);
+    lbl_icp_overlap_->setProperty("overlap", overlap_band);
+    lbl_icp_overlap_->style()->unpolish(lbl_icp_overlap_);
+    lbl_icp_overlap_->style()->polish(lbl_icp_overlap_);
 
     bar_volume_->setValue(static_cast<int>(m.volume_usage_pct));
     bar_mesh_extract_->setValue(static_cast<int>(m.mesh_extract_pct));

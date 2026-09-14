@@ -21,6 +21,7 @@ private:
     QLabel*       lbl_frame_count_       = nullptr;
     QLabel*       lbl_tracking_status_   = nullptr;
     QLabel*       lbl_icp_error_         = nullptr;
+    QLabel*       lbl_icp_overlap_       = nullptr;
     QLabel*       lbl_integrated_frames_ = nullptr;
     QLabel*       lbl_volume_usage_      = nullptr;
     QLabel*       lbl_mesh_triangles_    = nullptr;
