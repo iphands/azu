@@ -86,6 +86,8 @@ public:
     /** Thread-safe copy for UI / diagnostics (locks internal metrics mutex). */
     PipelineMetrics metricsSnapshot() const;
     PipelineState state() const { return state_.load(); }
+    /** Copy of live camera pose (locks pose_mutex_); for cage-color UI at timer rate. */
+    Eigen::Matrix4f currentPose() const;
 
     FusionHyperparams hyperparamsSnapshot() const;
     void              setHyperparams(const FusionHyperparams& h);
@@ -115,7 +117,7 @@ private:
     std::atomic<PipelineState> state_{PipelineState::Idle};
     Eigen::Matrix4f            current_pose_;
     Eigen::Matrix4f            last_pose_{Eigen::Matrix4f::Identity()};
-    std::mutex                 pose_mutex_;
+    mutable std::mutex         pose_mutex_;
 
     // Metrics
     PipelineMetrics            metrics_;

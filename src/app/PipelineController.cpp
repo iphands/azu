@@ -61,7 +61,10 @@ bool PipelineController::start() {
     lost_log_counter_     = 0;
     success_log_counter_  = 0;
     hip_ui_skip_          = 0;
-    current_pose_  = Eigen::Matrix4f::Identity();
+    {
+        std::lock_guard<std::mutex> lk(pose_mutex_);
+        current_pose_  = Eigen::Matrix4f::Identity();
+    }
     // Set frame callback before starting capture
     sensor_->setFrameCallback([this](std::shared_ptr<sensor::RawFrame> raw) {
         onRawFrame(std::move(raw));
@@ -176,6 +179,11 @@ PipelineMetrics PipelineController::metricsSnapshot() const {
   PipelineMetrics m = metrics_;
   m.state = state_.load();
   return m;
+}
+
+Eigen::Matrix4f PipelineController::currentPose() const {
+  std::lock_guard<std::mutex> lk(pose_mutex_);
+  return current_pose_;
 }
 
 FusionHyperparams PipelineController::hyperparamsSnapshot() const {
