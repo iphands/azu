@@ -51,9 +51,18 @@ private:
 
     QTimer* metrics_timer_ = nullptr;
 
+    Eigen::Vector3f cage_origin_{0.0f, 0.0f, 0.0f};
+    Eigen::Vector3f cage_size_{0.0f, 0.0f, 0.0f};
+    // Amber fires only after N consecutive outside ticks, inset by margin so a
+    // pose on the boundary face (identity start sits on the Z=0 default face)
+    // doesn't trip; latch holds through TrackingLost until pose re-enters.
+    float cage_exit_margin_ = 0.15f;
+    int   cage_out_streak_  = 0;
+
     void setupUI();
     void connectSignals();
     void updateGlobalStyle();
+    void applyVolumeCage(const app::FusionHyperparams& h);
 
     float ui_scale_ = 1.0f;
     void keyPressEvent(QKeyEvent* event) override;
