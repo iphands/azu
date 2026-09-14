@@ -3,6 +3,8 @@
 #include "gui/MetricsPanel.h"
 #include "gui/ControlPanel.h"
 
+#include <Eigen/Core>
+
 #include <QSplitter>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
@@ -78,6 +80,8 @@ void MainWindow::connectSignals() {
     connect(control_panel_, &ControlPanel::exportPLYClicked, this, &MainWindow::onExportPLY);
     connect(control_panel_, &ControlPanel::exportGLBClicked, this, &MainWindow::onExportGLB);
     connect(control_panel_, &ControlPanel::modeChanged, this, &MainWindow::onModeChanged);
+    connect(control_panel_, &ControlPanel::volumeCageToggled,
+            gl_widget_, &OpenGLWidget::setVolumeBoxVisible);
     connect(control_panel_, &ControlPanel::threadsChanged, this, [this](int n) {
         if (pipeline_) pipeline_->setNumThreads(n);
     });
@@ -96,6 +100,7 @@ void MainWindow::connectSignals() {
         }
         pipeline_->setHyperparams(h);
         control_panel_->setHyperparams(pipeline_->hyperparamsSnapshot());
+        applyVolumeCage(pipeline_->hyperparamsSnapshot());
         statusBar()->showMessage("Hyperparameters applied.");
     });
 
@@ -110,6 +115,7 @@ void MainWindow::connectSignals() {
     });
 
     control_panel_->setHyperparams(pipeline_->hyperparamsSnapshot());
+    applyVolumeCage(pipeline_->hyperparamsSnapshot());
 }
 
 void MainWindow::onStartClicked() {
@@ -216,6 +222,22 @@ void MainWindow::onMetricsTimer() {
     if (!pipeline_ || !metrics_panel_) return;
     app::PipelineMetrics m = pipeline_->metricsSnapshot();
     metrics_panel_->update(m);
+
+    const Eigen::Vector3f pos = pipeline_->currentPose().block<3, 1>(0, 3);
+    const Eigen::Vector3f margin = Eigen::Vector3f::Constant(cage_exit_margin_);
+    const bool inside = (pos.array() >= (cage_origin_ - margin).array()).all()
+                     && (pos.array() <= (cage_origin_ + cage_size_ + margin).array()).all();
+    if (m.state == app::PipelineState::Running)
+        cage_out_streak_ = inside ? 0 : (cage_out_streak_ < 99 ? cage_out_streak_ + 1 : 99);
+    if (gl_widget_)
+        gl_widget_->setVolumeBoxOutside(cage_out_streak_ >= 3);
+}
+
+void MainWindow::applyVolumeCage(const app::FusionHyperparams& h) {
+    cage_origin_ = h.tsdf.origin;
+    const float extent = static_cast<float>(h.tsdf.resolution) * h.tsdf.voxel_size;
+    cage_size_ = Eigen::Vector3f(extent, extent, extent);
+    if (gl_widget_) gl_widget_->setVolumeBox(cage_origin_, cage_size_);
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
