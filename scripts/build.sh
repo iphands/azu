@@ -3,7 +3,7 @@
 # scripts/build.sh — KinectFusionQt build helper
 #
 # Usage:
-#   ./scripts/build.sh [--hip|--cuda|--cpu] [--debug] [--clean] [-j N]
+#   ./scripts/build.sh [--hip|--cuda|--cpu] [--debug] [--clean] [-jN] [--arch=A.B]
 #
 # Options:
 #   --hip     Force HIP/ROCm back-end (AMD GPU)
@@ -12,9 +12,13 @@
 #   (none)    AUTO: prefer HIP, fall back to CUDA, then CPU
 #   --debug   Debug build (no optimisations)
 #   --clean   Wipe the build directory before configuring
-#   -j N      Parallelism (default: nproc)
+#   -jN       Parallelism, no space (default: min(nproc, 28))
 # ============================================================
 set -euo pipefail
+
+# KIN-FORK: this box installs libfreenect.pc under /usr/local, absent from
+# Gentoo's default pkg-config search path.
+export PKG_CONFIG_PATH="/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -22,7 +26,8 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 BACKEND="AUTO"
 BUILD_TYPE="Release"
 CLEAN=0
-JOBS=$(nproc)
+JOBS=$(( $(nproc) > 28 ? 28 : $(nproc) ))
+EXTRA_CMAKE_ARGS=()
 
 for arg in "$@"; do
     case "$arg" in
@@ -32,6 +37,7 @@ for arg in "$@"; do
         --debug)  BUILD_TYPE="Debug" ;;
         --clean)  CLEAN=1         ;;
         -j*)      JOBS="${arg#-j}" ;;
+        --arch=*) EXTRA_CMAKE_ARGS+=(-DCMAKE_CUDA_ARCHITECTURES="${arg#--arch=}") ;;
         *)  echo "Unknown option: $arg"; exit 1 ;;
     esac
 done
@@ -63,7 +69,8 @@ cd "$BUILD_DIR"
 cmake "$PROJECT_ROOT" \
     -G Ninja \
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-    -DGPU_BACKEND="$BACKEND"
+    -DGPU_BACKEND="$BACKEND" \
+    "${EXTRA_CMAKE_ARGS[@]}"
 
 ninja -j "$JOBS"
 
