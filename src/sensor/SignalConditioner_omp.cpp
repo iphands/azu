@@ -3,6 +3,7 @@
 #include "sensor/FrameData.h"
 #include "sensor/KinectSensor.h"
 #include "sensor/SuperResolution.h"
+#include "utils/Logger.h"
 
 #include <algorithm>
 #include <array>
@@ -329,6 +330,13 @@ void SignalConditioner::applySuperResolutionToRgb(const std::vector<uint8_t>& rg
     // Apply EASU upscaling + RCAS sharpening for TSDF texturing
     // This is separate from guidance to avoid resolution mismatch
     if (sr_scale_ > 1) {
+#ifdef CUDA_ENABLED
+        static const bool sr_warned = [] {
+            KFLOG_WARN("SR", "EASU upscaling falls back to CPU on the CUDA backend (GPU EASU exists only on HIP)");
+            return true;
+        }();
+        (void)sr_warned;
+#endif
         // EASU upscaling
         std::vector<uint8_t> upscaled;
         sr::applyEASU(rgb, upscaled, FRAME_W, FRAME_H, sr_scale_);
