@@ -3,6 +3,7 @@
 #include <QVariant>
 #include <QPushButton>
 #include <QComboBox>
+#include <QCheckBox>
 #include <QSpinBox>
 #include <QDoubleSpinBox>
 #include <QLabel>
@@ -75,13 +76,22 @@ void ControlPanel::setupUI() {
     inner_layout->setSpacing(10);
     inner_layout->setContentsMargins(0, 0, 6, 0);
 
-    // 2. Preview Mode
-    auto* grp_mode = new QGroupBox("Preview Mode", inner);
+    // 2. Viewport
+    auto* grp_mode = new QGroupBox("Viewport", inner);
     auto* v_mode = new QVBoxLayout(grp_mode);
     combo_mode_ = new QComboBox(grp_mode);
     combo_mode_->addItem("Point Cloud");
     combo_mode_->addItem("Mesh");
     v_mode->addWidget(combo_mode_);
+    chk_volume_cage_ = new QCheckBox("Capture volume", grp_mode);
+    chk_volume_cage_->setToolTip(tr(
+        "Shows the box your scan is kept inside. Nothing is reconstructed outside it.\n"
+        "The box turns amber when the sensor leaves it — move back in, or enlarge it\n"
+        "under Hyperparameters (size = resolution × voxel size)."));
+    // Ordering load-bearing: setChecked before connectSignals() wires toggled keeps
+    // checkbox/widget/renderer defaults (all true) in sync with no startup signal.
+    chk_volume_cage_->setChecked(true);
+    v_mode->addWidget(chk_volume_cage_);
     inner_layout->addWidget(grp_mode);
 
     // 3. Camera Controls
@@ -231,6 +241,8 @@ void ControlPanel::connectSignals() {
     connect(btn_glb_,   &QPushButton::clicked, this, &ControlPanel::exportGLBClicked);
     connect(combo_mode_, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &ControlPanel::modeChanged);
+    connect(chk_volume_cage_, &QCheckBox::toggled,
+            this, &ControlPanel::volumeCageToggled);
     connect(spin_threads_, QOverload<int>::of(&QSpinBox::valueChanged),
             this, &ControlPanel::threadsChanged);
     connect(btn_apply_hyper_, &QPushButton::clicked, this, &ControlPanel::hyperparamsApplyClicked);

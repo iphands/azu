@@ -57,6 +57,32 @@ void OpenGLWidget::clearGeometry() {
     update();
 }
 
+void OpenGLWidget::setVolumeBox(const Eigen::Vector3f& origin, const Eigen::Vector3f& size) {
+    cage_origin_ = origin;
+    cage_size_   = size;
+    if (renderer_) {
+        renderer_->setVolumeBox(origin, size);
+        update();
+    }
+}
+
+void OpenGLWidget::setVolumeBoxVisible(bool visible) {
+    cage_visible_ = visible;
+    if (renderer_) {
+        renderer_->setVolumeBoxVisible(visible);
+        update();
+    }
+}
+
+void OpenGLWidget::setVolumeBoxOutside(bool outside) {
+    if (outside == cage_outside_) return;  // 5 Hz poller: repaint only on real transitions
+    cage_outside_ = outside;
+    if (renderer_) {
+        renderer_->setVolumeBoxOutside(outside);
+        update();
+    }
+}
+
 void OpenGLWidget::setCameraRotation(int pitch, int yaw, int roll) {
     if (!renderer_) return;
     auto& cam = renderer_->camera();
@@ -70,6 +96,9 @@ void OpenGLWidget::initializeGL() {
     initializeOpenGLFunctions();
     renderer_ = std::make_unique<rendering::PreviewRenderer>();
     renderer_->initialize();
+    renderer_->setVolumeBox(cage_origin_, cage_size_);
+    renderer_->setVolumeBoxVisible(cage_visible_);
+    renderer_->setVolumeBoxOutside(cage_outside_);
 }
 
 void OpenGLWidget::resizeGL(int w, int h) {

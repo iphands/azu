@@ -11,6 +11,7 @@ class QDoubleSpinBox;
 class QLabel;
 class QSlider;
 class QGroupBox;
+class QCheckBox;
 QT_END_NAMESPACE
 
 namespace kfusion {
@@ -33,6 +34,7 @@ signals:
     void exportPLYClicked();
     void exportGLBClicked();
     void modeChanged(int index); // 0=PointCloud, 1=Mesh
+    void volumeCageToggled(bool visible);
     void threadsChanged(int n);
     void hyperparamsApplyClicked();
     void cameraRotationChanged(int pitch, int yaw, int roll);
@@ -51,6 +53,7 @@ private:
     QPushButton* btn_ply_    = nullptr;
     QPushButton* btn_glb_    = nullptr;
     QComboBox*   combo_mode_ = nullptr;
+    QCheckBox*   chk_volume_cage_ = nullptr;
     QSpinBox*    spin_threads_ = nullptr;
     QLabel*      lbl_status_ = nullptr;
     QComboBox*   combo_presets_ = nullptr;

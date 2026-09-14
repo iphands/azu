@@ -25,6 +25,10 @@ public:
     void updateMesh(const meshing::MeshData& mesh);
     void clearGeometry();
 
+    void setVolumeBox(const Eigen::Vector3f& origin, const Eigen::Vector3f& size);
+    void setVolumeBoxVisible(bool visible);
+    void setVolumeBoxOutside(bool outside);
+
 signals:
     void cameraRotated(int pitch, int yaw, int roll);
 
@@ -48,6 +52,13 @@ private slots:
 
 private:
     std::unique_ptr<rendering::PreviewRenderer> renderer_;
+
+    // Volume-cage state cache: MainWindow pushes the box before initializeGL
+    // creates renderer_; flush to renderer_ at creation time.
+    Eigen::Vector3f cage_origin_{0.0f, 0.0f, 0.0f};
+    Eigen::Vector3f cage_size_{0.0f, 0.0f, 0.0f};
+    bool cage_visible_ = true;
+    bool cage_outside_ = false;
     QPoint last_mouse_pos_;
     bool   mouse_pressed_ = false;
     Qt::MouseButton pressed_button_ = Qt::NoButton;
