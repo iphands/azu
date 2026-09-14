@@ -757,6 +757,64 @@ void PipelineController::integrationLoop() {
       int back = model_buffers_.back_idx.load();
       auto &model_back = *(model_buffers_.buffers[back]);
 
+#ifndef HIP_ENABLED
+      // KIN-FORK(cpu-preview): Upstream defines this block only in the non-GPU
+      // #else branch and reaches it from the CUDA branch via `goto cpu_raycast`,
+      // whose label is compiled out in CUDA builds (CUDA never compiled).
+      // Extracted so CUDA (GPU toggled off at runtime) and CPU share one preview
+      // path. HIP keeps upstream shape to minimize merge conflicts.
+      auto emitCpuPreview = [&]() {
+          // Optimization for CPU: Downsample raycast for UI preview to reduce
+          // jitter/lag
+          {
+              std::shared_lock<std::shared_mutex> lk_tsdf(tsdf_mutex_);
+              tsdf_->raycast(frame->pose, static_cast<float>(sensor::FX),
+                             static_cast<float>(sensor::FY),
+                             static_cast<float>(sensor::CX),
+                             static_cast<float>(sensor::CY), sensor::DEPTH_WIDTH,
+                             sensor::DEPTH_HEIGHT, model_back.vertices.data(),
+                             model_back.normals.data(), model_back.colors.data());
+          }
+
+          if (frame_ready_cb_) {
+            size_t n = sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT;
+            auto ui_frame = std::make_shared<sensor::FrameData>();
+
+            // For CPU, we use a 2x downsample for the UI preview to keep it
+            // responsive (8fps -> 15fps feel)
+            constexpr int step = 2;
+            ui_frame->width = sensor::DEPTH_WIDTH / step;
+            ui_frame->height = sensor::DEPTH_HEIGHT / step;
+            int n_ui = ui_frame->width * ui_frame->height;
+            ui_frame->vertices.resize(n_ui);
+            ui_frame->rgb.resize(n_ui * 3);
+            ui_frame->depth_meters.resize(n_ui);
+
+            for (int y = 0; y < ui_frame->height; ++y) {
+              for (int x = 0; x < ui_frame->width; ++x) {
+                int idx_full = (y * step) * sensor::DEPTH_WIDTH + (x * step);
+                int idx_ui = y * ui_frame->width + x;
+                auto& v = model_back.vertices[idx_full];
+                ui_frame->vertices[idx_ui] = v;
+                ui_frame->rgb[idx_ui * 3 + 0] = model_back.colors[idx_full * 3 + 0];
+                ui_frame->rgb[idx_ui * 3 + 1] = model_back.colors[idx_full * 3 + 1];
+                ui_frame->rgb[idx_ui * 3 + 2] = model_back.colors[idx_full * 3 + 2];
+                ui_frame->depth_meters[idx_ui] = (v.z() != 0.0f || v.x() != 0.0f || v.y() != 0.0f) ? 1.0f : 0.0f;
+              }
+            }
+            ui_frame->pose = Eigen::Matrix4f::Identity();
+
+            QMetaObject::invokeMethod(
+                qApp,
+                [this, ui_frame]() {
+                  if (frame_ready_cb_)
+                    frame_ready_cb_(*ui_frame);
+                },
+                Qt::QueuedConnection);
+          }
+      };
+#endif
+
 #ifdef CUDA_ENABLED
       if (use_gpu_.load()) {
           {
@@ -807,7 +865,7 @@ void PipelineController::integrationLoop() {
                 Qt::QueuedConnection);
           }
       } else {
-          goto cpu_raycast;
+          emitCpuPreview();
       }
 #elif defined(HIP_ENABLED)
       if (use_gpu_.load()) {
@@ -869,55 +927,7 @@ void PipelineController::integrationLoop() {
           // Fall through to CPU raycast
       }
 #else
-cpu_raycast:
-      // Optimization for CPU: Downsample raycast for UI preview to reduce
-      // jitter/lag
-      {
-          std::shared_lock<std::shared_mutex> lk_tsdf(tsdf_mutex_);
-          tsdf_->raycast(frame->pose, static_cast<float>(sensor::FX),
-                         static_cast<float>(sensor::FY),
-                         static_cast<float>(sensor::CX),
-                         static_cast<float>(sensor::CY), sensor::DEPTH_WIDTH,
-                         sensor::DEPTH_HEIGHT, model_back.vertices.data(),
-                         model_back.normals.data(), model_back.colors.data());
-      }
-
-      if (frame_ready_cb_) {
-        size_t n = sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT;
-        auto ui_frame = std::make_shared<sensor::FrameData>();
-
-        // For CPU, we use a 2x downsample for the UI preview to keep it
-        // responsive (8fps -> 15fps feel)
-        constexpr int step = 2;
-        ui_frame->width = sensor::DEPTH_WIDTH / step;
-        ui_frame->height = sensor::DEPTH_HEIGHT / step;
-        int n_ui = ui_frame->width * ui_frame->height;
-        ui_frame->vertices.resize(n_ui);
-        ui_frame->rgb.resize(n_ui * 3);
-        ui_frame->depth_meters.resize(n_ui);
-
-        for (int y = 0; y < ui_frame->height; ++y) {
-          for (int x = 0; x < ui_frame->width; ++x) {
-            int idx_full = (y * step) * sensor::DEPTH_WIDTH + (x * step);
-            int idx_ui = y * ui_frame->width + x;
-            auto& v = model_back.vertices[idx_full];
-            ui_frame->vertices[idx_ui] = v;
-            ui_frame->rgb[idx_ui * 3 + 0] = model_back.colors[idx_full * 3 + 0];
-            ui_frame->rgb[idx_ui * 3 + 1] = model_back.colors[idx_full * 3 + 1];
-            ui_frame->rgb[idx_ui * 3 + 2] = model_back.colors[idx_full * 3 + 2];
-            ui_frame->depth_meters[idx_ui] = (v.z() != 0.0f || v.x() != 0.0f || v.y() != 0.0f) ? 1.0f : 0.0f;
-          }
-        }
-        ui_frame->pose = Eigen::Matrix4f::Identity();
-
-        QMetaObject::invokeMethod(
-            qApp,
-            [this, ui_frame]() {
-              if (frame_ready_cb_)
-                frame_ready_cb_(*ui_frame);
-            },
-            Qt::QueuedConnection);
-      }
+      emitCpuPreview();  // KIN-FORK(cpu-preview): was `goto cpu_raycast` + label
 #endif
       model_buffers_.swap();
       // Signal trackingLoop that at least one valid model frame exists.
