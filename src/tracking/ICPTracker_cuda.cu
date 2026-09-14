@@ -7,6 +7,7 @@
 #include <iostream>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <Eigen/Dense>  // SelfAdjointEigenSolver (:423) + LDLT (:434); matches HIP twin
 
 #define CUDA_CHECK(call) \
     do { \
@@ -215,24 +216,24 @@ __global__ void computeHessianKernel(
                                 J[4] = v_live.z * n_model_live.x - v_live.x * n_model_live.z;
                                 J[5] = v_live.x * n_model_live.y - v_live.y * n_model_live.x;
 
-                                if (isnan(J[0]) || isinf(J[0]) || isnan(J[3]) || isinf(J[3])) {
-                                    continue;
-                                }
+                                // KIN-FORK: `continue` is invalid here (no enclosing loop —
+                                // nvcc hard error). Guard form copied from ICPTracker_hip.hip:220.
+                                if (!isnan(J[0]) && !isinf(J[0]) && !isnan(J[3]) && !isinf(J[3])) {
+                                    float abs_err = fabsf(err);
+                                    float huber_k = 0.02f; 
+                                    float w = (abs_err <= huber_k) ? 1.0f : huber_k / abs_err;
+                                    float weighted_err = err * w;
 
-                                float abs_err = fabsf(err);
-                                float huber_k = 0.02f; 
-                                float w = (abs_err <= huber_k) ? 1.0f : huber_k / abs_err;
-                                float weighted_err = err * w;
-
-                                int count = 0;
-                                for (int i = 0; i < 6; ++i) {
-                                    for (int j = i; j < 6; ++j) {
-                                        local_A[count++] += J[i] * J[j];
+                                    int count = 0;
+                                    for (int i = 0; i < 6; ++i) {
+                                        for (int j = i; j < 6; ++j) {
+                                            local_A[count++] += J[i] * J[j];
+                                        }
+                                        local_b[i] -= J[i] * weighted_err;
                                     }
-                                    local_b[i] -= J[i] * weighted_err;
+                                    local_res += weighted_err * weighted_err;
+                                    local_inliers++;
                                 }
-                                local_res += weighted_err * weighted_err;
-                                local_inliers++;
                             } else local_angle_filtered++;
                         } else local_dist_filtered++;
                     }
