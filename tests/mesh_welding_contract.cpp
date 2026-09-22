@@ -20,6 +20,7 @@
 #include "meshing/MarchingCubes.h"
 #include "meshing/MarchingCubesTables.h"
 #include "tsdf/TSDFVolume.h"
+#include "utils/ColorMath.h"
 
 #include <array>
 #include <cmath>
@@ -36,6 +37,7 @@ using kfusion::meshing::MeshData;
 using kfusion::tsdf::EMPTY_TSDF;
 using kfusion::tsdf::TSDFParams;
 using kfusion::tsdf::TSDFVolume;
+using kfusion::utils::srgbUint8ToFloat;   // uint8 sRGB -> the volume's float sRGB domain
 
 int g_failures = 0;
 int g_sections = 0;
@@ -187,7 +189,7 @@ void section_sphere_matches_oracle() {
                 auto& v = vol.voxelAt(x, y, z);
                 v.tsdf   = std::max(-1.0f, std::min(1.0f, t));
                 v.weight = p.max_weight;
-                v.r = 120; v.g = 160; v.b = 200;
+                v.r = srgbUint8ToFloat(120); v.g = srgbUint8ToFloat(160); v.b = srgbUint8ToFloat(200);
             }
 
     auto m = mesh(vol);
@@ -223,7 +225,7 @@ void section_zero_corner_not_false_merged() {
                 auto& v  = vol.voxelAt(x, y, z);
                 v.tsdf   = inBlock ? -0.5f : (0.5f + 0.01f * static_cast<float>(x));
                 v.weight = 8.0f;
-                v.r = 40; v.g = 80; v.b = 120;
+                v.r = srgbUint8ToFloat(40); v.g = srgbUint8ToFloat(80); v.b = srgbUint8ToFloat(120);
             }
     vol.voxelAt(c, c, c).tsdf = 0.0f;       // the exactly-zero shared corner (still observed)
 
@@ -265,7 +267,7 @@ void section_determinism() {
                 auto& v = vol.voxelAt(x, y, z);
                 v.tsdf   = std::max(-1.0f, std::min(1.0f, t));
                 v.weight = p.max_weight;
-                v.r = 7; v.g = 14; v.b = 21;
+                v.r = srgbUint8ToFloat(7); v.g = srgbUint8ToFloat(14); v.b = srgbUint8ToFloat(21);
             }
     auto bytes = [](const MeshData& m) {
         std::string s;

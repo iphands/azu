@@ -77,15 +77,17 @@ void appendU32(std::string& out, uint32_t v) {
     out.append(tmp, sizeof(uint32_t));
 }
 
-// Voxel payload: tsdf, weight, R, G, B — every field, exact IEEE bits.
+// Voxel payload: tsdf, weight, R, G, B — every field, exact IEEE bits. The color
+// channels are float sRGB since Todo 19, so they widen to the same 4-byte record
+// as tsdf/weight (the host Voxel is five floats).
 std::string serializeVolume(const TSDFVolume& vol) {
     std::string out;
     for (const Voxel& v : vol.voxelData()) {
         appendF32(out, v.tsdf);
         appendF32(out, v.weight);
-        out.push_back(static_cast<char>(v.r));
-        out.push_back(static_cast<char>(v.g));
-        out.push_back(static_cast<char>(v.b));
+        appendF32(out, v.r);
+        appendF32(out, v.g);
+        appendF32(out, v.b);
     }
     return out;
 }
@@ -277,10 +279,13 @@ void runHandDerivedOracle() {
     auto blendTsdf = [&](double tsdf_old, double w_old, double v) {
         return (tsdf_old * w_old + v * wnew) / (w_old + wnew + eps);
     };
-    auto blendColor = [&](uint8_t old_c, double w_old, uint8_t src) -> uint8_t {
-        double num = static_cast<double>(old_c) * w_old + static_cast<double>(src);
-        return static_cast<uint8_t>(std::round(num / (w_old + wnew + eps)));
+    auto blendColor = [&](double old_c, double w_old, uint8_t src) -> double {
+        // Canonical CPU color fold (Todo 19): the incoming byte becomes float
+        // sRGB and blends through the same denominator as tsdf, with no
+        // per-update rounding back to a byte.
+        return (old_c * w_old + static_cast<double>(src) / 255.0) / (w_old + wnew + eps);
     };
+    const double ec = static_cast<double>(EMPTY_COLOR);
 
     // Two-hit voxel (32,32,47): steps 0 and 1 => tsdf_new = 1.0 then 0.75.
     const double a = 1.0, b = 0.75;
@@ -288,14 +293,17 @@ void runHandDerivedOracle() {
     double s1 = blendTsdf(EMPTY_TSDF, 0.0, a);
     double w2 = std::min(w1 + wnew, cap);
     double s2 = blendTsdf(s1, w1, b);
-    uint8_t r1 = blendColor(EMPTY_COLOR, 0.0, R), r2 = blendColor(r1, w1, R);
-    uint8_t g1 = blendColor(EMPTY_COLOR, 0.0, G), g2 = blendColor(g1, w1, G);
-    uint8_t b1 = blendColor(EMPTY_COLOR, 0.0, B), b2 = blendColor(b1, w1, B);
+    const double r1 = blendColor(ec, 0.0, R), r2 = blendColor(r1, w1, R);
+    const double g1 = blendColor(ec, 0.0, G), g2 = blendColor(g1, w1, G);
+    const double b1 = blendColor(ec, 0.0, B), b2 = blendColor(b1, w1, B);
 
     const Voxel& v47 = atVoxel(vol, ox, oy, 47);
     CHECK(v47.weight == static_cast<float>(w2), stage + ": two-hit voxel weight == 2 (both steps counted, none lost)");
     CHECK(std::fabs(static_cast<double>(v47.tsdf) - s2) < 2e-6, stage + ": two-hit voxel tsdf matches the double fold");
-    CHECK(v47.r == r2 && v47.g == g2 && v47.b == b2, stage + ": two-hit voxel color matches the double fold");
+    CHECK(std::fabs(static_cast<double>(v47.r) - r2) < 2e-6 &&
+          std::fabs(static_cast<double>(v47.g) - g2) < 2e-6 &&
+          std::fabs(static_cast<double>(v47.b) - b2) < 2e-6,
+          stage + ": two-hit voxel color matches the double fold");
     // Anti-single-apply discriminators: a lost/undropped step would leave tsdf at one
     // of the individual candidate values or weight at 1, not the mean of both.
     CHECK(std::fabs(static_cast<double>(v47.tsdf) - a) > 1e-3 &&
@@ -308,21 +316,28 @@ void runHandDerivedOracle() {
     const double c = 0.5;
     double wSingle = std::min(0.0 + wnew, cap);
     double sSingle = blendTsdf(EMPTY_TSDF, 0.0, c);
-    uint8_t rSingle = blendColor(EMPTY_COLOR, 0.0, R);
-    uint8_t gSingle = blendColor(EMPTY_COLOR, 0.0, G);
-    uint8_t bSingle = blendColor(EMPTY_COLOR, 0.0, B);
+    const double rSingle = blendColor(ec, 0.0, R);
+    const double gSingle = blendColor(ec, 0.0, G);
+    const double bSingle = blendColor(ec, 0.0, B);
     const Voxel& v48 = atVoxel(vol, ox, oy, 48);
     CHECK(v48.weight == static_cast<float>(wSingle) && v48.weight == 1.0f,
           stage + ": single-hit voxel weight == 1 (fixture distinguishes hit counts)");
     CHECK(std::fabs(static_cast<double>(v48.tsdf) - sSingle) < 2e-6,
           stage + ": single-hit voxel tsdf matches the single double fold");
-    CHECK(v48.r == rSingle && v48.g == gSingle && v48.b == bSingle,
+    CHECK(std::fabs(static_cast<double>(v48.r) - rSingle) < 2e-6 &&
+          std::fabs(static_cast<double>(v48.g) - gSingle) < 2e-6 &&
+          std::fabs(static_cast<double>(v48.b) - bSingle) < 2e-6,
           stage + ": single-hit voxel color matches the single double fold");
+    // A single update from the neutral EMPTY_COLOR must land exactly on the
+    // normalized input byte, not on the byte value itself (120 would be an
+    // out-of-range sRGB component) and not on a re-rounded byte mean.
+    CHECK(std::fabs(static_cast<double>(v48.r) - static_cast<double>(R) / 255.0) < 1e-6,
+          stage + ": one update equals the normalized input float R/255");
 
     // Thread-count equivalence for this same code path is locked by the wall scenario.
 
-    std::printf("ORACLE two_hit tsdf=%.9g weight=%.9g rgb=(%u,%u,%u) single_hit tsdf=%.9g weight=%.9g\n",
-                v47.tsdf, v47.weight, v47.r, v47.g, v47.b, v48.tsdf, v48.weight);
+    std::printf("ORACLE two_hit tsdf=%.9g weight=%.9g rgb=(%.9g,%.9g,%.9g) single_hit tsdf=%.9g weight=%.9g rgb=(%.9g,%.9g,%.9g)\n",
+                v47.tsdf, v47.weight, v47.r, v47.g, v47.b, v48.tsdf, v48.weight, v48.r, v48.g, v48.b);
 }
 
 } // namespace

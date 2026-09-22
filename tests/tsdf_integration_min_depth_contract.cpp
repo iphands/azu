@@ -27,6 +27,7 @@
 //   tsdf_new(C) =        (0.50125-0.47750)/0.025  = 0.02375/0.025 = 0.95
 #include "app/FusionHyperparams.h"
 #include "tsdf/TSDFVolume.h"
+#include "utils/ColorMath.h"
 
 #include <cmath>
 #include <cstdint>
@@ -135,6 +136,14 @@ bool allEmpty(const TSDFVolume& v) {
     return true;
 }
 
+// The canonical single-update color fold, in double, from the neutral EMPTY_COLOR:
+// (EMPTY_COLOR*0 + byte/255) / (0 + 1 + eps). Independent of the product's float math.
+double colorOracle(uint8_t byte) {
+    return (static_cast<double>(EMPTY_COLOR) * 0.0 + static_cast<double>(byte) / 255.0) /
+           (0.0 + 1.0 + 1e-6);
+}
+bool nearColor(float got, double want) { return std::fabs(static_cast<double>(got) - want) < 1e-6; }
+
 // ---------------------------------------------------------------------------
 // A. the configured min_depth is the pixel gate
 // ---------------------------------------------------------------------------
@@ -195,13 +204,20 @@ void gateB_marchNearClamp() {
           tag + ": the configured band demonstrably changed the fold, delta=" +
               std::to_string(std::fabs(o.tsdf - c.tsdf)));
     // Color gate: both voxels are in the color band (sdf > -trunc/2), and the single
-    // update from EMPTY_COLOR is the hand-derived src value.
-    const uint8_t expect_r = static_cast<uint8_t>(
-        std::round((EMPTY_COLOR * 0.0 + static_cast<double>(kR)) / (0.0 + 1.0 + eps_blend)));
-    CHECK(o.r == expect_r && o.g == kG && o.b == kB,
+    // float-sRGB update from EMPTY_COLOR is the hand-derived normalized src value
+    // divided by the same blend denominator (Todo 19) - not the raw byte, which is an
+    // out-of-range sRGB component, and not a re-rounded byte.
+    const double expect_r = colorOracle(kR), expect_g = colorOracle(kG), expect_b = colorOracle(kB);
+    CHECK(nearColor(o.r, expect_r) && nearColor(o.g, expect_g) && nearColor(o.b, expect_b),
           tag + ": color of the accepted voxel is the frame's RGB, got (" + std::to_string(o.r) +
               "," + std::to_string(o.g) + "," + std::to_string(o.b) + ")");
-    CHECK(c.r == expect_r && c.g == kG && c.b == kB, tag + ": the clipped voxel keeps the same color");
+    CHECK(nearColor(c.r, expect_r) && nearColor(c.g, expect_g) && nearColor(c.b, expect_b),
+          tag + ": the clipped voxel keeps the same color");
+    // And the byte an extraction boundary would publish is exactly the input byte.
+    uint8_t qr = 0, qg = 0, qb = 0;
+    CHECK(kfusion::utils::srgbFloatToUint8(o.r, qr) && kfusion::utils::srgbFloatToUint8(o.g, qg) &&
+              kfusion::utils::srgbFloatToUint8(o.b, qb) && qr == kR && qg == kG && qb == kB,
+          tag + ": the float color quantizes back to the frame's exact RGB bytes");
     std::printf("B tsdf_open=%.9f want=%.9f tsdf_clipped=%.9f want=%.9f w=%.6f/%.6f\n", o.tsdf,
                 expect_open, c.tsdf, expect_clipped, o.weight, c.weight);
 }

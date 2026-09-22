@@ -110,7 +110,8 @@ Current CPU behavior:
 
 - `include/tsdf/TSDFVolume.h` `struct Voxel` defaults to
   `tsdf = EMPTY_TSDF`, `weight = EMPTY_WEIGHT`, `r = g = b = EMPTY_COLOR`
-  (128) — canonical, and a `static_assert` in the same header makes
+  (`EMPTY_COLOR = 128.0f / 255.0f`, the float sRGB widening of the neutral byte
+  `128`) — canonical, and a `static_assert` in the same header makes
   `Voxel{}` equal to the named constants at compile time.
 - `src/tsdf/TSDFVolume.cpp` `unlocked_reset()` fills
   `Voxel{EMPTY_TSDF, EMPTY_WEIGHT, EMPTY_COLOR, EMPTY_COLOR, EMPTY_COLOR}` and
@@ -120,7 +121,8 @@ Current CPU behavior:
   isosurface so an unobserved voxel could be meshed as surface. The CPU
   contract is `tests/tsdf_reset_contract.cpp`.
 - `include/tsdf/TSDFVolume.h` now names the CPU sentinel pair
-  `EMPTY_TSDF = 1.0f` / `EMPTY_WEIGHT = 0.0f` (plus `EMPTY_COLOR = 128`), and
+  `EMPTY_TSDF = 1.0f` / `EMPTY_WEIGHT = 0.0f` (plus
+  `EMPTY_COLOR = 128.0f / 255.0f`, which publishes the neutral byte `128`), and
   `unlocked_reset()`, `getTSDF()` and the `raycast()` empty-space markers use
   them. Nine raw `1.0f` literals remain in `src/tsdf/TSDFVolume.cpp` and none of
   them is an empty-voxel marker: two are the ray projection `z = 1`, two are the
@@ -327,8 +329,8 @@ empty mesh instead of dividing a `(resolution - 2)` progress span. Locked by
 `tests/mesh_welding_contract.cpp`, `tests/mesh_color_invariant_contract.cpp` and
 `tests/mesh_truncation_progress_contract.cpp`. The CPU reverse-winding emission
 (`2, 1, 0`) is now the derived, locked winding convention (winding section
-above; Todo 18), no longer an open item; the unclamped float→uint8 color cast
-(below) is unchanged and still owed to the color todo.
+above; Todo 18), no longer an open item; the float→uint8 color quantization is
+now the single shared policy described below (Todo 19).
 
 ## Color pipeline and export
 
@@ -358,12 +360,25 @@ Current CPU behavior:
 
 - `include/meshing/MeshData.h` stores `std::vector<uint8_t> colors` (RGB, no
   alpha). Canonical-consistent as the uint8 sRGB stage.
-- `src/export/GLBExporter.cpp` emits `COLOR_0` as a `VEC4` `float` accessor
-  built from `uint8 / 255.0f` with alpha `1.0`. The container is therefore
-  already linear-*typed* float, but the values are sRGB-encoded, so the output
-  does not satisfy "GLB COLOR_0 is linear float". **Known CPU defect** owned by
-  the export/color todo: apply sRGB→linear decode to the RGB components (alpha
-  stays as-is) and keep the float `VEC4` accessor.
+- `include/tsdf/TSDFVolume.h::Voxel` is now
+  `{ float tsdf, weight, r, g, b }` — five floats, the color pair triply widened
+  to match the canonical domain. `include/tsdf/VoxelGPU.h` already carried float
+  `r/g/b` plus `float padding[3]` under `alignas(32)`, so the two structs agree
+  on the *type* of every color field but not on size or alignment (20 B vs 32 B);
+  no GPU-side semantics are claimed here, and the migration stays in the deferred
+  backend dossier.
+- `src/export/GLBExporter.cpp` emits `COLOR_0` as a `VEC4` `float` accessor whose
+  RGB components are the checked sRGB→linear decode
+  (`include/export/ColorConversion.h`, `c <= 0.04045 ? c/12.92 :
+  ((c+0.055)/1.055)^2.4`, computed in double) of the uint8 sRGB `MeshData`
+  colors, with alpha `1.0` and no alpha conversion. A component that is
+  non-finite or outside `[0, 1]` rejects the whole export **before** the file is
+  opened, so no partial triple and no half-written file can escape. That checked
+  rejection is stricter than the extraction clamp below and stays so on purpose:
+  an exporter input is already a validated uint8 byte, so a value out of `[0, 1]`
+  there can only be a caller bug. Locked by
+  `tests/glb_linear_color_contract.cpp`, which exports real temporary `.glb`
+  files and reads the accessor back.
 - `src/export/GLBExporter.cpp` converts Kinect Y-down to glTF Y-up by negating
   Y and flipping Z; the README documents `Y → -Y` and Unity's importer applying
   the handedness flip. Any winding-rule change must be re-checked against this
@@ -374,13 +389,43 @@ Current CPU behavior:
   `property uchar ...` plus `property list uchar uint vertex_indices`. Schema
   drift between the two writers for the same logical mesh. **Known CPU defect**
   (owned by the export todo): one schema, one spelling, both writers.
-- `src/meshing/MarchingCubes.cpp` interpolates edge color with an unclamped
-  `static_cast<uint8_t>` of a float, so an out-of-range interpolation wraps as
-  undefined behavior instead of saturating. HIP deliberately matches CPU
-  ("simple cast without clamping"), CUDA clamps with
-  `fminf(255.0f, fmaxf(0.0f, ...))`. Canonical: one clamped, non-UB
-  float→uint8 conversion everywhere; deferred backend rows `meshing:C8` /
-  `cross-backend:A26`.
+ - `src/meshing/MarchingCubes.cpp` interpolates the edge color in float sRGB with
+   the same parameter that produced the vertex position and turns it into the
+   canonical byte through `kfusion::utils::srgbFloatToUint8`
+   (`include/utils/ColorMath.h`) - one clamp plus round-to-nearest, so a finite
+   overshoot of the blend saturates to the endpoint byte instead of wrapping.
+   Only a NON-FINITE endpoint or blend invalidates the crossing edge outright:
+   it is treated as not crossed and the triangle rows that depend on it are
+   dropped, exactly like an unusable normal, rather than emitting an
+   undefined-behavior byte. Positions, normals, the shared interpolation
+   parameter, welding and winding are untouched by either path (locked: a
+   uniform out-of-range color produces the identical vertex and triangle counts).
+   The same single helper quantizes the raycast color output and the global point
+   cloud, so there is exactly one answer to "what byte represents this float".
+   HIP deliberately keeps the old "simple cast without clamping" and CUDA keeps
+   `fminf(255.0f, fmaxf(0.0f, ...))`; both still owe the migration to this policy
+   (deferred backend rows `meshing:C8` / `cross-backend:A26`).
+ - `include/utils/ColorMath.h::srgbFloatToUint8` is that one CPU policy and it is
+   a **clamp** policy: every FINITE value is representable, a value outside
+   `[0, 1]` is clamped before it is scaled (clamping first means even `FLT_MAX`
+   cannot overflow the multiply) and then `std::lround`-ed, so `-0.001`, `-1.0`
+   and `lowest()` are byte `0` while `1.001`, `2.0` and `FLT_MAX` are byte `255`.
+   NaN and `+/-Inf` are the only rejected inputs - they return false and leave
+   the output byte untouched, because `static_cast<uint8_t>` of a non-finite
+   float is undefined behavior and saturating a NaN would hide an upstream bug;
+   a caller therefore withdraws the raycast pixel, skips the point-cloud voxel,
+   or drops the Marching Cubes edge, and never publishes a half-written triple.
+   The GLB boundary is deliberately stricter (see the `ColorConversion.h` bullet
+   above): an export input is already a validated byte, so range there is a bug.
+   `include/tsdf/TSDFVolume.h::EMPTY_COLOR` is `128.0f / 255.0f` so the neutral
+   byte 128 stays a representable color in the float domain (a raw `120` in a
+   voxel color field is an out-of-range sRGB component, not a color, and the
+   boundary publishes 255 for it rather than wrapping). CPU integration widens
+   every incoming candidate with `kfusion::utils::srgbUint8ToFloat` (one division
+   by 255, no gamma: the volume domain is sRGB-encoded) and accumulates in float,
+   so repeated fusion converges to the true mean instead of stalling in a
+   per-update uint8 rounding dead zone. Locked by
+   `tests/color_convergence_contract.cpp`.
 
 ## ICP / tracking
 

@@ -1,4 +1,5 @@
 #include "tsdf/TSDFVolume.h"
+#include "utils/ColorMath.h"
 #include "utils/CoordinateMath.h"
 #include <climits>
 #include <cstdint>
@@ -358,12 +359,25 @@ void TSDFVolume::integrateCPU(const float*           depth_meters,
         if (c.apply_color) {
             // Same (y, x) that produced this candidate → its own RGB sample.
             const int pidx = static_cast<int>(c.key >> 32) * 3;
-            // Use float arithmetic to avoid truncation darkening.
-            vox.r = static_cast<uint8_t>(std::round((static_cast<float>(vox.r) * w_old + static_cast<float>(rgb[pidx+0])) / (w_old + 1.0f + 1e-6f)));
-            vox.g = static_cast<uint8_t>(std::round((static_cast<float>(vox.g) * w_old + static_cast<float>(rgb[pidx+1])) / (w_old + 1.0f + 1e-6f)));
-            vox.b = static_cast<uint8_t>(std::round((static_cast<float>(vox.b) * w_old + static_cast<float>(rgb[pidx+2])) / (w_old + 1.0f + 1e-6f)));
-
-            if (logging) ++g_tsdf_stats.color_updates;
+            // Canonical fold (docs/CANONICAL_SEMANTICS.md, "Color pipeline"):
+            // the incoming device byte becomes float sRGB and blends in the same
+            // weighted-average denominator as tsdf/weight. No per-update rounding
+            // or truncation here — that is what made a heavily-fused voxel stop
+            // converging (a |delta| under half a byte was rounded away). The
+            // byte stage is deliberately left to the extraction boundaries.
+            const float denom = w_old + 1.0f + 1e-6f;
+            const float r_next = (vox.r * w_old + utils::srgbUint8ToFloat(rgb[pidx + 0])) / denom;
+            const float g_next = (vox.g * w_old + utils::srgbUint8ToFloat(rgb[pidx + 1])) / denom;
+            const float b_next = (vox.b * w_old + utils::srgbUint8ToFloat(rgb[pidx + 2])) / denom;
+            // Assign only when every channel is finite: a non-finite candidate
+            // must leave the voxel's previous color intact rather than poison it,
+            // exactly as the tsdf guard above skips a non-finite blend.
+            if (std::isfinite(r_next) && std::isfinite(g_next) && std::isfinite(b_next)) {
+                vox.r = r_next;
+                vox.g = g_next;
+                vox.b = b_next;
+                if (logging) ++g_tsdf_stats.color_updates;
+            }
         }
     }
     
@@ -442,9 +456,23 @@ void TSDFVolume::raycast(const Eigen::Matrix4f& pose,
                 if (inBounds(vi.x(), vi.y(), vi.z())) {
                     const Voxel& vox = voxels_[idx(vi.x(), vi.y(), vi.z())];
                     if (vox.weight > EMPTY_WEIGHT) {
-                        colors_out[out_idx*3+0] = vox.r;
-                        colors_out[out_idx*3+1] = vox.g;
-                        colors_out[out_idx*3+2] = vox.b;
+                        // One shared quantization policy at the byte boundary: a
+                        // finite color, however far outside [0,1], publishes its
+                        // saturated byte. Only a non-finite voxel color is a bug
+                        // upstream, and then the whole surface output for this pixel
+                        // is withdrawn (the documented all-or-nothing raycast
+                        // contract) instead of emitting a fabricated black.
+                        uint8_t qc[3] = {0, 0, 0};
+                        if (utils::srgbFloatToUint8(vox.r, qc[0]) &&
+                            utils::srgbFloatToUint8(vox.g, qc[1]) &&
+                            utils::srgbFloatToUint8(vox.b, qc[2])) {
+                            colors_out[out_idx*3+0] = qc[0];
+                            colors_out[out_idx*3+1] = qc[1];
+                            colors_out[out_idx*3+2] = qc[2];
+                        } else {
+                            vertices_out[out_idx] = Eigen::Vector3f::Zero();
+                            normals_out[out_idx]  = Eigen::Vector3f::Zero();
+                        }
                     }
                 }
             }
@@ -588,10 +616,20 @@ void TSDFVolume::extractGlobalPointCloud(std::vector<Eigen::Vector3f>& points_ou
                     const Voxel& vox = voxels_[idx(x, y, z)];
                     // Only extract voxels near the surface (low absolute TSDF) with significant weight
                     if (vox.weight > 1.0f && std::abs(vox.tsdf) < 0.2f) {
+                        // Same shared quantization policy as the raycast: a finite
+                        // color saturates to its byte, and only a voxel whose color
+                        // is non-finite is skipped, so the point count and the color
+                        // count stay in lockstep either way.
+                        uint8_t qc[3] = {0, 0, 0};
+                        if (!utils::srgbFloatToUint8(vox.r, qc[0]) ||
+                            !utils::srgbFloatToUint8(vox.g, qc[1]) ||
+                            !utils::srgbFloatToUint8(vox.b, qc[2])) {
+                            continue;
+                        }
                         local_points.push_back(voxelToWorld(x, y, z));
-                        local_colors.push_back(vox.r);
-                        local_colors.push_back(vox.g);
-                        local_colors.push_back(vox.b);
+                        local_colors.push_back(qc[0]);
+                        local_colors.push_back(qc[1]);
+                        local_colors.push_back(qc[2]);
                     }
                 }
             }

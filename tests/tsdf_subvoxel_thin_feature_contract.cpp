@@ -15,6 +15,7 @@
 // If NO lattice plane goes negative the feature is below the lattice's own representable
 // limit and the honest answer is "no surface" (asserted, not hidden).
 #include "tsdf/TSDFVolume.h"
+#include "utils/ColorMath.h"
 
 #include <cmath>
 #include <cstdint>
@@ -35,6 +36,7 @@ using kfusion::tsdf::EMPTY_TSDF;
 using kfusion::tsdf::EMPTY_WEIGHT;
 using kfusion::tsdf::TSDFParams;
 using kfusion::tsdf::TSDFVolume;
+using kfusion::utils::srgbUint8ToFloat;   // uint8 sRGB -> the volume's float sRGB domain
 
 int g_failures = 0;
 int g_checks   = 0;
@@ -143,9 +145,9 @@ Hit castOnce(const std::vector<Slab>& slabs, float min_depth, float max_depth) {
                 auto& v            = vol.voxelAt(x, y, z);
                 v.tsdf             = f[static_cast<size_t>(z)];
                 v.weight           = 1.0f;
-                v.r                = layerR(z);
-                v.g                = layerG(z);
-                v.b                = layerB(z);
+                v.r                = srgbUint8ToFloat(layerR(z));
+                v.g                = srgbUint8ToFloat(layerG(z));
+                v.b                = srgbUint8ToFloat(layerB(z));
             }
         }
     }

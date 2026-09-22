@@ -21,6 +21,7 @@
 
 #include "meshing/MarchingCubes.h"
 #include "tsdf/TSDFVolume.h"
+#include "utils/ColorMath.h"
 
 #include <cmath>
 #include <cstdint>
@@ -34,6 +35,7 @@ using kfusion::meshing::MarchingCubes;
 using kfusion::meshing::MeshData;
 using kfusion::tsdf::TSDFParams;
 using kfusion::tsdf::TSDFVolume;
+using kfusion::utils::srgbUint8ToFloat;   // uint8 sRGB -> the volume's float sRGB domain
 
 int g_failures = 0;
 int g_sections = 0;
@@ -84,8 +86,8 @@ void section_lockstep_and_shared_parameter() {
                 auto& v = vol.voxelAt(x, y, z);
                 v.tsdf   = std::max(-1.0f, std::min(1.0f, t));
                 v.weight = p.max_weight;
-                v.r = encodeX(w.x(), scale);   // color encodes world x
-                v.g = 0; v.b = 0;
+                v.r = srgbUint8ToFloat(encodeX(w.x(), scale));   // color encodes world x
+                v.g = srgbUint8ToFloat(0); v.b = srgbUint8ToFloat(0);
             }
 
     auto m = mesh(vol);
@@ -132,7 +134,7 @@ void section_octant_color_lockstep() {
                 auto& v  = vol.voxelAt(x, y, z);
                 v.tsdf   = inBlock ? -0.5f : (0.5f + 0.01f * static_cast<float>(x));
                 v.weight = 8.0f;
-                v.r = inBlock ? 30 : 200; v.g = 90; v.b = inBlock ? 40 : 160;
+                v.r = srgbUint8ToFloat(inBlock ? 30 : 200); v.g = srgbUint8ToFloat(90); v.b = srgbUint8ToFloat(inBlock ? 40 : 160);
             }
     vol.voxelAt(c, c, c).tsdf = 0.0f;
 
@@ -167,7 +169,7 @@ void section_constant_color() {
                 auto& v = vol.voxelAt(x, y, z);
                 v.tsdf   = std::max(-1.0f, std::min(1.0f, t));
                 v.weight = p.max_weight;
-                v.r = 128; v.g = 128; v.b = 128;   // constant color
+                v.r = srgbUint8ToFloat(128); v.g = srgbUint8ToFloat(128); v.b = srgbUint8ToFloat(128);   // constant color
             }
     auto m = mesh(vol);
     CHECK(m != nullptr && !m->empty(), "s3: constant-color sphere meshes");
@@ -201,7 +203,7 @@ void section_color_determinism() {
                 auto& v = vol.voxelAt(x, y, z);
                 v.tsdf   = std::max(-1.0f, std::min(1.0f, t));
                 v.weight = p.max_weight;
-                v.r = encodeX(w.x(), scale); v.g = 10; v.b = 20;
+                v.r = srgbUint8ToFloat(encodeX(w.x(), scale)); v.g = srgbUint8ToFloat(10); v.b = srgbUint8ToFloat(20);
             }
     auto bytes = [](const MeshData& m) {
         std::string s;

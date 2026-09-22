@@ -351,6 +351,41 @@ target_link_libraries(marching_cubes_winding_contract PRIVATE azu_test_core)
 add_test(NAME marching_cubes_winding_contract COMMAND marching_cubes_winding_contract)
 set_tests_properties(marching_cubes_winding_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 19: CPU color convergence + linear GLB color contracts ----
+# color_convergence_contract is public CPU API only (TSDFVolume integrate/raycast/
+# extractGlobalPointCloud + the shared utils::ColorMath policy): it locks the uint8
+# sRGB -> float sRGB widening as exactly b/255 over all 256 bytes, the one shared
+# float -> byte policy as round-to-nearest with an exact 256-byte round trip - it
+# clamps every finite value into [0,1] before scaling and rejects only NaN/Inf, leaving
+# the output byte untouched - fusion that
+# converges to the true mean instead of stalling in the old per-update uint8 rounding
+# dead zone, EMPTY_COLOR as the exact 128/255 quotient publishing byte 128, and that
+# every extraction boundary emits bytes the shared policy reproduces. No device,
+# display, GPU, sensor, thread timing or filesystem.
+# glb_linear_color_contract exports REAL temporary .glb files through GLBExporter and
+# reads them back with tinygltf (declarations only; the tinygltf definitions come from
+# GLBExporter.cpp.o inside azu_test_core), so COLOR_0 is verified as written on disk:
+# componentType FLOAT, type VEC4, count == POSITION count, alpha exactly 1.0, and RGB
+# within 1e-5 of an independent double sRGB EOTF oracle written in the test - including
+# the piecewise knee (byte 10 linear branch, byte 11 power branch) and a positive
+# witness that the value is NOT the raw byte/255 the old exporter emitted. Refusal
+# paths write no file at all, exports are byte-identical across repeats, and the PLY
+# path keeps the exact uint8 sRGB triples. Scratch files live under
+# std::filesystem::temp_directory_path() and are removed.
+add_executable(color_convergence_contract color_convergence_contract.cpp)
+target_compile_definitions(color_convergence_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(color_convergence_contract PRIVATE azu_test_core)
+
+add_executable(glb_linear_color_contract glb_linear_color_contract.cpp)
+target_compile_definitions(glb_linear_color_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(glb_linear_color_contract PRIVATE azu_test_core)
+
+add_test(NAME color_convergence_contract COMMAND color_convergence_contract)
+set_tests_properties(color_convergence_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
+add_test(NAME glb_linear_color_contract COMMAND glb_linear_color_contract)
+set_tests_properties(glb_linear_color_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that

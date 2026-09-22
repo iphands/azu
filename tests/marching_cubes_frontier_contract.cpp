@@ -28,6 +28,7 @@
 #include "meshing/MarchingCubes.h"
 #include "meshing/MarchingCubesTables.h"
 #include "tsdf/TSDFVolume.h"
+#include "utils/ColorMath.h"
 
 #include <algorithm>
 #include <array>
@@ -45,6 +46,7 @@ namespace {
 using kfusion::meshing::MeshData;
 using kfusion::tsdf::TSDFParams;
 using kfusion::tsdf::TSDFVolume;
+using kfusion::utils::srgbUint8ToFloat;   // uint8 sRGB -> the volume's float sRGB domain
 
 int g_failures = 0;
 int g_sections = 0;
@@ -265,7 +267,7 @@ void fillOutside(TSDFVolume& vol, float value = 0.5f, float ramp_x = 0.0f) {
                 auto& v  = vol.voxelAt(x, y, z);
                 v.tsdf   = value + ramp_x * static_cast<float>(x);
                 v.weight = p.max_weight;
-                v.r = 10; v.g = 20; v.b = 30;
+                v.r = srgbUint8ToFloat(10); v.g = srgbUint8ToFloat(20); v.b = srgbUint8ToFloat(30);
             }
 }
 
@@ -364,7 +366,7 @@ void section_frontier_sphere_closure() {
             for (int x = 0; x < R; ++x) {
                 const float sdf = (vol.voxelToWorld(x, y, z) - center).norm() - rad;
                 auto& v = vol.voxelAt(x, y, z);
-                v.r = 200; v.g = 100; v.b = 50;
+                v.r = srgbUint8ToFloat(200); v.g = srgbUint8ToFloat(100); v.b = srgbUint8ToFloat(50);
                 if (sdf <= 1.2f * vs) {                 // interior + thin outer shell
                     float t = sdf / p.truncation;
                     v.tsdf   = std::max(-1.0f, std::min(1.0f, t));
@@ -457,7 +459,7 @@ void section_unsupported_edge() {
                 auto& v = vol.voxelAt(x, y, z);
                 v.tsdf   = std::max(-1.0f, std::min(1.0f, s));
                 v.weight = p.max_weight;
-                v.r = 70; v.g = 70; v.b = 70;
+                v.r = srgbUint8ToFloat(70); v.g = srgbUint8ToFloat(70); v.b = srgbUint8ToFloat(70);
             }
     stamp(vol, 3, 3, 3, -0.9f, 0.0f);                   // unobserved + stale negative
 
@@ -509,7 +511,7 @@ void section_cancelled_normal() {
                 auto& v  = vol.voxelAt(x, y, z);
                 v.tsdf   = pattern[x % 4];
                 v.weight = p.max_weight;
-                v.r = 30; v.g = 60; v.b = 90;
+                v.r = srgbUint8ToFloat(30); v.g = srgbUint8ToFloat(60); v.b = srgbUint8ToFloat(90);
             }
 
     auto m = mesh(vol);
@@ -584,7 +586,7 @@ void section_non_finite_tsdf() {
                     auto& v  = target->voxelAt(x, y, z);
                     v.tsdf   = t;
                     v.weight = p.max_weight;
-                    v.r = 11; v.g = 22; v.b = 33;
+                    v.r = srgbUint8ToFloat(11); v.g = srgbUint8ToFloat(22); v.b = srgbUint8ToFloat(33);
                 }
             }
 
@@ -679,7 +681,7 @@ void section_border_one_sided_normal() {
                 auto& v = vol.voxelAt(x, y, z);
                 v.tsdf   = std::max(-1.0f, std::min(1.0f, s));
                 v.weight = p.max_weight;
-                v.r = 90; v.g = 90; v.b = 90;
+                v.r = srgbUint8ToFloat(90); v.g = srgbUint8ToFloat(90); v.b = srgbUint8ToFloat(90);
             }
 
     auto m = mesh(vol);
@@ -727,7 +729,7 @@ void section_determinism() {
                     v.tsdf   = kfusion::tsdf::EMPTY_TSDF;
                     v.weight = kfusion::tsdf::EMPTY_WEIGHT;
                 }
-                v.r = 5; v.g = 6; v.b = 7;
+                v.r = srgbUint8ToFloat(5); v.g = srgbUint8ToFloat(6); v.b = srgbUint8ToFloat(7);
             }
 
     const std::string a = serializeBytes(*mesh(vol));

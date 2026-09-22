@@ -1,5 +1,6 @@
 #include "meshing/MarchingCubes.h"
 #include "meshing/MarchingCubesTables.h"
+#include "utils/ColorMath.h"
 #include <cmath>
 #include <array>
 #include <cstdint>
@@ -290,9 +291,24 @@ std::shared_ptr<MeshData> MarchingCubes::extract(const tsdf::TSDFVolume& volume,
 
                     edge_pos[e]   = cr.position;
                     edge_norms[e] = blended / blend_len;
-                    edge_colors[e][0] = static_cast<uint8_t>(corner_vox[low_c].r + cr.t * (static_cast<float>(corner_vox[up_c].r) - corner_vox[low_c].r));
-                    edge_colors[e][1] = static_cast<uint8_t>(corner_vox[low_c].g + cr.t * (static_cast<float>(corner_vox[up_c].g) - corner_vox[low_c].g));
-                    edge_colors[e][2] = static_cast<uint8_t>(corner_vox[low_c].b + cr.t * (static_cast<float>(corner_vox[up_c].b) - corner_vox[low_c].b));
+                    // Endpoints are float sRGB, blended with the SAME t that produced
+                    // the position (Todo 17's shared parameter) and quantized through
+                    // the one CPU policy, which saturates a finite overshoot of the
+                    // blend to the endpoint byte. Only a non-finite endpoint or blend
+                    // invalidates this crossing edge outright: every triangle row
+                    // touching it is dropped below, exactly like an unusable normal.
+                    float col_f[3];
+                    col_f[0] = corner_vox[low_c].r + cr.t * (corner_vox[up_c].r - corner_vox[low_c].r);
+                    col_f[1] = corner_vox[low_c].g + cr.t * (corner_vox[up_c].g - corner_vox[low_c].g);
+                    col_f[2] = corner_vox[low_c].b + cr.t * (corner_vox[up_c].b - corner_vox[low_c].b);
+                    uint8_t col_b[3] = {0, 0, 0};
+                    if (!utils::srgbFloatToUint8(col_f[0], col_b[0]) ||
+                        !utils::srgbFloatToUint8(col_f[1], col_b[1]) ||
+                        !utils::srgbFloatToUint8(col_f[2], col_b[2]))
+                        continue;
+                    edge_colors[e][0] = col_b[0];
+                    edge_colors[e][1] = col_b[1];
+                    edge_colors[e][2] = col_b[2];
                     edge_ok[e] = true;
                 }
 

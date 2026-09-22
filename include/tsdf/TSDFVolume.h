@@ -26,8 +26,15 @@ namespace tsdf {
 inline constexpr float EMPTY_TSDF   = 1.0f;
 inline constexpr float EMPTY_WEIGHT = 0.0f;
 
-// Color an unobserved voxel carries (no integration has written it yet).
-inline constexpr uint8_t EMPTY_COLOR = 128;
+// Color an unobserved voxel carries (no integration has written it yet). The CPU
+// voxel color domain is float sRGB [0,1] (Todo 19), so the neutral byte 128 is
+// written as the exact quotient 128.0f / 255.0f. A raw 120 in this field is not a
+// color: it is an out-of-range sRGB component, and the extraction boundary CLAMPS
+// finite values, so a raw 120 publishes byte 255 rather than being refused. Only a
+// non-finite color is rejected (see kfusion::utils::srgbFloatToUint8). This value
+// round-trips through that helper back to byte 128, which is the neutral byte the
+// reset fill and every extraction boundary publish for an unobserved voxel.
+inline constexpr float EMPTY_COLOR = 128.0f / 255.0f;
 
 struct TSDFParams {
     int   resolution     = 256;          // 256³ voxels
@@ -46,9 +53,12 @@ struct TSDFParams {
 };
 
 struct Voxel {
-    float    tsdf   = EMPTY_TSDF;    // normalized [-1,1]
-    float    weight = EMPTY_WEIGHT;
-    uint8_t  r = EMPTY_COLOR, g = EMPTY_COLOR, b = EMPTY_COLOR;
+    float tsdf   = EMPTY_TSDF;    // normalized [-1,1]
+    float weight = EMPTY_WEIGHT;
+    // sRGB-encoded [0,1], accumulated as float so repeated fusion converges to
+    // the true mean instead of a per-update uint8 rounding dead zone. The byte
+    // stage belongs to the extraction boundaries (utils::srgbFloatToUint8).
+    float r = EMPTY_COLOR, g = EMPTY_COLOR, b = EMPTY_COLOR;
 };
 
 static_assert(Voxel{}.tsdf == EMPTY_TSDF && Voxel{}.weight == EMPTY_WEIGHT &&

@@ -3,6 +3,7 @@
 // Public API only; no device, display, GPU, sensor, thread timing or filesystem.
 
 #include "tsdf/TSDFVolume.h"
+#include "utils/ColorMath.h"
 
 #include <cstdio>
 #include <functional>
@@ -21,6 +22,7 @@ using kfusion::tsdf::EMPTY_WEIGHT;
 using kfusion::tsdf::TSDFParams;
 using kfusion::tsdf::TSDFVolume;
 using kfusion::tsdf::Voxel;
+using kfusion::utils::srgbUint8ToFloat;   // uint8 sRGB -> the volume's float sRGB domain
 
 int g_failures = 0;
 int g_checks   = 0;
@@ -71,7 +73,7 @@ void checkAllVoxelsEmpty(const TSDFVolume& vol, const std::string& stage) {
         if (!isClean(v)) {
             if (dirty == 0) {
                 std::printf("  first non-empty voxel at %zu: tsdf=%.9g weight=%.9g "
-                            "rgb=(%u,%u,%u); expected tsdf=%.9g weight=%.9g rgb=(%u,%u,%u)\n",
+                            "rgb=(%.9g,%.9g,%.9g); expected tsdf=%.9g weight=%.9g rgb=(%.9g,%.9g,%.9g)\n",
                             i, v.tsdf, v.weight, v.r, v.g, v.b,
                             EMPTY_TSDF, EMPTY_WEIGHT, EMPTY_COLOR, EMPTY_COLOR, EMPTY_COLOR);
             }
@@ -89,14 +91,19 @@ const int kDirtyPts[4][3] = {{0, 0, 0}, {1, 2, 3}, {3, 4, 5}, {kRes - 1, kRes - 
 
 float dirtyTsdf(int i) { return 0.25f + 0.1f * static_cast<float>(i); }
 float dirtyWeight(int i) { return 7.0f + static_cast<float>(i); }
-uint8_t dirtyR(int i) { return static_cast<uint8_t>(11 + i); }
+// The color domain is float sRGB [0,1], so the dirty fill goes through the same
+// byte -> float widening production integration uses; a raw 11 in this field is
+// an out-of-range sRGB component, not a color.
+float dirtyR(int i) { return srgbUint8ToFloat(static_cast<uint8_t>(11 + i)); }
+float dirtyG(int i) { return srgbUint8ToFloat(static_cast<uint8_t>(22 + i)); }
+float dirtyB(int i) { return srgbUint8ToFloat(static_cast<uint8_t>(33 + i)); }
 
 void dirtyVolume(TSDFVolume& vol) {
     for (int i = 0; i < 4; ++i) {
         Voxel& v = vol.voxelAt(kDirtyPts[i][0], kDirtyPts[i][1], kDirtyPts[i][2]);
         v.tsdf   = dirtyTsdf(i);
         v.weight = dirtyWeight(i);
-        v.r = dirtyR(i); v.g = static_cast<uint8_t>(22 + i); v.b = static_cast<uint8_t>(33 + i);
+        v.r = dirtyR(i); v.g = dirtyG(i); v.b = dirtyB(i);
     }
 }
 
@@ -114,8 +121,7 @@ void checkDirtyStateIsStuck(TSDFVolume& vol, const std::string& stage) {
     for (int i = 0; i < 4; ++i) {
         const Voxel& v = at(vol, kDirtyPts[i][0], kDirtyPts[i][1], kDirtyPts[i][2]);
         CHECK(v.tsdf == dirtyTsdf(i) && v.weight == dirtyWeight(i) &&
-              v.r == dirtyR(i) && v.g == static_cast<uint8_t>(22 + i) &&
-              v.b == static_cast<uint8_t>(33 + i),
+              v.r == dirtyR(i) && v.g == dirtyG(i) && v.b == dirtyB(i),
               stage + ": dirty voxel " + std::to_string(i) + " holds the written bit pattern");
     }
 }

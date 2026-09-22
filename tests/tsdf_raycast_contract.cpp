@@ -23,6 +23,7 @@
 // That state is unambiguous in this fixture because every configured near bound is
 // >= 0.12 m, so a genuine hit can never sit at the camera origin.
 #include "tsdf/TSDFVolume.h"
+#include "utils/ColorMath.h"
 
 #include <algorithm>
 #include <cmath>
@@ -42,6 +43,8 @@ namespace {
 using kfusion::tsdf::EMPTY_COLOR;
 using kfusion::tsdf::TSDFParams;
 using kfusion::tsdf::TSDFVolume;
+using kfusion::utils::srgbFloatToUint8;    // the one CPU float sRGB -> byte policy
+using kfusion::utils::srgbUint8ToFloat;   // uint8 sRGB -> the volume's float sRGB domain
 using kfusion::tsdf::Voxel;
 
 int g_failures = 0;
@@ -140,9 +143,9 @@ std::unique_ptr<TSDFVolume> makeVolume(float min_depth, float max_depth, FieldFn
                 Voxel& v = vol->voxelAt(x, y, z);
                 v.tsdf   = field(kVs * static_cast<float>(z));
                 v.weight = 4.0f;
-                v.r      = c.r;
-                v.g      = c.g;
-                v.b      = c.b;
+                v.r      = srgbUint8ToFloat(c.r);
+                v.g      = srgbUint8ToFloat(c.g);
+                v.b      = srgbUint8ToFloat(c.b);
             }
         }
     }
@@ -186,6 +189,12 @@ Hit castPixel(const TSDFVolume& vol, int px, int py) {
 
 bool near(double got, double want, double tol = kTol) { return std::fabs(got - want) <= tol; }
 bool colorEq(const Hit& h, Rgb c) { return h.c[0] == c.r && h.c[1] == c.g && h.c[2] == c.b; }
+// The byte an unobserved voxel's float sRGB color publishes as.
+uint8_t emptyColorByte() {
+    uint8_t b = 0;
+    srgbFloatToUint8(EMPTY_COLOR, b);
+    return b;
+}
 int  layerOf(double z) { return static_cast<int>(std::floor(z / kVs)); }
 std::string rgbStr(uint8_t r, uint8_t g, uint8_t b) {
     return "(" + std::to_string(r) + "," + std::to_string(g) + "," + std::to_string(b) + ")";
@@ -216,7 +225,8 @@ void gateA_planarHit() {
                                 "'s own RGB " + rgbStr(want.r, want.g, want.b) + ", got " + rgbStr(h));
     CHECK(!colorEq(h, layerColor(want_layer - 1)) && !colorEq(h, layerColor(want_layer + 1)),
           tag + ": color is not an adjacent layer's (no neighbour ghost)");
-    CHECK(!(h.c[0] == EMPTY_COLOR && h.c[1] == EMPTY_COLOR && h.c[2] == EMPTY_COLOR),
+    const uint8_t empty_c = emptyColorByte();
+    CHECK(!(h.c[0] == empty_c && h.c[1] == empty_c && h.c[2] == empty_c),
           tag + ": color is not the stale unobserved fill color");
     std::printf("A hit=(%.7f,%.7f,%.7f) normal=(%.4f,%.4f,%.4f) rgb=%s want_z=%.7f\n", h.v.x(),
                 h.v.y(), h.v.z(), h.n.x(), h.n.y(), h.n.z(), rgbStr(h).c_str(), kWallHitZ);

@@ -21,6 +21,7 @@
 
 #include "meshing/MarchingCubes.h"
 #include "tsdf/TSDFVolume.h"
+#include "utils/ColorMath.h"
 
 #include <atomic>
 #include <cmath>
@@ -37,6 +38,7 @@ using kfusion::meshing::MeshData;
 using kfusion::meshing::ProgressCallback;
 using kfusion::tsdf::TSDFParams;
 using kfusion::tsdf::TSDFVolume;
+using kfusion::utils::srgbUint8ToFloat;   // uint8 sRGB -> the volume's float sRGB domain
 
 int g_failures = 0;
 int g_sections = 0;
@@ -68,7 +70,7 @@ void fillSphere(TSDFVolume& vol, int R, float vs, float rad) {
                 auto& v = vol.voxelAt(x, y, z);
                 v.tsdf   = std::max(-1.0f, std::min(1.0f, t));
                 v.weight = p.max_weight;
-                v.r = 60; v.g = 120; v.b = 180;
+                v.r = srgbUint8ToFloat(60); v.g = srgbUint8ToFloat(120); v.b = srgbUint8ToFloat(180);
             }
 }
 

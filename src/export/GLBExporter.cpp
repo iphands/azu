@@ -1,4 +1,6 @@
 #include "export/GLBExporter.h"
+#include "export/ColorConversion.h"
+#include "utils/ColorMath.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -143,20 +145,32 @@ bool GLBExporter::write(const meshing::MeshData& input_mesh, const std::string& 
         norm_length = buffer_data.size() - norm_offset;
     }
 
-    // --- vertex colors (as vec4 FLOAT) ---
-    // Standard GLTF viewers prefer FLOAT colors.
+    // --- vertex colors (as vec4 FLOAT, LINEAR light) ---
+    // MeshData colors are uint8 sRGB; glTF COLOR_0 is linear float, so this is
+    // the mandatory decode (docs/CANONICAL_SEMANTICS.md). Alpha is not converted.
+    // The checked decode rejects rather than clamps, and it runs while the mesh
+    // is still in memory: a rejected component aborts the export BEFORE the file
+    // is opened, exactly like the validate() gates above.
     size_t col_offset = 0;
     size_t col_length = 0;
+    std::vector<float> col_data;
     if (has_colors) {
-        col_offset = buffer_data.size();
-        std::vector<float> col_data;
         col_data.reserve(nvert * 4);
         for (size_t i = 0; i < nvert; ++i) {
-            col_data.push_back(mesh.colors[i*3+0] / 255.0f);
-            col_data.push_back(mesh.colors[i*3+1] / 255.0f);
-            col_data.push_back(mesh.colors[i*3+2] / 255.0f);
+            float lr = 0.0f, lg = 0.0f, lb = 0.0f;
+            if (!srgbColorToLinear(utils::srgbUint8ToFloat(mesh.colors[i*3+0]),
+                                   utils::srgbUint8ToFloat(mesh.colors[i*3+1]),
+                                   utils::srgbUint8ToFloat(mesh.colors[i*3+2]), lr, lg, lb)) {
+                KFLOGF_ERROR("GLBExport", "Color component %zu is not a valid sRGB value, "
+                                          "nothing written to %s", i, filepath.c_str());
+                return false;
+            }
+            col_data.push_back(lr);
+            col_data.push_back(lg);
+            col_data.push_back(lb);
             col_data.push_back(1.0f); // alpha
         }
+        col_offset = buffer_data.size();
         appendBytes(col_data.data(), col_data.size() * sizeof(float));
         col_length = buffer_data.size() - col_offset;
     }
