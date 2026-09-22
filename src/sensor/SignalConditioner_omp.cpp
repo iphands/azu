@@ -56,42 +56,43 @@ struct FilterStats {
     float avg_depth_delta = 0.0f;
 };
 
-FilterStats g_stats;
-bool g_logging_enabled = false;
-std::ofstream g_log_file;
+// Process-global CSV diagnostic channel (KFUSION_LOG=debug|1|verbose). It is a
+// deliberately process-wide facility, NOT per-instance state: one file, one
+// header line, opened at most once, and the env parsing that decides it is
+// read-mostly configuration. The C++11 function-local static makes that
+// configuration write-once and thread-safe, replacing the mutable
+// logging_enabled / initialized flag pair that used to be raced on the hot
+// path. The per-frame counters are not here: they live in
+// SignalConditioner::Stats, the object that produces them.
+struct CsvSink {
+    std::ofstream file;
+    bool          enabled = false;
 
-void initLogging() {
-    const char* log_env = std::getenv("KFUSION_LOG");
-    if (log_env) {
+    CsvSink() {
+        const char* log_env = std::getenv("KFUSION_LOG");
+        if (!log_env) return;
         std::string env_str(log_env);
         for (auto& c : env_str) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (env_str == "debug" || env_str == "1" || env_str == "verbose") {
-            g_logging_enabled = true;
-            g_log_file.open("signal_conditioner_log.csv");
-            if (g_log_file.is_open()) {
-                g_log_file << "frame,bilateral_filtered,median_filtered,hole_filled,guided_filtered,ema_reset,ema_filtered,boundary_clamps,edge_pixels,max_depth_delta,avg_depth_delta\n";
-            }
+        if (env_str != "debug" && env_str != "1" && env_str != "verbose") return;
+        file.open("signal_conditioner_log.csv");
+        if (file.is_open()) {
+            file << "frame,bilateral_filtered,median_filtered,hole_filled,guided_filtered,"
+                    "ema_reset,ema_filtered,boundary_clamps,edge_pixels,max_depth_delta,"
+                    "avg_depth_delta\n";
+            file.flush();
+            enabled = true;
         }
     }
+};
+
+CsvSink& csvSink() {
+    static CsvSink sink;
+    return sink;
 }
 
-void logFrameStats(int frame_id) {
-    if (!g_logging_enabled || !g_log_file.is_open()) return;
-    g_log_file << frame_id << ","
-               << g_stats.bilateral_filtered << ","
-               << g_stats.median_filtered << ","
-               << g_stats.hole_filled << ","
-               << g_stats.guided_filtered << ","
-               << g_stats.ema_reset << ","
-               << g_stats.ema_filtered << ","
-               << g_stats.boundary_clamps << ","
-               << g_stats.edge_pixels << ","
-               << g_stats.max_depth_delta << ","
-               << g_stats.avg_depth_delta << "\n";
-    g_log_file.flush();
-    // Reset stats for next frame
-    g_stats = FilterStats{};
-}
+// Read on the per-pixel hot path; one atomic-free bool load of a value that is
+// never written after the first call.
+inline bool diagnosticsEnabled() { return csvSink().enabled; }
 
 inline uint8_t clampToByte(float v) {
     return static_cast<uint8_t>(std::clamp(v, 0.0f, 255.0f));
@@ -177,10 +178,6 @@ void medianBlur3x3(std::vector<uint8_t>& rgb) {
     }
 
     rgb.swap(scratch);
-    if (g_logging_enabled) {
-        #pragma omp atomic
-        g_stats.median_filtered += FRAME_W * FRAME_H;
-    }
 }
 
 void bilateralDenoiseRgb(const std::vector<uint8_t>& src, std::vector<uint8_t>& dst) {
@@ -228,10 +225,6 @@ void bilateralDenoiseRgb(const std::vector<uint8_t>& src, std::vector<uint8_t>& 
             }
         }
     }
-    if (g_logging_enabled) {
-        #pragma omp atomic
-        g_stats.bilateral_filtered += FRAME_W * FRAME_H;
-    }
 }
 
 } // namespace
@@ -244,6 +237,35 @@ SignalConditioner::SignalConditioner()
        guidance_luma_(FRAME_W * FRAME_H, 0.0f),
        depth_scratch_(FRAME_W * FRAME_H, 0),
        depth_src_(FRAME_W * FRAME_H, 0) {}
+
+void SignalConditioner::logDiagnostics() {
+    CsvSink& sink = csvSink();
+    if (!sink.enabled || !sink.file.is_open()) return;
+
+    // avg_depth_delta divides by the CONTRIBUTING sample count. Every sample in
+    // the sum passed the same in-band test that increments ema_filtered (an
+    // out-of-band pixel resets and continues before any delta exists), so
+    // ema_filtered is exactly the denominator; a fully invalid frame reports 0.0
+    // instead of 0/0 = NaN.
+    const float avg_depth_delta =
+        (stats_.ema_filtered > 0)
+            ? static_cast<float>(stats_.sum_depth_delta / stats_.ema_filtered)
+            : 0.0f;
+
+    sink.file << stats_frame_++ << ","
+              << stats_.bilateral_filtered << ","
+              << stats_.median_filtered << ","
+              << stats_.hole_filled << ","
+              << stats_.guided_filtered << ","
+              << stats_.ema_reset << ","
+              << stats_.ema_filtered << ","
+              << stats_.boundary_clamps << ","
+              << stats_.edge_pixels << ","
+              << stats_.max_depth_delta << ","
+              << avg_depth_delta << "\n";
+    sink.file.flush();
+    stats_ = Stats{};
+}
 
 
 void SignalConditioner::reset() {
@@ -307,14 +329,6 @@ void SignalConditioner::process(RawFrame& raw, cudaStream_t cuda_stream, float m
 }
 
 void SignalConditioner::processCpu(RawFrame& raw, float min_depth_m, float max_depth_m) {
-    static int frame_counter = 0;
-    static bool logging_initialized = false;
-    
-    if (!logging_initialized) {
-        initLogging();
-        logging_initialized = true;
-    }
-    
     preprocessRgb(raw.rgb);
     applySuperResolutionToRgb(raw.rgb, raw.frame_id); // Apply EASU+RCAS for TSDF texturing
     buildSuperResolutionGuidance(raw.rgb); // Build guidance from processed RGB
@@ -323,9 +337,7 @@ void SignalConditioner::processCpu(RawFrame& raw, float min_depth_m, float max_d
     guidedDepthFilter(raw.depth, min_depth_m, max_depth_m);
     applyDepthEma(raw.depth, min_depth_m, max_depth_m);
     
-    if (g_logging_enabled) {
-        logFrameStats(frame_counter++);
-    }
+    logDiagnostics();
 }
 
 void SignalConditioner::preprocessRgb(std::vector<uint8_t>& rgb) {
@@ -338,6 +350,14 @@ void SignalConditioner::preprocessRgb(std::vector<uint8_t>& rgb) {
     // reduction and `applyCAS` (SuperResolution) later for contrast enhancement.
 
     medianBlur3x3(rgb);
+
+    // Counted here rather than inside the two free helpers, which cannot name
+    // this object's private Stats: both stages ran to completion on this thread,
+    // so the per-frame totals are identical to the old in-helper increments.
+    if (diagnosticsEnabled()) {
+        stats_.bilateral_filtered += FRAME_W * FRAME_H;
+        stats_.median_filtered    += FRAME_W * FRAME_H;
+    }
 }
 
 void SignalConditioner::buildSuperResolutionGuidance(const std::vector<uint8_t>& rgb) {
@@ -449,9 +469,9 @@ void SignalConditioner::denoiseDepthSpatial(std::vector<uint16_t>& depth, float 
     }
 
     depth.swap(depth_scratch_);
-    if (g_logging_enabled) {
+    if (diagnosticsEnabled()) {
         #pragma omp atomic
-        g_stats.median_filtered += FRAME_W * FRAME_H;
+        stats_.median_filtered += FRAME_W * FRAME_H;
     }
 }
 
@@ -475,9 +495,9 @@ void SignalConditioner::applyDepthEma(std::vector<uint16_t>& depth, float min_de
         const float depth_m = cpuDepthMeters(src[i], min_depth_m, max_depth_m);
         if (depth_m == 0.0f) {
             ema[i] = 0.0f; // Prevent ghosting by resetting stale EMA values
-            if (g_logging_enabled) {
+            if (diagnosticsEnabled()) {
                 #pragma omp atomic
-                g_stats.ema_reset++;
+                stats_.ema_reset++;
             }
             // The destination keeps the incoming raw code untouched: raw 0 stays
             // raw 0 and the raw 2047 sentinel stays raw 2047. Rewriting either
@@ -533,24 +553,21 @@ void SignalConditioner::applyDepthEma(std::vector<uint16_t>& depth, float min_de
         ema[i]   = (encoded != 0) ? filtered : 0.0f;
         depth[i] = encoded;
         
-        if (g_logging_enabled) {
+        if (diagnosticsEnabled()) {
             #pragma omp atomic
-            g_stats.ema_filtered++;
+            stats_.ema_filtered++;
             if (reset_ema) {
                 #pragma omp atomic
-                g_stats.ema_reset++;
+                stats_.ema_reset++;
             }
             #pragma omp critical
             {
-                g_stats.max_depth_delta = std::max(g_stats.max_depth_delta, delta);
-                g_stats.avg_depth_delta += delta;
+                stats_.max_depth_delta = std::max(stats_.max_depth_delta, delta);
+                stats_.sum_depth_delta += delta;
             }
         }
     }
-    if (g_logging_enabled && FRAME_W * FRAME_H > 0) {
-        g_stats.avg_depth_delta /= (FRAME_W * FRAME_H);
     }
-}
 
 void SignalConditioner::fillDepthHoles(std::vector<uint16_t>& depth, float min_depth_m, float max_depth_m) {
     // NOTE: depth_scratch_ is a member variable used as a write-scratch buffer.
@@ -600,9 +617,9 @@ void SignalConditioner::fillDepthHoles(std::vector<uint16_t>& depth, float min_d
 
             if (valid_neighbors > 0 && weight_sum > 1e-6f) {
                 depth_scratch_[idx] = cpuDepthMetersToRaw(weighted_sum / weight_sum, min_depth_m, max_depth_m);
-                if (g_logging_enabled) {
+                if (diagnosticsEnabled()) {
                     #pragma omp atomic
-                    g_stats.hole_filled++;
+                    stats_.hole_filled++;
                 }
             }
         }
@@ -638,9 +655,9 @@ void SignalConditioner::guidedDepthFilter(std::vector<uint16_t>& depth, float mi
             
             // Edge-aware filtering: compute depth gradient to reduce filter strength near edges
             const float edge_strength = computeDepthGradient(depth, x, y, FRAME_W, FRAME_H, min_depth_m, max_depth_m);
-            if (g_logging_enabled && edge_strength > 0.5f) {
+            if (diagnosticsEnabled() && edge_strength > 0.5f) {
                 #pragma omp atomic
-                g_stats.edge_pixels++;
+                stats_.edge_pixels++;
             }
 
             float sum_weights = 0.0f;
@@ -676,9 +693,9 @@ void SignalConditioner::guidedDepthFilter(std::vector<uint16_t>& depth, float mi
 
             if (sum_weights > 1e-6f) {
                 depth_scratch_[idx] = cpuDepthMetersToRaw(sum_depth / sum_weights, min_depth_m, max_depth_m);
-                if (g_logging_enabled) {
+                if (diagnosticsEnabled()) {
                     #pragma omp atomic
-                    g_stats.guided_filtered++;
+                    stats_.guided_filtered++;
                 }
             } else {
                 // Fallback to original depth if filtering failed

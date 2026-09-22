@@ -53,7 +53,17 @@ CPU_LABEL="cpu"
 # written to disk, its GLB container and JSON chunk parsed independently, its
 # accessors/buffer views/bounds/unit normals/linear COLOR_0 checked against the glTF
 # spec, a tinygltf round trip over the same bytes, every invalid mesh refused with no
-# file, and a real post-open write fault leaving no partial GLB); every name is
+# file, and a real post-open write fault leaving no partial GLB); todo 33
+# INTENTIONALLY appended logger_timer_contract as the 35th CPU test (the real
+# src/utils/Logger.cpp atomic threshold, localtime_r stamp, single-write whole-line
+# emission under concurrent foreign std::cerr writers, plus the real
+# src/utils/Timer.cpp zero-allocation scope and its named above-threshold record)
+# and stats_denominator_contract as the 36th CPU test (the real TSDFVolume /
+# SignalConditioner / FrameData CSV channels read back from disk, locking that every
+# published mean divides by its contributing sample count, that a zero-contribution
+# frame publishes 0.0 rather than NaN, that the counters partition the raster, and
+# that each channel creates no file at all when its env gate is absent, each scenario
+# in its own fork+execve child inside a private mkdtemp tree); every name is
 # enforced as registered (the list only ever grows, so the guard never weakens).
 REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_contract"
     "marching_cubes_table_contract" "marching_cubes_sphere_contract" "tsdf_reset_contract"
@@ -80,7 +90,12 @@ REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_co
     # todo 30: real PLY writer schema/LE bytes + every no-file failure path.
     "ply_writer_contract"
     # todo 31: real GLB writer container/glTF validity, unit normals, linear COLOR_0.
-    "glb_writer_contract")
+    "glb_writer_contract"
+    # todo 33: real Logger threshold/stamp/single-write integrity + zero-alloc Timer.
+    "logger_timer_contract"
+    # todo 33: real TSDF/SignalConditioner/FrameData stats means over their
+    # contributing sample counts, read back from the CSV channel itself.
+    "stats_denominator_contract")
 # Real controller coupling, proven post-build: a source-only replica that
 # re-declares its own look-alike seam methods has none of these symbols. Both
 # real-controller seam binaries must carry them...

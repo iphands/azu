@@ -183,9 +183,38 @@ public:
     bool isGPUEnabled() const { return gpu_enabled_; }
 
 private:
+    // Per-volume integration diagnostics (audit tsdf:T23: these counters used to
+    // be one file-scope struct shared by every TSDFVolume in the process, so a
+    // second volume silently polluted the first one's CSV rows). They live here
+    // because this object is what actually produces them.
+    //
+    // Concurrency story: every write happens inside integrate(), i.e. while the
+    // volume's own unique_lock is held — the integer counters that are updated
+    // from inside an OpenMP region do so under `#pragma omp atomic` /
+    // `#pragma omp critical`, the rest in the serial canonical fold. The single
+    // read + reset is logDiagnostics(), also under that unique_lock, after the
+    // parallel region's implicit barrier. There is deliberately no public
+    // accessor: reading these without the volume lock would be a data race, and
+    // the AZU_TSDF_LOG=1 CSV is the only consumer by design.
+    struct Stats {
+        int    depth_filtered      = 0;
+        int    voxels_updated      = 0;   // contributing samples of sum_abs_sdf
+        int    color_updates       = 0;
+        int    truncation_clamped  = 0;
+        float  max_abs_sdf         = 0.0f;
+        double sum_abs_sdf         = 0.0; // sum over exactly voxels_updated samples
+    };
+
+    // Writes the AZU_TSDF_LOG CSV row for the current frame (avg computed as
+    // sum_abs_sdf / voxels_updated, the contributing-sample count) and resets
+    // stats_. Caller holds the unique_lock; no-op when the channel is off.
+    void logDiagnostics();
+
     TSDFParams           params_;
     std::vector<Voxel>   voxels_;
     std::atomic<int>     integrated_frames_{0};
+    Stats                stats_;
+    int                  stats_frame_{0};
     mutable std::shared_mutex mutex_;
 
     inline int idx(int x, int y, int z) const {

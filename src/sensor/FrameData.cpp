@@ -13,46 +13,90 @@
 namespace kfusion {
 namespace sensor {
 
-// FrameData logging infrastructure
-struct FrameDataStats {
-    int depth_filtered = 0;
-    int vertices_computed = 0;
-    int normals_computed = 0;
-    int normals_skipped_depth = 0;
-    int normals_skipped_jump = 0;
-    float max_depth = 0.0f;
-    float avg_depth = 0.0f;
+namespace {
+
+// Process-global frame diagnostics, deliberately NOT per-instance (audit
+// sensor:S-19): buildFrameData() and computeNormals() are free functions with no
+// owning object, and one CSV row carries counters from BOTH, so the accumulator
+// cannot live in either call. It is internal-linkage, so no other TU can touch
+// it, and the AZU_FRAME_LOG=1 CSV is its only reader.
+//
+// Concurrency story: every write inside an OpenMP region is an
+// `#pragma omp atomic` (integer counters) or an `#pragma omp critical`
+// (float max/sum); the single read + reset happens in logFrameDataStats(), which
+// runs on the driving thread AFTER the enclosing parallel region's implicit
+// barrier. There is exactly one driver (PipelineController's single preprocess
+// stage), and the channel is a debug facility, not a measurement API: a second
+// concurrent driver would interleave rows, which is why nothing here pretends to
+// be lock-free-shareable.
+struct FrameStats {
+    int    depth_filtered       = 0;
+    int    vertices_computed    = 0;   // contributing samples of sum_depth
+    int    normals_computed     = 0;
+    int    normals_skipped_depth = 0;
+    int    normals_skipped_jump = 0;
+    float  max_depth            = 0.0f;
+    double sum_depth            = 0.0; // sum over exactly vertices_computed samples
 };
 
-FrameDataStats g_frame_stats;
-bool g_frame_logging_enabled = false;
-std::ofstream g_frame_log_file;
+FrameStats g_frame_stats;
+int        g_frame_seq = 0;   // CSV column only: a channel sequence number
 
-void initFrameDataLogging() {
-    const char* log_env = std::getenv("AZU_FRAME_LOG");
-    if (log_env && std::string(log_env) == "1") {
-        g_frame_logging_enabled = true;
-        g_frame_log_file.open("framedata_log.csv");
-        if (g_frame_log_file.is_open()) {
-            g_frame_log_file << "frame,depth_filtered,vertices_computed,normals_computed,normals_skipped_depth,normals_skipped_jump,max_depth,avg_depth\n";
+// Process-global CSV diagnostic channel (AZU_FRAME_LOG=1): one file, one header
+// line, opened at most once. The function-local static makes the env-derived
+// switch write-once and thread-safe, replacing the mutable enabled /
+// initialized flag pair that used to be raced on the hot path.
+struct CsvSink {
+    std::ofstream file;
+    bool          enabled = false;
+
+    CsvSink() {
+        const char* log_env = std::getenv("AZU_FRAME_LOG");
+        if (!log_env || std::string(log_env) != "1") return;
+        file.open("framedata_log.csv");
+        if (file.is_open()) {
+            file << "frame,depth_filtered,vertices_computed,normals_computed,"
+                    "normals_skipped_depth,normals_skipped_jump,max_depth,avg_depth\n";
+            file.flush();
+            enabled = true;
         }
     }
+};
+
+CsvSink& csvSink() {
+    static CsvSink sink;
+    return sink;
 }
 
-void logFrameDataStats(int frame_id) {
-    if (!g_frame_logging_enabled || !g_frame_log_file.is_open()) return;
-    g_frame_log_file << frame_id << ","
-               << g_frame_stats.depth_filtered << ","
-               << g_frame_stats.vertices_computed << ","
-               << g_frame_stats.normals_computed << ","
-               << g_frame_stats.normals_skipped_depth << ","
-               << g_frame_stats.normals_skipped_jump << ","
-               << g_frame_stats.max_depth << ","
-               << g_frame_stats.avg_depth << "\n";
-    g_frame_log_file.flush();
-    // Reset stats for next frame
-    g_frame_stats = FrameDataStats{};
+inline bool diagnosticsEnabled() { return csvSink().enabled; }
+
+void logFrameDataStats() {
+    CsvSink& sink = csvSink();
+    if (!sink.enabled || !sink.file.is_open()) return;
+
+    // avg_depth divides by the CONTRIBUTING sample count. Every term in the sum
+    // is a pixel whose depth passed the band test, i.e. exactly the pixel that
+    // increments vertices_computed, so vertices_computed is the denominator;
+    // dividing by the raster size instead silently diluted the mean by the
+    // invalid-pixel fraction. An all-invalid frame reports 0.0, not 0/0 = NaN.
+    const float avg_depth =
+        (g_frame_stats.vertices_computed > 0)
+            ? static_cast<float>(g_frame_stats.sum_depth / g_frame_stats.vertices_computed)
+            : 0.0f;
+
+    sink.file << g_frame_seq++ << ","
+              << g_frame_stats.depth_filtered << ","
+              << g_frame_stats.vertices_computed << ","
+              << g_frame_stats.normals_computed << ","
+              << g_frame_stats.normals_skipped_depth << ","
+              << g_frame_stats.normals_skipped_jump << ","
+              << g_frame_stats.max_depth << ","
+              << avg_depth << "\n";
+    sink.file.flush();
+    g_frame_stats = FrameStats{};
 }
+
+} // namespace
 
 namespace {
 
@@ -95,14 +139,6 @@ void buildFrameData(const uint16_t* raw_depth,
                     float           min_depth,
                     float           max_depth)
 {
-    static int frame_counter = 0;
-    static bool logging_initialized = false;
-    
-    if (!logging_initialized) {
-        initFrameDataLogging();
-        logging_initialized = true;
-    }
-    
     const int W = out.width;
     const int H = out.height;
     // THE CPU depth boundary for everything downstream (vertices, normals,
@@ -121,7 +157,7 @@ void buildFrameData(const uint16_t* raw_depth,
                 out.depth_meters[idx] = 0.0f;
                 out.vertices[idx]     = Eigen::Vector3f::Zero();
                 out.normals[idx]      = Eigen::Vector3f::Zero();
-                if (g_frame_logging_enabled) {
+                if (diagnosticsEnabled()) {
                     #pragma omp atomic
                     g_frame_stats.depth_filtered++;
                 }
@@ -130,13 +166,13 @@ void buildFrameData(const uint16_t* raw_depth,
                 out.vertices[idx] = Eigen::Vector3f::Zero();
                 out.normals[idx]  = Eigen::Vector3f::Zero(); // computed separately
                 
-                if (g_frame_logging_enabled) {
+                if (diagnosticsEnabled()) {
                     #pragma omp atomic
                     g_frame_stats.vertices_computed++;
                     #pragma omp critical
                     {
                         g_frame_stats.max_depth = std::max(g_frame_stats.max_depth, d);
-                        g_frame_stats.avg_depth += d;
+                        g_frame_stats.sum_depth += static_cast<double>(d);
                     }
                 }
             }
@@ -149,12 +185,8 @@ void buildFrameData(const uint16_t* raw_depth,
 
     updateVerticesFromDepth(out);
     
-    if (g_frame_logging_enabled && W * H > 0) {
-        g_frame_stats.avg_depth /= (W * H);
-    }
-    
-    if (g_frame_logging_enabled) {
-        logFrameDataStats(frame_counter++);
+    if (diagnosticsEnabled()) {
+        logFrameDataStats();
     }
 }
 
@@ -177,7 +209,7 @@ void computeNormals(FrameData& frame) {
                 frame.depth_meters[u] <= 0.0f ||
                 frame.depth_meters[d] <= 0.0f) {
                 frame.normals[c] = Eigen::Vector3f::Zero();
-                if (g_frame_logging_enabled) {
+                if (diagnosticsEnabled()) {
                     #pragma omp atomic
                     g_frame_stats.normals_skipped_depth++;
                 }
@@ -191,7 +223,7 @@ void computeNormals(FrameData& frame) {
                 std::abs(dc - frame.depth_meters[u]) > jump ||
                 std::abs(dc - frame.depth_meters[d]) > jump) {
                 frame.normals[c] = Eigen::Vector3f::Zero();
-                if (g_frame_logging_enabled) {
+                if (diagnosticsEnabled()) {
                     #pragma omp atomic
                     g_frame_stats.normals_skipped_jump++;
                 }
@@ -204,7 +236,7 @@ void computeNormals(FrameData& frame) {
             float len = n.norm();
             if (len > 1e-6f) {
                 frame.normals[c] = n / len;
-                if (g_frame_logging_enabled) {
+                if (diagnosticsEnabled()) {
                     #pragma omp atomic
                     g_frame_stats.normals_computed++;
                 }

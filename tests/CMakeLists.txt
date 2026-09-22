@@ -647,6 +647,46 @@ target_link_libraries(glb_writer_contract PRIVATE azu_test_core)
 add_test(NAME glb_writer_contract COMMAND glb_writer_contract)
 set_tests_properties(glb_writer_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 33: CPU logger/timer hygiene + stats denominator contracts ----
+# logger_timer_contract drives the REAL src/utils/Logger.cpp and src/utils/Timer.cpp
+# (gate 14 below demands both TUs inside azu_test_core, so a local replica cannot
+# link). Expectations are protocol properties, never snapshots: threshold semantics
+# for the typed and variadic paths, the exact record grammar including the fixed
+# three-digit millisecond field and the 10-column tag, stamp validity plus
+# monotonicity across a burst, and a single-write integrity test in which foreign
+# threads stream multi-insert lines to the same unbuffered std::cerr while four
+# logger threads emit 1600 uniquely-tokened records - every logger record must still
+# arrive whole, exactly once, because one composed string is one write(2). It also
+# proves ScopedTimer performs ZERO allocations per below-threshold scope using a
+# global operator new counter and a name longer than any SSO buffer, and that the
+# const char* name contract is compile-enforced. stderr is captured to a private
+# temp file through dup2 and removed.
+add_executable(logger_timer_contract logger_timer_contract.cpp)
+target_compile_definitions(logger_timer_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(logger_timer_contract PRIVATE azu_test_core)
+
+# stats_denominator_contract drives the REAL TSDFVolume / SignalConditioner /
+# FrameData diagnostic channels (gate 15 below). It locks that every published mean
+# divides by its CONTRIBUTING SAMPLE COUNT, through oracles that need no product
+# snapshot: max/count <= mean <= max over a one-valid-pixel TSDF frame (a raster
+# denominator misses by four orders of magnitude), mean == max exactly on uniform
+# EMA and uniform-depth fixtures, the two FrameData counters partitioning the
+# raster, depth_filtered counting the fixture's own invalid pixels, padding
+# invariance across the invalid sentinel versus an out-of-band distance, a
+# zero-contribution frame publishing exactly 0.0 and never NaN, and every channel
+# creating NO file when its env gate is absent. Each scenario needs a fresh env and
+# a fresh working directory, so it runs in its own fork+execve child inside a
+# private mkdtemp tree the parent inspects and removes.
+add_executable(stats_denominator_contract stats_denominator_contract.cpp)
+target_compile_definitions(stats_denominator_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(stats_denominator_contract PRIVATE azu_test_core)
+
+add_test(NAME logger_timer_contract COMMAND logger_timer_contract)
+set_tests_properties(logger_timer_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
+add_test(NAME stats_denominator_contract COMMAND stats_denominator_contract)
+set_tests_properties(stats_denominator_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that
@@ -1229,4 +1269,111 @@ if(NOT AZU_TEST_CORE_HAS_GLB_TU)
         "instead of the product GLB writer.")
 endif()
 
-message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract + pipeline_state_contract + pipeline_mesh_cadence_contract + pipeline_export_mesh_contract + camera_basis_contract + fusion_ui_validation_contract + ply_writer_contract + glb_writer_contract registered (label=cpu)")
+# 14) big-fix todo 33: logger_timer_contract must drive the REAL Logger and Timer
+#     translation units. Same discipline as gate 1/4/5/.../13: comments are stripped
+#     first, so only a genuine CALL SHAPE (receiver '.'/'>'/'::' + name + '(')
+#     configures the gate. The singleton accessor, both threshold surfaces and the
+#     variadic path are demanded, plus a qualified ScopedTimer declaration - and the
+#     library it links must CARRY both real TUs, because a test that re-declared its
+#     own logger/timer could otherwise never be told apart from the product.
+get_target_property(AZU_LOGTEST_SOURCES logger_timer_contract SOURCES)
+if(NOT AZU_LOGTEST_SOURCES)
+    message(FATAL_ERROR "ANTI-SYNTHETIC GATE: logger_timer_contract has no SOURCES.")
+endif()
+set(AZU_LOGTEST_TEXT "")
+foreach(_azu_lsrc ${AZU_LOGTEST_SOURCES})
+    get_filename_component(_azu_labs "${_azu_lsrc}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(NOT EXISTS "${_azu_labs}")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: registered logger_timer_contract source ${_azu_labs} does not exist.")
+    endif()
+    file(READ "${_azu_labs}" _azu_ltxt)
+    azu_strip_c_comments(_azu_ltxt_code _azu_ltxt)
+    string(APPEND AZU_LOGTEST_TEXT "${_azu_ltxt_code}")
+endforeach()
+foreach(_azu_lcall instance setLevel currentLevel logf)
+    if(NOT AZU_LOGTEST_TEXT MATCHES "[.>:]${_azu_lcall}[ \t\r\n]*\\(")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: the logger_timer_contract source must call ${_azu_lcall}() on the real "
+            "kfusion::utils::Logger (a comment or string literal naming it is not a call).")
+    endif()
+endforeach()
+if(NOT AZU_LOGTEST_TEXT MATCHES "[.>:]ScopedTimer[ \t\r\n]+[A-Za-z_][A-Za-z0-9_]*[ \t\r\n]*\\(")
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: the logger_timer_contract source must construct a qualified "
+        "kfusion::utils::ScopedTimer (a replica timer class does not satisfy this todo).")
+endif()
+get_target_property(AZU_LOGTEST_LINKS logger_timer_contract LINK_LIBRARIES)
+if(NOT "${AZU_LOGTEST_LINKS}" MATCHES "azu_test_core")
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: logger_timer_contract must link azu_test_core, got: ${AZU_LOGTEST_LINKS}")
+endif()
+get_target_property(AZU_LOG_CORE_SOURCES azu_test_core SOURCES)
+if(NOT AZU_LOG_CORE_SOURCES)
+    message(FATAL_ERROR "ANTI-SYNTHETIC GATE: azu_test_core has no SOURCES.")
+endif()
+foreach(_azu_needed_util Logger Timer)
+    set(AZU_TEST_CORE_HAS_${_azu_needed_util}_TU FALSE)
+    foreach(_azu_core_src ${AZU_LOG_CORE_SOURCES})
+        file(TO_CMAKE_PATH "${_azu_core_src}" _azu_core_norm)
+        if(_azu_core_norm MATCHES "(^|/)src/utils/${_azu_needed_util}\\.cpp$")
+            set(AZU_TEST_CORE_HAS_${_azu_needed_util}_TU TRUE)
+        endif()
+    endforeach()
+    if(NOT AZU_TEST_CORE_HAS_${_azu_needed_util}_TU)
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: azu_test_core must compile the real src/utils/${_azu_needed_util}.cpp "
+            "as one source-list element; logger_timer_contract would otherwise test a replica.")
+    endif()
+endforeach()
+
+# 15) big-fix todo 33: stats_denominator_contract must drive the REAL product paths
+#     that produce each CSV row - the TSDF integrate kernel, the SignalConditioner
+#     EMA stage and buildFrameData - and must READ the resulting rows back. Comments
+#     are stripped first, so only a genuine CALL SHAPE configures the gate; the CSV
+#     read-back is demanded through the file-opening call shape too, because a test
+#     that only recomputed means in memory would prove nothing about what the
+#     product publishes.
+get_target_property(AZU_STATSTEST_SOURCES stats_denominator_contract SOURCES)
+if(NOT AZU_STATSTEST_SOURCES)
+    message(FATAL_ERROR "ANTI-SYNTHETIC GATE: stats_denominator_contract has no SOURCES.")
+endif()
+set(AZU_STATSTEST_TEXT "")
+foreach(_azu_ssrc ${AZU_STATSTEST_SOURCES})
+    get_filename_component(_azu_sabs "${_azu_ssrc}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(NOT EXISTS "${_azu_sabs}")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: registered stats_denominator_contract source ${_azu_sabs} does not exist.")
+    endif()
+    file(READ "${_azu_sabs}" _azu_stxt)
+    azu_strip_c_comments(_azu_stxt_code _azu_stxt)
+    string(APPEND AZU_STATSTEST_TEXT "${_azu_stxt_code}")
+endforeach()
+foreach(_azu_scall integrate applyDepthEmaForTests buildFrameData is_open)
+    if(NOT AZU_STATSTEST_TEXT MATCHES "[.>:]${_azu_scall}[ \t\r\n]*\\(")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: the stats_denominator_contract source must call ${_azu_scall}() (real product "
+            "path or CSV read-back; a comment or string literal naming it is not a call).")
+    endif()
+endforeach()
+get_target_property(AZU_STATSTEST_LINKS stats_denominator_contract LINK_LIBRARIES)
+if(NOT "${AZU_STATSTEST_LINKS}" MATCHES "azu_test_core")
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: stats_denominator_contract must link azu_test_core, got: ${AZU_STATSTEST_LINKS}")
+endif()
+foreach(_azu_needed_stat src/tsdf/TSDFVolume src/sensor/SignalConditioner_omp src/sensor/FrameData)
+    set(AZU_TEST_CORE_HAS_STAT_TU FALSE)
+    foreach(_azu_core_src ${AZU_LOG_CORE_SOURCES})
+        file(TO_CMAKE_PATH "${_azu_core_src}" _azu_core_norm)
+        if(_azu_core_norm MATCHES "(^|/)${_azu_needed_stat}\\.cpp$")
+            set(AZU_TEST_CORE_HAS_STAT_TU TRUE)
+        endif()
+    endforeach()
+    if(NOT AZU_TEST_CORE_HAS_STAT_TU)
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: azu_test_core must compile the real ${_azu_needed_stat}.cpp; "
+            "stats_denominator_contract would otherwise test a replica accumulator.")
+    endif()
+endforeach()
+
+message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract + pipeline_state_contract + pipeline_mesh_cadence_contract + pipeline_export_mesh_contract + camera_basis_contract + fusion_ui_validation_contract + ply_writer_contract + glb_writer_contract + logger_timer_contract + stats_denominator_contract registered (label=cpu)")

@@ -18,19 +18,66 @@
 namespace kfusion {
 namespace tsdf {
 
-// TSDF logging infrastructure
-struct TSDFStats {
-    int depth_filtered = 0;
-    int voxels_updated = 0;
-    int color_updates = 0;
-    int truncation_clamped = 0;
-    float max_sdf = 0.0f;
-    float avg_sdf = 0.0f;
+namespace {
+
+// Process-global CSV diagnostic channel for TSDF integration (AZU_TSDF_LOG=1).
+// It is a deliberately process-wide facility, NOT per-instance state: one file,
+// one header line, opened at most once. The C++11 function-local static makes
+// the read-mostly configuration write-once and thread-safe (magic-static
+// initialization runs exactly once even if two threads integrate at once), which
+// is why there is no mutable `logging_enabled` / `initialized` flag pair racing
+// on the hot path any more. The per-frame COUNTERS are not here — they live in
+// TSDFVolume::Stats, the object that produces them.
+struct CsvSink {
+    std::ofstream file;
+    bool          enabled = false;
+
+    CsvSink() {
+        const char* log_env = std::getenv("AZU_TSDF_LOG");
+        if (log_env && std::string(log_env) == "1") {
+            enabled = true;
+            file.open("tsdf_integration_log.csv");
+            if (file.is_open()) {
+                file << "frame,depth_filtered,voxels_updated,color_updates,"
+                        "truncation_clamped,max_sdf,avg_sdf\n";
+                file.flush();
+            } else {
+                enabled = false;   // fail closed: no header, no rows
+            }
+        }
+    }
 };
 
-TSDFStats g_tsdf_stats;
-bool g_tsdf_logging_enabled = false;
-std::ofstream g_tsdf_log_file;
+CsvSink& csvSink() {
+    static CsvSink sink;
+    return sink;
+}
+
+} // namespace
+
+void TSDFVolume::logDiagnostics() {
+    CsvSink& sink = csvSink();
+    if (!sink.enabled || !sink.file.is_open()) return;
+
+    // avg_sdf divides by the CONTRIBUTING sample count, not by the raster size.
+    // Every sample folded into the sum is one voxels_updated increment in the
+    // same statement, so voxels_updated is exactly the denominator; a frame that
+    // updated nothing has no mean at all and stays 0.0 instead of 0/0 = NaN.
+    const float avg_sdf =
+        (stats_.voxels_updated > 0)
+            ? static_cast<float>(stats_.sum_abs_sdf / stats_.voxels_updated)
+            : 0.0f;
+
+    sink.file << stats_frame_++ << ","
+              << stats_.depth_filtered << ","
+              << stats_.voxels_updated << ","
+              << stats_.color_updates << ","
+              << stats_.truncation_clamped << ","
+              << stats_.max_abs_sdf << ","
+              << avg_sdf << "\n";
+    sink.file.flush();
+    stats_ = Stats{};
+}
 
 namespace {
 // Exact comparison over every field, so a change in any one of them is visible.
@@ -45,31 +92,6 @@ bool sameParams(const TSDFParams& a, const TSDFParams& b) {
            (a.origin.array() == b.origin.array()).all();
 }
 } // namespace
-
-void initTSDFLogging() {
-    const char* log_env = std::getenv("AZU_TSDF_LOG");
-    if (log_env && std::string(log_env) == "1") {
-        g_tsdf_logging_enabled = true;
-        g_tsdf_log_file.open("tsdf_integration_log.csv");
-        if (g_tsdf_log_file.is_open()) {
-            g_tsdf_log_file << "frame,depth_filtered,voxels_updated,color_updates,truncation_clamped,max_sdf,avg_sdf\n";
-        }
-    }
-}
-
-void logTSDFStats(int frame_id) {
-    if (!g_tsdf_logging_enabled || !g_tsdf_log_file.is_open()) return;
-    g_tsdf_log_file << frame_id << ","
-               << g_tsdf_stats.depth_filtered << ","
-               << g_tsdf_stats.voxels_updated << ","
-               << g_tsdf_stats.color_updates << ","
-               << g_tsdf_stats.truncation_clamped << ","
-               << g_tsdf_stats.max_sdf << ","
-               << g_tsdf_stats.avg_sdf << "\n";
-    g_tsdf_log_file.flush();
-    // Reset stats for next frame
-    g_tsdf_stats = TSDFStats{};
-}
 
 TSDFVolume::TSDFVolume(const TSDFParams& params)
     : params_(params)
@@ -131,14 +153,6 @@ void TSDFVolume::integrate(const float*           depth_meters,
                            float min_depth,
                            float max_depth)
 {
-    static int frame_counter = 0;
-    static bool logging_initialized = false;
-    
-    if (!logging_initialized) {
-        initTSDFLogging();
-        logging_initialized = true;
-    }
-    
     std::unique_lock<std::shared_mutex> lk(mutex_);
 #ifdef CUDA_ENABLED
     if (gpu_enabled_) {
@@ -191,9 +205,9 @@ void TSDFVolume::integrate(const float*           depth_meters,
 #endif
     integrated_frames_.fetch_add(1);
     
-    if (g_tsdf_logging_enabled) {
-        logTSDFStats(frame_counter++);
-    }
+    // Still under the unique_lock taken above: the diagnostics read + reset is
+    // serialized with every other integration exactly like the writes are.
+    logDiagnostics();
 }
 
 void TSDFVolume::integrateCPU(const float*           depth_meters,
@@ -242,7 +256,7 @@ void TSDFVolume::integrateCPU(const float*           depth_meters,
     // Logging never alters the canonical fold; when enabled its counters accumulate
     // deterministically (integer sums in Phase 1, the float |sdf| sum in Phase 2
     // canonical order), so an AZU_TSDF_LOG=1 run is reproducible too.
-    const bool logging = g_tsdf_logging_enabled;
+    const bool logging = csvSink().enabled;
     std::vector<Candidate> candidates;
 
     #pragma omp parallel
@@ -325,8 +339,8 @@ void TSDFVolume::integrateCPU(const float*           depth_meters,
         {
             candidates.insert(candidates.end(), local.begin(), local.end());
             if (logging) {
-                g_tsdf_stats.depth_filtered     += local_depth_filtered;
-                g_tsdf_stats.truncation_clamped += local_truncation_clamped;
+                stats_.depth_filtered     += local_depth_filtered;
+                stats_.truncation_clamped += local_truncation_clamped;
             }
         }
     }
@@ -352,9 +366,9 @@ void TSDFVolume::integrateCPU(const float*           depth_meters,
         vox.weight = w_sum;
 
         if (logging) {
-            ++g_tsdf_stats.voxels_updated;
-            g_tsdf_stats.max_sdf = std::max(g_tsdf_stats.max_sdf, c.abs_sdf);
-            g_tsdf_stats.avg_sdf += c.abs_sdf;
+            ++stats_.voxels_updated;
+            stats_.max_abs_sdf = std::max(stats_.max_abs_sdf, c.abs_sdf);
+            stats_.sum_abs_sdf += c.abs_sdf;
         }
 
         if (c.apply_color) {
@@ -377,13 +391,9 @@ void TSDFVolume::integrateCPU(const float*           depth_meters,
                 vox.r = r_next;
                 vox.g = g_next;
                 vox.b = b_next;
-                if (logging) ++g_tsdf_stats.color_updates;
+                if (logging) ++stats_.color_updates;
             }
         }
-    }
-    
-    if (g_tsdf_logging_enabled && width * height > 0) {
-        g_tsdf_stats.avg_sdf /= (width * height);
     }
 }
 

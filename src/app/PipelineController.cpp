@@ -9,7 +9,6 @@
 #include <chrono>
 #include <cmath>
 #include <stdexcept>
-#include <iostream>
 
 #ifdef CUDA_ENABLED
 #include <cuda_runtime.h>
@@ -1505,7 +1504,7 @@ bool PipelineController::exportMesh(const std::string &path,
   uint64_t ver;
   auto mesh = shared_mesh_.snapshot(ver);
   if (!mesh || mesh->empty()) {
-    std::cout << "[Pipeline] No mesh yet, requesting an extraction...\n";
+    KFLOG_INFO("Pipeline", "No mesh yet, requesting an extraction...");
     // Request a version and wait for THAT version to be published, instead of
     // polling a shared flag that another thread (or the cadence) could clear:
     // the wait is now answered only by the mesh this request caused.
@@ -1514,7 +1513,7 @@ bool PipelineController::exportMesh(const std::string &path,
     mesh = shared_mesh_.snapshot(ver);
   }
   if (!mesh || mesh->empty()) {
-    std::cerr << "[Pipeline] No mesh to export — scan more frames first.\n";
+    KFLOG_WARN("Pipeline", "No mesh to export — scan more frames first.");
     return false;
   }
   {
@@ -1525,10 +1524,10 @@ bool PipelineController::exportMesh(const std::string &path,
   try {
     ok = writer_fn(*mesh, path);
   } catch (const std::exception &e) {
-    std::cerr << "[Pipeline] Export writer threw: " << e.what() << "\n";
+    KFLOG_ERROR("Pipeline", std::string("Export writer threw: ") + e.what());
     ok = false;
   } catch (...) {
-    std::cerr << "[Pipeline] Export writer threw an unknown error.\n";
+    KFLOG_ERROR("Pipeline", "Export writer threw an unknown error.");
     ok = false;
   }
   {

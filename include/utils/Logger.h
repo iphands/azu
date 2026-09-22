@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <string>
 #include <mutex>
 #include <chrono>
@@ -15,6 +16,12 @@ public:
     static Logger& instance();
 
     void setLevel(LogLevel level);
+    // Current threshold. The stored value is the integer underlying LogLevel, so
+    // a concurrent setLevel() is a well-defined atomic store rather than a data
+    // race on a plain enum field. Named currentLevel(), not level(), because the
+    // log/logf call sites carry a `level` parameter that would shadow it.
+    LogLevel currentLevel() const;
+
     void log(LogLevel level, const std::string& tag, const std::string& msg);
     
     // Variadic printf-style logging
@@ -27,8 +34,13 @@ public:
 
 private:
     Logger();
+
+    // Serializes whole-line emission only. It deliberately does NOT guard the
+    // threshold: every hot call site (logf / log) reads the threshold BEFORE
+    // taking this lock, so the threshold has to be race-free on its own and
+    // lives in level_ below.
     std::mutex mutex_;
-    LogLevel   level_;
+    std::atomic<int> level_;
 };
 
 } // namespace utils

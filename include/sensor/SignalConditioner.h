@@ -73,6 +73,39 @@ public:
     const std::vector<uint8_t>& getSrRgbUpscaled() const { return sr_rgb_upscaled_; }
 
 private:
+    // Per-instance depth-stage diagnostics (audit sensor:S-19: they used to be
+    // one file-scope struct shared by every SignalConditioner in the process, so
+    // two conditioners silently mixed their counters into each other's CSV
+    // rows). They belong to this object because this object is what counts them.
+    //
+    // Concurrency story: one SignalConditioner is driven by exactly one thread at
+    // a time (the pipeline's single preprocess/tracking thread — the same
+    // invariant depth_scratch_ already relies on, see fillDepthHoles). Within a
+    // frame the counters are only touched inside OpenMP regions, where the
+    // integer increments use `#pragma omp atomic` and the float max/sum a
+    // `#pragma omp critical`; the single read + reset (logDiagnostics) happens on
+    // the driving thread after those regions' implicit barriers. No lock, because
+    // no second driver exists — and no cross-instance sharing left to race with.
+    struct Stats {
+        int    bilateral_filtered  = 0;
+        int    median_filtered     = 0;
+        int    hole_filled         = 0;
+        int    guided_filtered     = 0;
+        int    ema_reset           = 0;
+        int    ema_filtered        = 0;   // contributing samples of sum_depth_delta
+        int    boundary_clamps     = 0;
+        int    edge_pixels         = 0;
+        float  max_depth_delta     = 0.0f;
+        double sum_depth_delta     = 0.0; // sum over exactly ema_filtered samples
+    };
+
+    // Writes the KFUSION_LOG CSV row for the current frame (avg_depth_delta
+    // computed as sum_depth_delta / ema_filtered, the contributing-sample count)
+    // and resets stats_. No-op while the channel is off.
+    void logDiagnostics();
+
+    Stats                stats_;
+    int                  stats_frame_{0};
     int sr_scale_ = 2; // Default 2x upscaling
     // Availability state for sr_rgb_upscaled_. Never consulted on its own:
     // srUpscaledAvailable() re-derives the geometry and scale every call, so a
