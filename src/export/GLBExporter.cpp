@@ -405,6 +405,12 @@ bool GLBExporter::write(const meshing::MeshData& input_mesh, const std::string& 
     // Write GLB
     // ---------------------------------------------------------
     tinygltf::TinyGLTF writer;
+    // errno is only a cause channel if it belongs to THIS call. It is a global: an
+    // unrelated earlier failure can leave it dirty, and a writer that returns false
+    // without a failing syscall would then report that stale value as the cause
+    // (GLB-06). Clearing here makes the captured value either the write path's own
+    // error or honestly zero ("no errno was set by the write path").
+    errno = 0;
     const bool ok = writer.WriteGltfSceneToFile(&model, filepath,
         /*embedImages=*/true,
         /*embedBuffers=*/true,

@@ -43,7 +43,9 @@
 //      is refused with a real cause and nothing is created or deleted; a REAL
 //      post-open RLIMIT_FSIZE fault leaves NO partial file and logs the real cause
 //      (GLB-06: the previous code logged err/warn strings that tinygltf never
-//      fills, i.e. it could not name any cause at all);
+//      fills, i.e. it could not name any cause at all), and the reported errno is
+//      always one THIS call's failure produced - a deliberately dirtied prior
+//      errno can never masquerade as the writer's cause;
 //   H determinism: the same mesh exports byte-identically twice.
 //
 // Filesystem use is the point of this contract; it stays in a process-unique
@@ -57,6 +59,7 @@
 #include "utils/ColorMath.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
@@ -978,7 +981,11 @@ void testWriterFailures() {
     // G3: a REAL writer failure the log can be captured from. The parent directory
     // exists but is not writable, so the pre-check cannot see it and the open inside
     // the writer is what fails. The report must name the target and the cause the
-    // write path actually observed.
+    // write path actually observed. errno is deliberately dirtied to EPERM right
+    // before the call: the writer must reset it before its own I/O, so the reported
+    // cause is the real EACCES from the refused open, never the stale value a
+    // previous unrelated failure left behind (the old code captured errno only AFTER
+    // the call, so a dirty global could masquerade as the writer's cause).
     {
         const auto ro     = scratchDir() / "locked";
         const auto target = ro / "blocked.glb";
@@ -991,7 +998,10 @@ void testWriterFailures() {
         const auto capf = scratchDir() / "blocked.stderr.txt";
         std::string captured;
         bool wrote = true;
-        const bool cap_ok = captureTo(capf, [&] { wrote = GLBExporter::write(mesh, target.string()); }, captured);
+        const bool cap_ok = captureTo(capf, [&] {
+                                   errno = EPERM;  // dirty global from an unrelated earlier failure
+                                   wrote = GLBExporter::write(mesh, target.string());
+                               }, captured);
         std::filesystem::permissions(ro, std::filesystem::perms::all, std::filesystem::perm_options::replace, ec);
         CHECK(!wrote, "G3: write into an unwritable directory returns false");
         CHECK(!std::filesystem::exists(target), "G3: no file was created in the unwritable directory");
@@ -1002,6 +1012,11 @@ void testWriterFailures() {
             CHECK(captured.find("errno=") != std::string::npos ||
                       captured.find("no errno was set") != std::string::npos,
                   "G3: the report carries the cause the write path observed");
+            CHECK(captured.find("errno=13 (") != std::string::npos,
+                  "G3: the reported errno is the real EACCES(13) of the refused open (GLB-06)");
+            CHECK(captured.find("errno=1 ") == std::string::npos &&
+                      captured.find("Operation not permitted") == std::string::npos,
+                  "G3: the dirty pre-set errno=EPERM(1) is NOT reported as the writer cause");
             CHECK(captured.find("no file was created") != std::string::npos ||
                       captured.find("partial") != std::string::npos,
                   "G3: the report states what state the target ended in");
