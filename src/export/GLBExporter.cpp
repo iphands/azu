@@ -1,6 +1,9 @@
 #include "export/GLBExporter.h"
 #include "export/ColorConversion.h"
 #include "utils/ColorMath.h"
+#include <cerrno>
+#include <cmath>
+#include <filesystem>
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -18,15 +21,94 @@
 namespace kfusion {
 namespace export_io {
 
-// Kinect → Unity/GLTF coordinate conversion:
-//   Kinect: right-handed, X right, Y down, Z forward
-//   GLTF:   right-handed, X right, Y up,   Z backward
-// Mapping:
-//   (x, y, z) -> (x, -y, -z)
-// Flipping two axes (Y and Z) preserves winding order.
+namespace {
+
+// Coordinate mapping (GLB-09). Both spaces are RIGHT-HANDED; glTF's canonical
+// orientation is X right, Y UP, Z backward (towards the viewer), while the project's
+// source space is X right, Y DOWN, Z forward. Flipping the two axes that differ
+// gives (x, y, z) -> (x, -y, -z), a rotation (determinant +1), so handedness AND
+// triangle winding are both preserved and no node transform is needed.
 static Eigen::Vector3f toGLTF(const Eigen::Vector3f& v) {
     return Eigen::Vector3f(v.x(), -v.y(), -v.z());
 }
+
+// glTF requires NORMAL accessor vectors to be unit length. A zero-length (or
+// underflow-to-zero) normal therefore cannot be written as-is, and silently
+// dropping the whole NORMAL attribute would change the file schema for one bad
+// vertex. The documented contract is a deterministic substitute instead: a normal
+// that cannot be normalized becomes kFallbackNormalSource - source-space +Z, the
+// camera-forward direction - taken through the very same mapping as every other
+// normal, i.e. (0, 0, -1) in glTF space. It is unit length, it is constant, and it
+// is reported per export, so the output is reproducible and never the (0,0,0) that
+// a strict reader rejects (GLB-05).
+constexpr float kMinNormalLength = 1e-6f;
+const Eigen::Vector3f kFallbackNormalSource(0.0f, 0.0f, 1.0f);
+
+// Length is measured before the mapping: toGLTF only flips signs, so it preserves
+// length, and measuring here makes the substitution decision depend on the input
+// alone. `substituted` is set exactly when the fallback was written.
+Eigen::Vector3f unitNormalToGLTF(const Eigen::Vector3f& n_source, bool& substituted) {
+    substituted = false;
+    const float len = n_source.norm();
+    if (!std::isfinite(len) || len < kMinNormalLength) {
+        substituted = true;
+        return toGLTF(kFallbackNormalSource);
+    }
+    return toGLTF(n_source) / len;
+}
+
+// The target must be openable before the writer runs, because tinygltf creates the
+// file the instant it opens it: after the fact, an unopenable path and a truncated
+// write look identical except for what the filesystem already said. Existence is
+// the only thing checked here (never permissions, which a privileged caller would
+// misreport), so nothing below can refuse a path the writer could have opened.
+bool targetPrecheck(const std::string& filepath, std::string& reason) {
+    std::error_code ec;
+    const std::filesystem::path path(filepath);
+    if (std::filesystem::is_directory(path, ec)) {
+        reason = "target path is an existing directory";
+        return false;
+    }
+    const std::filesystem::path parent = path.parent_path();
+    if (!parent.empty() && !std::filesystem::is_directory(parent, ec)) {
+        reason = "parent directory " + parent.string() + " does not exist";
+        return false;
+    }
+    return true;
+}
+
+// GLB-06: tinygltf's writer takes no error out-parameter, so nothing it hands back
+// can name a cause. What is observable is what the write path left behind: the errno
+// of the failed I/O and the state of the target. That is what gets reported.
+std::string diagnoseWriteFailure(const std::string& filepath, int writer_errno) {
+    std::string s = "tinygltf WriteGltfSceneToFile returned false";
+    if (writer_errno != 0) {
+        s += "; errno=" + std::to_string(writer_errno) + " (" + std::strerror(writer_errno) + ")";
+    } else {
+        s += "; no errno was set by the write path";
+    }
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(filepath, ec)) {
+        s += "; target left a " + std::to_string(std::filesystem::file_size(filepath, ec)) +
+             " byte(s) partial file";
+    } else if (std::filesystem::exists(filepath, ec)) {
+        s += "; target exists but is not a regular file";
+    } else {
+        s += "; no file was created";
+    }
+    return s;
+}
+
+// Delete an unfinished GLB, but only when the target IS a regular file: a failed
+// write may name a directory, and destroying a target this writer never created is a
+// worse bug than the partial file it would have deleted.
+bool removePartialFile(const std::string& filepath) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(filepath, ec)) return false;
+    return std::filesystem::remove(filepath, ec) && !ec;
+}
+
+} // namespace
 
 bool GLBExporter::write(const meshing::MeshData& input_mesh, const std::string& filepath) {
     // Runs before the weld loop, which indexes positions/normals/colors with
@@ -35,6 +117,13 @@ bool GLBExporter::write(const meshing::MeshData& input_mesh, const std::string& 
     if (!input_mesh.validate(&reason)) {
         KFLOGF_ERROR("GLBExport", "Invalid mesh, nothing written to %s: %s",
                      filepath.c_str(), reason.c_str());
+        return false;
+    }
+
+    // Same fail-before-open discipline as validate(): a path that cannot hold the
+    // file is refused here, with the cause, before tinygltf can create anything.
+    if (!targetPrecheck(filepath, reason)) {
+        KFLOGF_ERROR("GLBExport", "Refusing to write %s: %s", filepath.c_str(), reason.c_str());
         return false;
     }
 
@@ -128,21 +217,26 @@ bool GLBExporter::write(const meshing::MeshData& input_mesh, const std::string& 
     // --- normals ---
     size_t norm_offset = 0;
     size_t norm_length = 0;
+    size_t fallback_normals = 0;
     if (has_normals) {
         norm_offset = buffer_data.size();
         std::vector<float> norm_data;
         norm_data.reserve(nvert * 3);
         for (size_t i = 0; i < nvert; ++i) {
-            Eigen::Vector3f n = toGLTF(mesh.normals[i]);
-            // Re-normalize after transformation
-            float len = n.norm();
-            if (len > 1e-6f) n /= len;
+            bool substituted = false;
+            const Eigen::Vector3f n = unitNormalToGLTF(mesh.normals[i], substituted);
+            if (substituted) ++fallback_normals;
             norm_data.push_back(n.x());
             norm_data.push_back(n.y());
             norm_data.push_back(n.z());
         }
         appendBytes(norm_data.data(), norm_data.size() * sizeof(float));
         norm_length = buffer_data.size() - norm_offset;
+    }
+    if (fallback_normals > 0) {
+        KFLOGF_INFO("GLBExport", "%zu normal(s) could not be normalized; the documented "
+                                 "fallback (source +Z -> glTF (0,0,-1)) was written in their place",
+                    fallback_normals);
     }
 
     // --- vertex colors (as vec4 FLOAT, LINEAR light) ---
@@ -195,7 +289,11 @@ bool GLBExporter::write(const meshing::MeshData& input_mesh, const std::string& 
 
     // Buffer
     tinygltf::Buffer gltf_buf;
-    gltf_buf.data = buffer_data;
+    // GLB-08: the payload is moved into the writer's buffer representation. buffer_data
+    // has no reader after this point (every offset and length above was captured while
+    // it was still intact), so copying the largest object in the export would be pure
+    // waste.
+    gltf_buf.data = std::move(buffer_data);
     model.buffers.push_back(std::move(gltf_buf));
 
     int buf_idx = 0;
@@ -232,11 +330,14 @@ bool GLBExporter::write(const meshing::MeshData& input_mesh, const std::string& 
     // Position buffer view + accessor
     int bv_pos = addBufferView(pos_offset, pos_length, TINYGLTF_TARGET_ARRAY_BUFFER);
 
-    // Compute bounding box for accessor min/max (required for positions)
-    Eigen::Vector3f bmin( 1e9f,  1e9f,  1e9f);
-    Eigen::Vector3f bmax(-1e9f, -1e9f, -1e9f);
-    for (const auto& p : mesh.positions) {
-        Eigen::Vector3f pg = toGLTF(p);
+    // Compute bounding box for accessor min/max (required for positions). Seeded from
+    // the first vertex, not from a sentinel: a +-1e9 seed silently clips an axis whose
+    // coordinates all lie beyond it, and these values are a promise to the reader
+    // about the geometry it just loaded.
+    Eigen::Vector3f bmin = toGLTF(mesh.positions[0]);
+    Eigen::Vector3f bmax = bmin;
+    for (size_t i = 1; i < nvert; ++i) {
+        const Eigen::Vector3f pg = toGLTF(mesh.positions[i]);
         bmin = bmin.cwiseMin(pg);
         bmax = bmax.cwiseMax(pg);
     }
@@ -304,17 +405,20 @@ bool GLBExporter::write(const meshing::MeshData& input_mesh, const std::string& 
     // Write GLB
     // ---------------------------------------------------------
     tinygltf::TinyGLTF writer;
-    std::string err, warn;
-    bool ok = writer.WriteGltfSceneToFile(&model, filepath,
+    const bool ok = writer.WriteGltfSceneToFile(&model, filepath,
         /*embedImages=*/true,
         /*embedBuffers=*/true,
         /*prettyPrint=*/false,
         /*writeBinary=*/true);
 
     if (!ok) {
-        KFLOGF_ERROR("GLBExport", "WriteGltfSceneToFile failed for: %s", filepath.c_str());
-        if (!err.empty())  KFLOGF_ERROR("GLBExport", "  Error: %s", err.c_str());
-        if (!warn.empty()) KFLOGF_WARN("GLBExport", "  Warn:  %s", warn.c_str());
+        // Captured before any further filesystem call can overwrite it.
+        const int writer_errno = errno;
+        const std::string cause = diagnoseWriteFailure(filepath, writer_errno);
+        const bool cleaned = removePartialFile(filepath);
+        KFLOGF_ERROR("GLBExport", "GLB write failed for %s: %s%s", filepath.c_str(), cause.c_str(),
+                     cleaned ? "; partial file removed" :
+                               "; nothing to remove (the target is not a file we created)");
         return false;
     }
 

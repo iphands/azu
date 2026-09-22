@@ -625,6 +625,28 @@ target_link_libraries(ply_writer_contract PRIVATE azu_test_core)
 add_test(NAME ply_writer_contract COMMAND ply_writer_contract)
 set_tests_properties(ply_writer_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 31: CPU GLB writer glTF-validity / linear-color contract ----
+# glb_writer_contract drives the REAL src/export/GLBExporter.cpp (carried by
+# azu_test_core through its src/export/*.cpp glob; gate 13 below) through its public
+# write() entry point and PARSES THE GLB CONTAINER ITSELF - magic, version,
+# totalLength, 4-aligned space-padded JSON chunk and zero-padded BIN chunk - then
+# parses the JSON chunk with the bundled nlohmann JSON, so glTF validity is asserted
+# against the spec numbers on disk (5126/5125, VEC3/VEC4/SCALAR, POSITION min+max,
+# 4-aligned byteOffsets, 34962/34963 targets, no zero-count accessor, disjoint
+# in-buffer views) before any tinygltf round-trip is trusted. It locks the
+# right-handed Y-up mapping (x,-y,-z), unit normals with the documented fallback for
+# a zero-length input, winding preserved through the position weld, COLOR_0 as LINEAR
+# float RGB against an independent double EOTF oracle, min/max that describe the data
+# even beyond the old +-1e9 sentinel, refusal of every invalid mesh with no file, a
+# real post-open RLIMIT_FSIZE fault leaving no partial GLB with its real cause
+# reported, and byte-identical repeats. Files live in a process-unique temp dir.
+add_executable(glb_writer_contract glb_writer_contract.cpp)
+target_compile_definitions(glb_writer_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(glb_writer_contract PRIVATE azu_test_core)
+
+add_test(NAME glb_writer_contract COMMAND glb_writer_contract)
+set_tests_properties(glb_writer_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that
@@ -1146,4 +1168,65 @@ if(NOT AZU_TEST_CORE_HAS_PLY_TU)
         "instead of the product PLY writer.")
 endif()
 
-message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract + pipeline_state_contract + pipeline_mesh_cadence_contract + pipeline_export_mesh_contract + camera_basis_contract + fusion_ui_validation_contract + ply_writer_contract registered (label=cpu)")
+# 13) big-fix todo 31: glb_writer_contract must drive the REAL GLB writer AND parse
+#     the result two independent ways. Same discipline as gate 1/4/5/6/7/8/9/10/11/12:
+#     comments are stripped first, so only a genuine CALL SHAPE (receiver
+#     '.'/'>'/'::' + name + '(') satisfies it. Three shapes are demanded, because the
+#     todo's acceptance criterion is "GLB JSON chunk parse AND tinygltf round-trip":
+#     write() (the product writer, namespace-qualified so a `:` precedes it),
+#     parse() (the nlohmann JSON parse of the JSON chunk the writer produced) and
+#     LoadBinaryFromFile() (the tinygltf round trip). A test that only handed a path
+#     to tinygltf would miss the parse() shape; a test that re-implemented the GLB
+#     container itself would link nothing and fail the coupling half, since
+#     azu_test_core must carry the real src/export/GLBExporter.cpp.
+get_target_property(AZU_GLB_TEST_SOURCES glb_writer_contract SOURCES)
+if(NOT AZU_GLB_TEST_SOURCES)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: glb_writer_contract has no SOURCES.")
+endif()
+set(AZU_GLB_TEST_TEXT "")
+foreach(_azu_glb_src ${AZU_GLB_TEST_SOURCES})
+    get_filename_component(_azu_glb_abs "${_azu_glb_src}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(NOT EXISTS "${_azu_glb_abs}")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: registered glb_writer_contract source ${_azu_glb_abs} does not exist.")
+    endif()
+    file(READ "${_azu_glb_abs}" _azu_glb_txt)
+    azu_strip_c_comments(_azu_glb_txt_code _azu_glb_txt)
+    string(APPEND AZU_GLB_TEST_TEXT "${_azu_glb_txt_code}")
+endforeach()
+foreach(_azu_glb_call write parse LoadBinaryFromFile)
+    if(NOT AZU_GLB_TEST_TEXT MATCHES "[.>:]${_azu_glb_call}[ \t\r\n]*\\(")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: the glb_writer_contract source must call ${_azu_glb_call}() on the real "
+            "writer/JSON loader (a comment or string literal naming it is not a call). A test that skips "
+            "the product writer or skips the JSON-chunk parse does not satisfy this todo.")
+    endif()
+endforeach()
+get_target_property(AZU_GLB_TEST_LINKS glb_writer_contract LINK_LIBRARIES)
+if(NOT "${AZU_GLB_TEST_LINKS}" MATCHES "azu_test_core")
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: glb_writer_contract must link azu_test_core, "
+        "got: ${AZU_GLB_TEST_LINKS}")
+endif()
+# Positive coupling: azu_test_core has to CARRY the real GLB writer TU.
+get_target_property(AZU_GLB_CORE_SOURCES azu_test_core SOURCES)
+if(NOT AZU_GLB_CORE_SOURCES)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: azu_test_core has no SOURCES.")
+endif()
+set(AZU_TEST_CORE_HAS_GLB_TU FALSE)
+foreach(_azu_core_src ${AZU_GLB_CORE_SOURCES})
+    file(TO_CMAKE_PATH "${_azu_core_src}" _azu_core_norm)
+    if(_azu_core_norm MATCHES "(^|/)src/export/GLBExporter\\.cpp$")
+        set(AZU_TEST_CORE_HAS_GLB_TU TRUE)
+    endif()
+endforeach()
+if(NOT AZU_TEST_CORE_HAS_GLB_TU)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: azu_test_core must compile the real src/export/GLBExporter.cpp "
+        "as one source-list element; glb_writer_contract would otherwise test a replica "
+        "instead of the product GLB writer.")
+endif()
+
+message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract + pipeline_state_contract + pipeline_mesh_cadence_contract + pipeline_export_mesh_contract + camera_basis_contract + fusion_ui_validation_contract + ply_writer_contract + glb_writer_contract registered (label=cpu)")

@@ -48,8 +48,13 @@ CPU_LABEL="cpu"
 # ply_writer_contract as the 33rd CPU test (the real src/export/PLYExporter.cpp
 # binary/ASCII schema, explicit little-endian bytes, header/payload count
 # agreement, determinism and every no-file failure path, driven through both
-# public write entry points and parsed off disk); every name is enforced as
-# registered (the list only ever grows, so the guard never weakens).
+# public write entry points and parsed off disk); todo 31 INTENTIONALLY appended
+# glb_writer_contract as the 34th CPU test (the real src/export/GLBExporter.cpp
+# written to disk, its GLB container and JSON chunk parsed independently, its
+# accessors/buffer views/bounds/unit normals/linear COLOR_0 checked against the glTF
+# spec, a tinygltf round trip over the same bytes, every invalid mesh refused with no
+# file, and a real post-open write fault leaving no partial GLB); every name is
+# enforced as registered (the list only ever grows, so the guard never weakens).
 REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_contract"
     "marching_cubes_table_contract" "marching_cubes_sphere_contract" "tsdf_reset_contract"
     "mesh_validation_contract" "coordinate_rounding_contract" "icp_weighting_contract"
@@ -73,7 +78,9 @@ REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_co
     # todo 29: Qt-free fusion UI validation / preset staging / metrics band model.
     "fusion_ui_validation_contract"
     # todo 30: real PLY writer schema/LE bytes + every no-file failure path.
-    "ply_writer_contract")
+    "ply_writer_contract"
+    # todo 31: real GLB writer container/glTF validity, unit normals, linear COLOR_0.
+    "glb_writer_contract")
 # Real controller coupling, proven post-build: a source-only replica that
 # re-declares its own look-alike seam methods has none of these symbols. Both
 # real-controller seam binaries must carry them...
