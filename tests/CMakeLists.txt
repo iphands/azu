@@ -100,6 +100,27 @@ set_tests_properties(pipeline_test_seam_smoke PROPERTIES
     # process even if a worker thread misbehaves.
 )
 
+# ---- big-fix todo 6: Marching Cubes fail-before-fix contracts ----
+# marching_cubes_table_contract is INTENTIONALLY RED until todo 7 repairs
+# edge_table[213/214/215]; it validates all 256 rows against an independent
+# crossing-edge oracle and is CPU-only (header + integer math, no volume).
+# marching_cubes_sphere_contract drives the real MarchingCubes::extract over an
+# analytic sphere and is green: its pre-extraction enumeration proves the fixture
+# never touches the corrupt configs, so it is UB-free regardless of the table state.
+add_executable(marching_cubes_table_contract marching_cubes_table_contract.cpp)
+target_compile_definitions(marching_cubes_table_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(marching_cubes_table_contract PRIVATE azu_test_core)
+
+add_executable(marching_cubes_sphere_contract marching_cubes_sphere_contract.cpp)
+target_compile_definitions(marching_cubes_sphere_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(marching_cubes_sphere_contract PRIVATE azu_test_core)
+
+add_test(NAME marching_cubes_table_contract COMMAND marching_cubes_table_contract)
+set_tests_properties(marching_cubes_table_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
+add_test(NAME marching_cubes_sphere_contract COMMAND marching_cubes_sphere_contract)
+set_tests_properties(marching_cubes_sphere_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that
