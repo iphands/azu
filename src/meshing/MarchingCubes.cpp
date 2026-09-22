@@ -3,6 +3,7 @@
 #include <cmath>
 #include <array>
 #include <iostream>
+#include <limits>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -12,16 +13,6 @@
 
 namespace kfusion {
 namespace meshing {
-
-// Helper for vertex unification
-struct VectorHash {
-    size_t operator()(const Eigen::Vector3f& v) const {
-        size_t h1 = std::hash<float>{}(v.x());
-        size_t h2 = std::hash<float>{}(v.y());
-        size_t h3 = std::hash<float>{}(v.z());
-        return h1 ^ (h2 << 1) ^ (h3 << 2);
-    }
-};
 
 MarchingCubes::MarchingCubes() {}
 MarchingCubes::~MarchingCubes() {
@@ -58,49 +49,91 @@ static const int EDGE_CORNERS[12][2] = {
     {0,4},{1,5},{2,6},{3,7}
 };
 
+namespace {
+
+// Canonical CPU observation threshold. A voxel at or below this weight has never
+// been integrated, so it carries no measured surface: it samples as the canonical
+// empty value EMPTY_TSDF (+1.0f, outside) whatever tsdf literal is in it, and it
+// cannot support a crossing edge. Same epsilon the old cube-level gate used, now
+// applied per corner instead of per cube.
+constexpr float kWeightEpsilon   = 0.001f;
+constexpr float kGradientEpsilon = 1e-6f;
+constexpr float kInterpEpsilon   = 1e-6f;
+
+bool isFiniteVec(const Eigen::Vector3f& v) {
+    return std::isfinite(v.x()) && std::isfinite(v.y()) && std::isfinite(v.z());
+}
+
+Eigen::Vector3f invalidNormal() {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    return Eigen::Vector3f(nan, nan, nan);
+}
+
+// Weight-guarded scalar-field sample plus its support bit (canonical rule R1).
+struct CornerSample {
+    float value;
+    bool  supported;
+};
+
+CornerSample sampleCorner(const tsdf::Voxel& v) {
+    if (!std::isfinite(v.tsdf) || v.weight <= kWeightEpsilon)
+        return {tsdf::EMPTY_TSDF, false};
+    return {v.tsdf, true};
+}
+
+} // namespace
+
 Eigen::Vector3f MarchingCubes::interpolateEdge(
     const Eigen::Vector3f& p1, float v1,
     const Eigen::Vector3f& p2, float v2)
 {
-    if (std::abs(v1) < 1e-6f) return p1;
-    if (std::abs(v2) < 1e-6f) return p2;
+    if (!std::isfinite(v1) || !std::isfinite(v2) || !isFiniteVec(p1) || !isFiniteVec(p2))
+        return invalidNormal();
+    if (std::abs(v1) < kInterpEpsilon) return p1;
+    if (std::abs(v2) < kInterpEpsilon) return p2;
     float diff = v1 - v2;
-    if (std::abs(diff) < 1e-6f) return p1;
+    if (!std::isfinite(diff) || std::abs(diff) < kInterpEpsilon) return p1;
     float t = std::max(0.0f, std::min(1.0f, v1 / diff));
     return p1 + t * (p2 - p1);
 }
 
-Eigen::Vector3f MarchingCubes::computeNormal(
-    const tsdf::TSDFVolume& vol, int x, int y, int z)
-{
-    auto tsdf_safe = [&](int xi, int yi, int zi) -> float {
-        const auto& p = vol.params();
-        if (xi < 0 || xi >= p.resolution ||
-            yi < 0 || yi >= p.resolution ||
-            zi < 0 || zi >= p.resolution)
-            return 1.0f;
-        return vol.voxelAt(xi, yi, zi).tsdf;
+Eigen::Vector3f MarchingCubes::voxelNormal(const tsdf::TSDFVolume& vol, int x, int y, int z) {
+    const auto& p = vol.params();
+    const int   R = p.resolution;
+
+    auto usable = [&](int xi, int yi, int zi, float& out) -> bool {
+        if (xi < 0 || xi >= R || yi < 0 || yi >= R || zi < 0 || zi >= R) return false;
+        const CornerSample s = sampleCorner(vol.voxelAt(xi, yi, zi));
+        if (!s.supported) return false;
+        out = s.value;
+        return true;
     };
 
-    float dx = tsdf_safe(x+1,y,z) - tsdf_safe(x-1,y,z);
-    float dy = tsdf_safe(x,y+1,z) - tsdf_safe(x,y-1,z);
-    float dz = tsdf_safe(x,y,z+1) - tsdf_safe(x,y,z-1);
-    Eigen::Vector3f n(dx, dy, dz);
-    float len = n.norm();
-    return (len > 1e-6f) ? (n / len) : Eigen::Vector3f(0,0,1);
-}
+    float self = 0.0f;
+    if (!usable(x, y, z, self)) return invalidNormal();
 
-#include <unordered_map>
-
-// Helper to hash Eigen vectors for vertex unification
-struct VectorHasher {
-    size_t operator()(const Eigen::Vector3f& v) const {
-        size_t h1 = std::hash<float>{}(v.x());
-        size_t h2 = std::hash<float>{}(v.y());
-        size_t h3 = std::hash<float>{}(v.z());
-        return h1 ^ (h2 << 1) ^ (h3 << 2);
+    Eigen::Vector3f grad(0.0f, 0.0f, 0.0f);
+    for (int axis = 0; axis < 3; ++axis) {
+        const int ox = (axis == 0) ? 1 : 0;
+        const int oy = (axis == 1) ? 1 : 0;
+        const int oz = (axis == 2) ? 1 : 0;
+        float hi = 0.0f, lo = 0.0f;
+        const bool have_hi = usable(x + ox, y + oy, z + oz, hi);
+        const bool have_lo = usable(x - ox, y - oy, z - oz, lo);
+        // Central differences span two voxel steps, so they carry the 0.5 factor;
+        // a one-sided fallback spans one. Without it the border axis would be
+        // weighted twice as heavily as an interior axis of the same physical slope.
+        if (have_hi && have_lo)   grad[axis] = 0.5f * (hi - lo);
+        else if (have_hi)         grad[axis] = hi - self;
+        else if (have_lo)         grad[axis] = self - lo;
+        else                      grad[axis] = 0.0f;
     }
-};
+
+    if (!isFiniteVec(grad)) return invalidNormal();
+    const float len = grad.norm();
+    if (!std::isfinite(len) || len <= kGradientEpsilon) return invalidNormal();
+    return grad / len;
+}
 
 std::shared_ptr<MeshData> MarchingCubes::extract(const tsdf::TSDFVolume& volume,
                                             ProgressCallback progress_cb)
@@ -112,30 +145,6 @@ std::shared_ptr<MeshData> MarchingCubes::extract(const tsdf::TSDFVolume& volume,
 
     std::shared_ptr<MeshData> mesh_final = std::make_shared<MeshData>();
 
-    // For vertex unification and smooth normals
-    // We'll use a thread-local approach to avoid contention during extraction, 
-    // then merge at the end. Or just use face vertices for now but indexed.
-    // Actually, to truly satisfy "Smooth Shading", we MUST use vertex normals.
-    
-    // Structure to hold unique vertex data
-    struct Vertex {
-        Eigen::Vector3f pos;
-        Eigen::Vector3f norm;
-        uint8_t color[3];
-
-        bool operator==(const Vertex& other) const {
-            return pos.isApprox(other.pos, 1e-4f);
-        }
-    };
-
-    struct VertexHasher {
-        size_t operator()(const Vertex& v) const {
-            return std::hash<float>{}(v.pos.x()) ^ 
-                   (std::hash<float>{}(v.pos.y()) << 1) ^ 
-                   (std::hash<float>{}(v.pos.z()) << 2);
-        }
-    };
-
     // Parallelize over slices (Z direction)
     std::vector<MeshData> slice_meshes(RES_Z - 1);
 
@@ -146,28 +155,24 @@ std::shared_ptr<MeshData> MarchingCubes::extract(const tsdf::TSDFVolume& volume,
             progress_cb(static_cast<float>(z) / (RES_Z - 2));
 
         auto& local_mesh = slice_meshes[z];
-        const float vs = p.voxel_size;
         
         for (int y = 0; y < RES_Y - 1; ++y) {
             for (int x = 0; x < RES_X - 1; ++x) {
-                bool valid_cube = true;
-                float corner_vals[8];
+                tsdf::Voxel corner_vox[8];
+                CornerSample corner[8];
                 for (int c = 0; c < 8; ++c) {
-                    int cx = x + CORNER_OFFSETS[c][0];
-                    int cy = y + CORNER_OFFSETS[c][1];
-                    int cz = z + CORNER_OFFSETS[c][2];
-                    const tsdf::Voxel& vox = volume.voxelAt(cx, cy, cz);
-                    if (vox.weight <= 0.001f) valid_cube = false;
-                    corner_vals[c] = vox.tsdf;
+                    corner_vox[c] = volume.voxelAt(x + CORNER_OFFSETS[c][0],
+                                                   y + CORNER_OFFSETS[c][1],
+                                                   z + CORNER_OFFSETS[c][2]);
+                    corner[c] = sampleCorner(corner_vox[c]);
                 }
-
-                if (!valid_cube) continue;
 
                 int cube_idx = 0;
                 for (int c = 0; c < 8; ++c)
-                    if (corner_vals[c] < 0.0f) cube_idx |= (1 << c);
+                    if (corner[c].value < 0.0f) cube_idx |= (1 << c);
 
-                if (tables::edge_table[cube_idx] == 0) continue;
+                const int edge_mask = tables::edge_table[cube_idx];
+                if (edge_mask == 0) continue;
 
                 Eigen::Vector3f corner_pos[8];
                 for (int c = 0; c < 8; ++c) {
@@ -177,48 +182,80 @@ std::shared_ptr<MeshData> MarchingCubes::extract(const tsdf::TSDFVolume& volume,
                         z + CORNER_OFFSETS[c][2]);
                 }
 
+                // One gradient evaluation per cube corner, shared by every crossing
+                // edge that touches it. The old path recomputed it per edge endpoint,
+                // up to 24 evaluations for the same 8 corners.
+                Eigen::Vector3f corner_norm[8];
+                bool corner_norm_done[8] = {false, false, false, false,
+                                            false, false, false, false};
+                auto cornerNormalAt = [&](int c) -> Eigen::Vector3f {
+                    if (!corner_norm_done[c]) {
+                        corner_norm[c] = voxelNormal(volume,
+                                                     x + CORNER_OFFSETS[c][0],
+                                                     y + CORNER_OFFSETS[c][1],
+                                                     z + CORNER_OFFSETS[c][2]);
+                        corner_norm_done[c] = true;
+                    }
+                    return corner_norm[c];
+                };
+
                 Eigen::Vector3f edge_verts[12];
                 Eigen::Vector3f edge_norms[12];
                 uint8_t         edge_colors[12][3];
+                bool            edge_ok[12] = {false, false, false, false,
+                                               false, false, false, false,
+                                               false, false, false, false};
 
                 for (int e = 0; e < 12; ++e) {
-                    if (tables::edge_table[cube_idx] & (1 << e)) {
-                        int c0 = EDGE_CORNERS[e][0];
-                        int c1 = EDGE_CORNERS[e][1];
-                        
-                        const tsdf::Voxel& vox0 = volume.voxelAt(x + CORNER_OFFSETS[c0][0], y + CORNER_OFFSETS[c0][1], z + CORNER_OFFSETS[c0][2]);
-                        const tsdf::Voxel& vox1 = volume.voxelAt(x + CORNER_OFFSETS[c1][0], y + CORNER_OFFSETS[c1][1], z + CORNER_OFFSETS[c1][2]);
+                    if (!(edge_mask & (1 << e))) continue;
+                    const int c0 = EDGE_CORNERS[e][0];
+                    const int c1 = EDGE_CORNERS[e][1];
 
-                        edge_verts[e] = interpolateEdge(
-                            corner_pos[c0], corner_vals[c0],
-                            corner_pos[c1], corner_vals[c1]);
-                        
-                        Eigen::Vector3f n0 = computeNormal(volume, 
-                            x + CORNER_OFFSETS[c0][0], 
-                            y + CORNER_OFFSETS[c0][1], 
-                            z + CORNER_OFFSETS[c0][2]);
-                        Eigen::Vector3f n1 = computeNormal(volume, 
-                            x + CORNER_OFFSETS[c1][0], 
-                            y + CORNER_OFFSETS[c1][1], 
-                            z + CORNER_OFFSETS[c1][2]);
-                        
-                        float diff = corner_vals[c0] - corner_vals[c1];
-                        float t = (std::abs(diff) < 1e-6f) ? 0.0f : 
-                                  (corner_vals[c0] / diff);
-                        t = std::max(0.0f, std::min(1.0f, t));
+                    // A crossing edge is emitted only when both of its endpoints
+                    // carry measured, finite data. An unobserved corner elsewhere in
+                    // the cube no longer deletes the cube.
+                    if (!corner[c0].supported || !corner[c1].supported) continue;
 
-                        edge_norms[e] = (n0 + t * (n1 - n0)).normalized();
-                        
-                        edge_colors[e][0] = static_cast<uint8_t>(vox0.r + t * (static_cast<float>(vox1.r) - vox0.r));
-                        edge_colors[e][1] = static_cast<uint8_t>(vox0.g + t * (static_cast<float>(vox1.g) - vox0.g));
-                        edge_colors[e][2] = static_cast<uint8_t>(vox0.b + t * (static_cast<float>(vox1.b) - vox0.b));
-                    }
+                    const Eigen::Vector3f vtx = interpolateEdge(
+                        corner_pos[c0], corner[c0].value,
+                        corner_pos[c1], corner[c1].value);
+                    if (!isFiniteVec(vtx)) continue;
+
+                    const Eigen::Vector3f n0 = cornerNormalAt(c0);
+                    const Eigen::Vector3f n1 = cornerNormalAt(c1);
+                    if (!isFiniteVec(n0) || !isFiniteVec(n1)) continue;
+
+                    const float diff = corner[c0].value - corner[c1].value;
+                    float t = 0.0f;
+                    if (std::isfinite(diff) && std::abs(diff) >= kInterpEpsilon)
+                        t = std::max(0.0f, std::min(1.0f, corner[c0].value / diff));
+
+                    // A cancelled endpoint pair blends to the zero vector; refuse the
+                    // edge instead of normalizing it into a NaN or a fabricated normal.
+                    const Eigen::Vector3f blended = n0 + t * (n1 - n0);
+                    const float blend_len = blended.norm();
+                    if (!std::isfinite(blend_len) || blend_len <= kGradientEpsilon) continue;
+
+                    edge_verts[e]  = vtx;
+                    edge_norms[e]  = blended / blend_len;
+                    edge_colors[e][0] = static_cast<uint8_t>(corner_vox[c0].r + t * (static_cast<float>(corner_vox[c1].r) - corner_vox[c0].r));
+                    edge_colors[e][1] = static_cast<uint8_t>(corner_vox[c0].g + t * (static_cast<float>(corner_vox[c1].g) - corner_vox[c0].g));
+                    edge_colors[e][2] = static_cast<uint8_t>(corner_vox[c0].b + t * (static_cast<float>(corner_vox[c1].b) - corner_vox[c0].b));
+                    edge_ok[e] = true;
                 }
 
                 for (int t = 0; tables::tri_table[cube_idx][t] != -1; t += 3) {
+                    const int ea = tables::tri_table[cube_idx][t + 0];
+                    const int eb = tables::tri_table[cube_idx][t + 1];
+                    const int ec = tables::tri_table[cube_idx][t + 2];
+                    // A triangle needs all three of its vertices; refusing one edge
+                    // costs only the rows that reference it. An edge the mask never
+                    // marked is never read, so a table slip cannot emit garbage here.
+                    if (!edge_ok[ea] || !edge_ok[eb] || !edge_ok[ec]) continue;
+                    const int tri_edges[3] = {ea, eb, ec};
                     // Reverse winding (2, 1, 0 instead of 0, 1, 2) to fix front-face culling
                     for (int i = 2; i >= 0; --i) {
-                        int e = tables::tri_table[cube_idx][t + i];
+                        int e = tri_edges[i];
                         uint32_t vidx = static_cast<uint32_t>(local_mesh.positions.size());
                         local_mesh.positions.push_back(edge_verts[e]);
                         // TSDF gradient already points OUT (toward camera), so keep it positive

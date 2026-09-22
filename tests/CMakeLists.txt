@@ -277,6 +277,25 @@ set_tests_properties(tsdf_integration_min_depth_contract PROPERTIES LABELS cpu T
 add_test(NAME tsdf_subvoxel_thin_feature_contract COMMAND tsdf_subvoxel_thin_feature_contract)
 set_tests_properties(tsdf_subvoxel_thin_feature_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 16: CPU Marching Cubes observed-frontier contracts ----
+# Public TSDFVolume + MarchingCubes::extract only, on direct synthetic volumes.
+# Locks the canonical frontier rules: an unobserved or non-finite voxel samples
+# as +1.0f whatever tsdf literal it carries; a cube is evaluated from its
+# crossing edges so an unrelated unobserved corner cannot delete it; a crossing
+# edge is emitted only with two supported endpoints; a normal that is not usable
+# yields no vertex instead of a fabricated +Z; the volume border takes a
+# one-sided gradient instead of an invented out-of-bounds sample; repeated
+# extraction is byte-identical. Expectations are independent oracles (integer
+# edge algebra over the shared table, hand-derived positions, directed-edge
+# topology), never product snapshots. No device, display, GPU, sensor, thread
+# timing or filesystem.
+add_executable(marching_cubes_frontier_contract marching_cubes_frontier_contract.cpp)
+target_compile_definitions(marching_cubes_frontier_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(marching_cubes_frontier_contract PRIVATE azu_test_core)
+
+add_test(NAME marching_cubes_frontier_contract COMMAND marching_cubes_frontier_contract)
+set_tests_properties(marching_cubes_frontier_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that

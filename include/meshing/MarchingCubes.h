@@ -64,8 +64,15 @@ private:
         const Eigen::Vector3f& p1, float v1,
         const Eigen::Vector3f& p2, float v2);
 
-    static Eigen::Vector3f computeNormal(
-        const tsdf::TSDFVolume& vol, int x, int y, int z);
+    /** The one CPU corner/volume normal primitive: the unit TSDF gradient at
+        voxel (x,y,z), sampled only from in-bounds voxels that are observed and
+        finite. Where a two-sided difference is unavailable - volume border, an
+        unobserved or non-finite neighbour - that axis falls back to a one-sided
+        difference at the same per-voxel-step scale; an out-of-bounds or
+        unobserved sample is never substituted into the difference. Returns a
+        NaN-filled vector when no usable gradient exists, so the caller refuses
+        the vertex instead of emitting a fabricated normal. */
+    static Eigen::Vector3f voxelNormal(const tsdf::TSDFVolume& vol, int x, int y, int z);
 };
 
 } // namespace meshing

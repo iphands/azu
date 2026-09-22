@@ -127,12 +127,12 @@ Current CPU behavior:
   `[-1,1]` truncation clamp, one is the per-frame weight increment `w_new`,
   three are the color fusion denominators, one is the point-cloud
   `weight > 1.0f` gate. The backends still carry no such constant, and CPU
-  meshing still gates a cube on `weight <= 0.001f` rather than on
-  `EMPTY_WEIGHT`: one named epsilon remains open (`tsdf:T2`, `tsdf:T5`,
+  meshing applies its own named `kWeightEpsilon = 0.001f` rather than
+  `EMPTY_WEIGHT`: one shared epsilon remains open (`tsdf:T2`, `tsdf:T5`,
   `tsdf:T11`, `tsdf:T24`).
 - Emptiness thresholds are inconsistent across layers: `weight > 0.0f` in the
-  CPU trilinear sampler, `weight <= 0.001f` in CPU meshing. Canonical: one
-  named epsilon.
+  CPU trilinear sampler, `kWeightEpsilon = 0.001f` in CPU meshing. Canonical:
+  one named epsilon.
 - `src/tsdf/TSDFVolume.cpp` `getTSDF()` samples an unobserved voxel as
   `EMPTY_TSDF` — canonical, and it is the rule Marching Cubes relies on.
 - `src/tsdf/TSDFVolume.cpp` `setParams()` compares every field of the incoming
@@ -242,20 +242,42 @@ shared header only. The `// fix: 0x835→0xb35 variant` comment at
 names the wrong target (`[213]` canonical is `0x83f`, not `0xb35`). Deferred
 backend propagation: `cross-backend:A7`.
 
-Canonical mesh vertex validity: a cube may mesh only when a crossing edge is
-supported by weighted voxels, unobserved voxels sample as `+1.0f`, and a
-position that is not finite is never emitted.
+Canonical mesh vertex validity (CPU, established by big-fix todo 16):
 
-Current CPU behavior: **no finite-value guard at all.** The only cube-level gate
-is `vox.weight <= 0.001f`; emission at `src/meshing/MarchingCubes.cpp:221-224`
-tests nothing. **Known CPU defect**: NaN positions and NaN normals can reach
-`MeshData`. Related CPU defects in the same function:
-`edge_norms[e] = (n0 + t * (n1 - n0)).normalized()` divides by zero for a
-cancelled pair (no `isApprox(0)` test), and `computeNormal()` maps a degenerate
-normal to a fabricated `(0, 0, 1)` instead of rejecting the vertex, so a
-bad-faith normal is indistinguishable from a real one. Backends replace NaN with
-the world origin and then emit it as a legitimate vertex
-(`meshing:C2`), which is a different wrong, not a fix.
+- An unobserved voxel, or one whose `tsdf` is not finite, samples as
+  `EMPTY_TSDF` (`+1.0f`) and carries no support bit. The literal stored in an
+  unobserved voxel is never read as material, so a stale negative left behind by
+  an earlier integration cannot mint geometry.
+- A cube is evaluated from its crossing edges. It is never dropped because a
+  corner that takes part in no crossing edge is unobserved.
+- A crossing edge is emitted only when **both** of its endpoints are observed
+  and finite.
+- A triangle is emitted only when all three of its vertices survived. A vertex
+  whose interpolated position is not finite, or whose blended normal is not
+  finite or collapses below `1e-6`, is refused outright and never substituted.
+- A corner normal is a central difference where both neighbours support one and
+  a one-sided difference on the axis that has no two-sided support, so a vertex
+  at the volume border still gets a real normal. The central form keeps its
+  `0.5` factor so a border axis is never weighted twice an interior axis of the
+  same physical slope.
+- Repeated extraction of one volume is byte-identical.
+
+Current CPU behavior: **fixed** in `src/meshing/MarchingCubes.cpp`
+(`MarchingCubes::voxelNormal` is the one normal primitive, and the cube loop
+samples each corner once and caches one normal per corner). Locked by
+`tests/marching_cubes_frontier_contract.cpp`. The replaced path gated a whole
+cube on `vox.weight <= 0.001f` and nothing else, so one unobserved corner
+deleted an otherwise fully supported cube and the mesh stopped being closed;
+`computeNormal()` mapped a degenerate gradient to a fabricated `(0, 0, 1)` and
+`(n0 + t * (n1 - n0)).normalized()` divided by zero for a cancelled endpoint
+pair, so a NaN normal and an invented normal both reached `MeshData` and were
+indistinguishable from real ones. Corner normals are now evaluated once per cube
+corner instead of once per crossing-edge endpoint - up to 24 evaluations for the
+same 8 corners before. CUDA and HIP are untouched by this todo; their
+equivalents stay deferred and are itemised in
+`docs/CUDA_HIP_DEFERRED_CHANGES.md` (`meshing:B1`, `meshing:B2`, `meshing:B3`,
+`meshing:B4`, `meshing:C2`, `meshing:C3`, `meshing:C7`, `meshing:D8`,
+`cross-backend:A14`).
 
 Canonical welding: exact edge identity where practical. The CPU weld in
 `src/meshing/MarchingCubes.cpp` keys a hash map on a quantized float position

@@ -26,7 +26,8 @@ CPU_LABEL="cpu"
 # "No tests were found!!!", so a green run without these names is NOT a pass.
 # big-fix todo 12 appended icp_weighting_contract and todo 13 appended
 # icp_numeric_policy_contract; todo 14 appended tsdf_integration_race_contract; todo 15
-# appended the three TSDF raycast/depth-band contracts; every
+# appended the three TSDF raycast/depth-band contracts; todo 16 appended
+# marching_cubes_frontier_contract; every
 # name is enforced as registered (the list only ever grows, so the guard never
 # weakens).
 REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_contract"
@@ -34,7 +35,7 @@ REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_co
     "mesh_validation_contract" "coordinate_rounding_contract" "icp_weighting_contract"
     "icp_numeric_policy_contract" "tsdf_integration_race_contract"
     "tsdf_raycast_contract" "tsdf_integration_min_depth_contract"
-    "tsdf_subvoxel_thin_feature_contract")
+    "tsdf_subvoxel_thin_feature_contract" "marching_cubes_frontier_contract")
 # Real controller coupling, proven post-build: a source-only replica that
 # re-declares its own look-alike seam methods has none of these symbols. Both
 # real-controller seam binaries must carry them...
