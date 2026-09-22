@@ -2,6 +2,7 @@
 #include "gui/OpenGLWidget.h"
 #include "gui/MetricsPanel.h"
 #include "gui/ControlPanel.h"
+#include "gui/FusionUiModel.h"
 
 #include <Eigen/Core>
 
@@ -13,7 +14,7 @@
 #include <QCloseEvent>
 #include <QStatusBar>
 #include <QLabel>
-#include <QApplication>
+#include <QKeyEvent>
 
 namespace kfusion {
 namespace gui {
@@ -23,7 +24,7 @@ MainWindow::MainWindow(sensor::PreprocessBackend preferred_backend, QWidget* par
 {
     setWindowTitle("KinectFusionQt");
     resize(1600, 900);
-    updateGlobalStyle();
+    updateUiStyle();
 
     pipeline_ = std::make_unique<app::PipelineController>(preferred_backend);
     setupUI();
@@ -99,14 +100,27 @@ void MainWindow::connectSignals() {
 
     connect(control_panel_, &ControlPanel::hyperparamsApplyClicked, this, [this]() {
         auto h = control_panel_->hyperparamsFromUi();
-        if (h.min_depth >= h.max_depth) {
-            QMessageBox::warning(this, "Invalid depth range",
-                "Depth minimum must be less than depth maximum.");
+        // The pure model owns every cross-field rule (depth order, the device
+        // depth ceiling, the truncation/voxel ratio, finiteness). The widget only
+        // renders its verdict, so the same validation the CPU test locks runs
+        // here verbatim.
+        const FusionValidationResult verdict = validateFusionHyperparams(h);
+        if (!verdict.ok) {
+            QString reasons;
+            for (const std::string& line : verdict.messages) {
+                if (!reasons.isEmpty()) reasons += "\n";
+                reasons += QString::fromStdString(line);
+            }
+            QMessageBox::warning(this, "Invalid hyperparameters", reasons);
             return;
         }
         pipeline_->setHyperparams(h);
-        control_panel_->setHyperparams(pipeline_->hyperparamsSnapshot());
-        applyVolumeCage(pipeline_->hyperparamsSnapshot());
+        // ONE snapshot reused for the panel echo and the volume cage: both then
+        // describe exactly the parameters the controller stored, from a single
+        // locked read, instead of two snapshots that could straddle a change.
+        const app::FusionHyperparams applied = pipeline_->hyperparamsSnapshot();
+        control_panel_->setHyperparams(applied);
+        applyVolumeCage(applied);
         statusBar()->showMessage("Hyperparameters applied.");
     });
 
@@ -120,8 +134,12 @@ void MainWindow::connectSignals() {
         }, Qt::QueuedConnection);
     });
 
-    control_panel_->setHyperparams(pipeline_->hyperparamsSnapshot());
-    applyVolumeCage(pipeline_->hyperparamsSnapshot());
+    // Seed the panel and the volume cage from ONE locked read of the controller's
+    // initial parameters, so the startup UI echo and the cage describe exactly the
+    // same state the controller holds (and it is FusionHyperparams::defaults()).
+    const app::FusionHyperparams initial = pipeline_->hyperparamsSnapshot();
+    control_panel_->setHyperparams(initial);
+    applyVolumeCage(initial);
 }
 
 void MainWindow::onStartClicked() {
@@ -338,7 +356,7 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     event->accept();
 }
 
-void MainWindow::updateGlobalStyle() {
+void MainWindow::updateUiStyle() {
     int base_font     = 12;
     int title_font    = 14;
     int status_font   = 24;
@@ -408,6 +426,7 @@ void MainWindow::updateGlobalStyle() {
         QLabel[overlap="warn"] { color: #fa4; }
         QLabel[overlap="bad"] { color: #f44; }
         QLabel[overlap="warming"] { color: #888; }
+        QLabel[overlap="unknown"] { color: #888; }
 
         QScrollBar:vertical { background: #1e1f24; width: 10px; }
         QScrollBar::handle:vertical { background: #444; border-radius: 5px; min-height: 20px; }
@@ -423,28 +442,47 @@ void MainWindow::updateGlobalStyle() {
     .arg(scaled_status)
     .arg(scaled_title);
 
-    qApp->setStyleSheet(style);
+    // Own the theme instead of mutating the process-wide qApp style: Qt cascades
+    // a widget's stylesheet to its descendants (and to dialogs parented here), so
+    // the identical theme renders for the whole window while a second window or a
+    // library dialog can never be recoloured through the global style sheet.
+    setStyleSheet(style);
 }
 
 void MainWindow::keyPressEvent(QKeyEvent* event) {
-    if (event->modifiers() & Qt::ControlModifier) {
-        if (event->key() == Qt::Key_Plus || event->key() == Qt::Key_Equal) {
+    // UI zoom is Ctrl-only; Ctrl combined with Shift/Alt/Meta is somebody else's
+    // shortcut and must fall through untouched rather than being grabbed here.
+    const bool ctrl_only =
+        (event->modifiers() & Qt::ControlModifier) &&
+        !(event->modifiers() & (Qt::ShiftModifier | Qt::AltModifier | Qt::MetaModifier));
+
+    if (ctrl_only) {
+        switch (event->key()) {
+        case Qt::Key_Plus:
+        case Qt::Key_Equal:
             ui_scale_ = std::min(3.0f, ui_scale_ + 0.1f);
-            updateGlobalStyle();
-            event->accept();
+            updateUiStyle();
+            event->accept(); // consumed here; never reaches an unrelated widget
             return;
-        } else if (event->key() == Qt::Key_Minus) {
+        case Qt::Key_Minus:
             ui_scale_ = std::max(0.5f, ui_scale_ - 0.1f);
-            updateGlobalStyle();
+            updateUiStyle();
             event->accept();
             return;
-        } else if (event->key() == Qt::Key_0) {
+        case Qt::Key_0:
             ui_scale_ = 1.0f;
-            updateGlobalStyle();
+            updateUiStyle();
             event->accept();
             return;
+        default:
+            break; // Ctrl + something else is not a zoom command
         }
     }
+
+    // Not ours: give the key back so Qt propagates it down the normal focus
+    // chain instead of swallowing it. The base implementation ignores the event,
+    // which is precisely the "an unhandled key keeps travelling" contract, while
+    // every handled branch above accepted and stopped it.
     QMainWindow::keyPressEvent(event);
 }
 

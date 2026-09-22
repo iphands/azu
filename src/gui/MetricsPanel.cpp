@@ -9,6 +9,25 @@
 namespace kfusion {
 namespace gui {
 
+namespace {
+
+// Style property name the MainWindow sheet keys on. "unknown" is the never-
+// measured state (text "--"); it renders in the same neutral grey the old code
+// used for a not-yet-warm panel, but stays a DISTINCT key so the band state
+// machine never confuses "nothing measured yet" with "measured, still warming".
+const char* overlapBandProperty(MetricsBand band) {
+    switch (band) {
+    case MetricsBand::kGood:    return "good";
+    case MetricsBand::kWarn:    return "warn";
+    case MetricsBand::kBad:     return "bad";
+    case MetricsBand::kWarming: return "warming";
+    case MetricsBand::kUnknown: return "unknown";
+    }
+    return "unknown";
+}
+
+} // namespace
+
 MetricsPanel::MetricsPanel(QWidget* parent) : QWidget(parent) {
     setupUI();
     setMinimumWidth(240);
@@ -134,38 +153,26 @@ void MetricsPanel::update(const app::PipelineMetrics& m) {
     lbl_mesh_triangles_->setText(QString::number(m.mesh_triangles));
     lbl_icp_error_->setText(QString::number(m.icp_error, 'f', 4));
 
-    QString overlap_text;
-    const char* overlap_band;
-    if (m.icp_overlap_pct < 0.0f) {
-        overlap_text = "--";
-        overlap_band = "warming";
-    } else if (m.icp_valid_model < 5000) {
-        overlap_text = QStringLiteral("building… %1k")
-                           .arg(m.icp_valid_model / 1000.0, 0, 'f', 1);
-        overlap_band = "warming";
-    } else {
-        overlap_text = QString::number(m.icp_overlap_pct, 'f', 0) + " %";
-        overlap_band = m.icp_overlap_pct > 40.0f ? "good"
-                     : m.icp_overlap_pct > 10.0f ? "warn" : "bad";
+    const OverlapDisplay overlap = computeOverlapDisplay(m.icp_overlap_pct, m.icp_valid_model);
+    lbl_icp_overlap_->setText(QString::fromStdString(overlap.text));
+    // Re-polish only when the band actually changes; a text refresh alone (e.g.
+    // "building… 1.1k" -> "building… 1.2k") never touches the style.
+    if (overlap_band_.apply(overlap.band)) {
+        lbl_icp_overlap_->setProperty("overlap", overlapBandProperty(overlap.band));
+        lbl_icp_overlap_->style()->unpolish(lbl_icp_overlap_);
+        lbl_icp_overlap_->style()->polish(lbl_icp_overlap_);
     }
-    lbl_icp_overlap_->setText(overlap_text);
-    lbl_icp_overlap_->setProperty("overlap", overlap_band);
-    lbl_icp_overlap_->style()->unpolish(lbl_icp_overlap_);
-    lbl_icp_overlap_->style()->polish(lbl_icp_overlap_);
 
     bar_volume_->setValue(static_cast<int>(m.volume_usage_pct));
     bar_mesh_extract_->setValue(static_cast<int>(m.mesh_extract_pct));
     bar_export_->setValue(static_cast<int>(m.export_pct));
 
-    if (m.tracking_ok) {
-        lbl_tracking_status_->setText("OK");
-        lbl_tracking_status_->setProperty("status", "ok");
-    } else {
-        lbl_tracking_status_->setText("LOST");
-        lbl_tracking_status_->setProperty("status", "lost");
+    lbl_tracking_status_->setText(m.tracking_ok ? "OK" : "LOST");
+    if (tracking_band_.apply(m.tracking_ok)) {
+        lbl_tracking_status_->setProperty("status", m.tracking_ok ? "ok" : "lost");
+        lbl_tracking_status_->style()->unpolish(lbl_tracking_status_);
+        lbl_tracking_status_->style()->polish(lbl_tracking_status_);
     }
-    lbl_tracking_status_->style()->unpolish(lbl_tracking_status_);
-    lbl_tracking_status_->style()->polish(lbl_tracking_status_);
 
     QString state_str;
     switch (m.state) {

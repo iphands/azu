@@ -65,7 +65,7 @@ private:
 
     void setupUI();
     void connectSignals();
-    void updateGlobalStyle();
+    void updateUiStyle();
     void applyVolumeCage(const app::FusionHyperparams& h);
 
     // ---- background export/reset work (big-fix Todo 26) ----

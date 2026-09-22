@@ -40,9 +40,12 @@ CPU_LABEL="cpu"
 # 30th CPU test (the shared exportMesh helper behind the non-blocking GUI
 # export); todo 27 INTENTIONALLY appended camera_basis_contract as the 31st CPU
 # test (the real src/rendering/Camera.cpp orbit/pan/basis math plus the pure
-# first-frame tick clamp, which needs no Qt, display or OpenGL context); every
-# name is enforced as registered (the list only ever grows, so the guard never
-# weakens).
+# first-frame tick clamp, which needs no Qt, display or OpenGL context); todo 29
+# INTENTIONALLY appended fusion_ui_validation_contract as the 32nd CPU test (the
+# real Qt-free src/gui/FusionUiModel.cpp cross-field hyperparameter validation,
+# atomic preset staging and metrics style-band state machine, which needs no Qt
+# Widgets, display or OpenGL context); every name is enforced as registered (the
+# list only ever grows, so the guard never weakens).
 REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_contract"
     "marching_cubes_table_contract" "marching_cubes_sphere_contract" "tsdf_reset_contract"
     "mesh_validation_contract" "coordinate_rounding_contract" "icp_weighting_contract"
@@ -62,7 +65,9 @@ REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_co
     # todo 26: shared exportMesh(path, writer_fn) helper behind exportPLY/exportGLB.
     "pipeline_export_mesh_contract"
     # todo 27: real Camera orbit/pan/basis math + the pure first-frame tick clamp.
-    "camera_basis_contract")
+    "camera_basis_contract"
+    # todo 29: Qt-free fusion UI validation / preset staging / metrics band model.
+    "fusion_ui_validation_contract")
 # Real controller coupling, proven post-build: a source-only replica that
 # re-declares its own look-alike seam methods has none of these symbols. Both
 # real-controller seam binaries must carry them...
@@ -225,6 +230,26 @@ neg_hits="$(grep -c -- "${NM_ABSENT_PATTERN}" "${NM_NEG_OUT}" || true)"
 [ "${neg_hits}" -eq 0 ] ||
     die "negative control ${NM_NEGATIVE_TARGET} unexpectedly contains '${NM_ABSENT_PATTERN}'; Qt-free lane must not link the controller"
 printf 'negative control: 0 hits for %s in %s (Qt-free lane stays controller-free)\n' "${NM_ABSENT_PATTERN}" "${NM_NEGATIVE_TARGET}"
+
+# Post-build coupling guard (todo 29): fusion_ui_validation_contract must link the
+# REAL Qt-free fusion UI model TU. The three mangled namespace symbols only exist
+# if src/gui/FusionUiModel.cpp is really in azu_test_core; a source-only replica
+# that re-declares its own look-alike functions carries none of them (and could
+# not link alongside the real definitions anyway).
+UI_MODEL_TARGET="tests/fusion_ui_validation_contract"
+[ -x "${GATE_BUILD_DIR}/${UI_MODEL_TARGET}" ] ||
+    die "expected CPU test binary ${GATE_BUILD_DIR}/${UI_MODEL_TARGET} was not produced"
+NM_UI_OUT="${WORKDIR}/nm-demangled-fusion_ui.txt"
+timeout 60 nm -C "${GATE_BUILD_DIR}/${UI_MODEL_TARGET}" >"${NM_UI_OUT}" 2>&1 ||
+    die "nm -C failed on ${UI_MODEL_TARGET}"
+for pattern in "kfusion::gui::validateFusionHyperparams" \
+               "kfusion::gui::applyFusionPreset" \
+               "kfusion::gui::computeOverlapDisplay"; do
+    ui_hits="$(grep -c -- "$pattern" "${NM_UI_OUT}" || true)"
+    [ "${ui_hits}" -ge 1 ] ||
+        die "coupling guard: ${UI_MODEL_TARGET} contains no '${pattern}' symbol; the UI test is not linked against the real src/gui/FusionUiModel.cpp"
+    printf 'coupling guard: %s hits for %s in %s\n' "${ui_hits}" "${pattern}" "${UI_MODEL_TARGET}"
+done
 
 # ---------------------------------------------------------------------------
 # 6. Required CPU tests only (label cpu), then prove the label actually ran

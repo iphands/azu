@@ -4,6 +4,7 @@
 #include <QLabel>
 #include <QProgressBar>
 #include "app/PipelineController.h"
+#include "gui/FusionUiModel.h"
 
 namespace kfusion {
 namespace gui {
@@ -29,6 +30,12 @@ private:
     QProgressBar* bar_volume_            = nullptr;
     QProgressBar* bar_mesh_extract_      = nullptr;
     QProgressBar* bar_export_            = nullptr;
+
+    // Style bands are cached so a label re-polishes only on a band TRANSITION,
+    // not on every 5 Hz metrics tick. Text still refreshes every tick; only the
+    // (expensive) unpolish/polish is edge-triggered.
+    BandCache<MetricsBand> overlap_band_;
+    BandCache<bool>        tracking_band_;
 
     void setupUI();
     QLabel* makeLabel(const QString& text);

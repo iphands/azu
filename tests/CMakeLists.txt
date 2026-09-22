@@ -37,6 +37,12 @@ add_library(azu_test_core STATIC ${AZU_TEST_CORE_SOURCES}
     # explicit source instead of a src/rendering/*.cpp glob. The camera contract
     # below must exercise THIS translation unit, not a local replica.
     "${CMAKE_SOURCE_DIR}/src/rendering/Camera.cpp"
+    # big-fix todo 29: the fusion UI validation / preset-staging / metrics-band
+    # model is Qt-free (FusionHyperparams + stdlib only, no Widgets/OpenGL/device),
+    # unlike ControlPanel/MetricsPanel, so it is an explicit source rather than a
+    # src/gui/*.cpp glob. The UI contract below must exercise THIS real model TU --
+    # the same code the widgets compile through the src/gui glob -- not a replica.
+    "${CMAKE_SOURCE_DIR}/src/gui/FusionUiModel.cpp"
 )
 target_compile_definitions(azu_test_core PUBLIC ${AZU_TEST_DEFS})
 target_include_directories(azu_test_core PUBLIC
@@ -579,6 +585,26 @@ target_link_libraries(camera_basis_contract PRIVATE azu_test_core)
 add_test(NAME camera_basis_contract COMMAND camera_basis_contract)
 set_tests_properties(camera_basis_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 29: CPU Qt-free fusion UI validation / band model ----
+# fusion_ui_validation_contract drives the REAL src/gui/FusionUiModel.cpp (linked
+# through azu_test_core, gate 11 below) through its public namespace only. It
+# locks the cross-field hyperparameter rules the Qt spin boxes cannot enforce on
+# their own (min<max strictly, the 4.0 m device depth ceiling, the 2..8x
+# truncation/voxel ratio, finiteness / positive geometry), that presets stage ONE
+# atomic complete value rather than mutating fields piecemeal, that
+# FusionHyperparams::defaults() is the one valid seed, that icp_valid_model == -1
+# maps to the textual "--" UNKNOWN band (never a premature warming colour), and
+# that the metrics band cache re-polishes only on a band TRANSITION. No Qt
+# Widgets, OpenGL context, display, device, GPU, sensor, thread timing or
+# filesystem. Expectations are independent rule statements, never product
+# snapshots.
+add_executable(fusion_ui_validation_contract fusion_ui_validation_contract.cpp)
+target_compile_definitions(fusion_ui_validation_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(fusion_ui_validation_contract PRIVATE azu_test_core)
+
+add_test(NAME fusion_ui_validation_contract COMMAND fusion_ui_validation_contract)
+set_tests_properties(fusion_ui_validation_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that
@@ -985,4 +1011,61 @@ if(NOT AZU_TEST_CORE_HAS_CAMERA_TU)
         "instead of the product camera.")
 endif()
 
-message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract + pipeline_state_contract + pipeline_mesh_cadence_contract + pipeline_export_mesh_contract + camera_basis_contract registered (label=cpu)")
+# 11) big-fix todo 29: fusion_ui_validation_contract must drive the REAL Qt-free
+#     fusion UI model translation unit, not a header-only replica the test keeps
+#     to itself. Same discipline as gate 1/4/5/6/7/8/9/10: comments are stripped,
+#     so only a genuine namespace-qualified CALL SHAPE (receiver '.'/'>'/'::' +
+#     name + '(') satisfies the call checks, the real src/gui/FusionUiModel.cpp
+#     must be an ELEMENT of azu_test_core's own source list, and the target must
+#     link azu_test_core. A test that re-declares its own validateFusionHyperparams
+#     replica cannot pass the source-coupling half (it would collide with the real
+#     definition the linked library carries) and cannot satisfy the call shape for
+#     the free functions without the :: qualification the real header demands.
+get_target_property(AZU_UI_TEST_SOURCES fusion_ui_validation_contract SOURCES)
+if(NOT AZU_UI_TEST_SOURCES)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: fusion_ui_validation_contract has no SOURCES.")
+endif()
+set(AZU_UI_TEST_TEXT "")
+foreach(_azu_ui_src ${AZU_UI_TEST_SOURCES})
+    get_filename_component(_azu_ui_abs "${_azu_ui_src}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(NOT EXISTS "${_azu_ui_abs}")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: registered fusion_ui_validation_contract source ${_azu_ui_abs} does not exist.")
+    endif()
+    file(READ "${_azu_ui_abs}" _azu_ui_txt)
+    azu_strip_c_comments(_azu_ui_txt_code _azu_ui_txt)
+    string(APPEND AZU_UI_TEST_TEXT "${_azu_ui_txt_code}")
+endforeach()
+# The headless surfaces todo 29 owns: the cross-field validator, the atomic preset
+# stager, the overlap-band renderer, and the edge-triggered band cache's apply().
+foreach(_azu_ui_call validateFusionHyperparams applyFusionPreset computeOverlapDisplay apply)
+    if(NOT AZU_UI_TEST_TEXT MATCHES "[.>:]${_azu_ui_call}[ \t\r\n]*\\(")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: the fusion_ui_validation_contract source must call ${_azu_ui_call}() "
+            "on the real kfusion::gui model (a comment or string literal naming it is not a call). "
+            "A local validation/band replica does not satisfy this todo.")
+    endif()
+endforeach()
+get_target_property(AZU_UI_TEST_LINKS fusion_ui_validation_contract LINK_LIBRARIES)
+if(NOT "${AZU_UI_TEST_LINKS}" MATCHES "azu_test_core")
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: fusion_ui_validation_contract must link azu_test_core, "
+        "got: ${AZU_UI_TEST_LINKS}")
+endif()
+# Positive coupling: azu_test_core has to CARRY the real fusion UI model TU.
+set(AZU_TEST_CORE_HAS_UI_TU FALSE)
+foreach(_azu_core_src ${AZU_TEST_CORE_LIB_SOURCES})
+    file(TO_CMAKE_PATH "${_azu_core_src}" _azu_core_norm)
+    if(_azu_core_norm MATCHES "(^|/)src/gui/FusionUiModel\\.cpp$")
+        set(AZU_TEST_CORE_HAS_UI_TU TRUE)
+    endif()
+endforeach()
+if(NOT AZU_TEST_CORE_HAS_UI_TU)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: azu_test_core must compile the real src/gui/FusionUiModel.cpp "
+        "as one source-list element; fusion_ui_validation_contract would otherwise test a "
+        "replica instead of the product fusion UI model.")
+endif()
+
+message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract + pipeline_state_contract + pipeline_mesh_cadence_contract + pipeline_export_mesh_contract + camera_basis_contract + fusion_ui_validation_contract registered (label=cpu)")

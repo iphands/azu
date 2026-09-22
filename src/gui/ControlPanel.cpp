@@ -15,6 +15,7 @@
 #include <QScrollArea>
 #include <QSlider>
 #include "gui/NavigationGizmo.h"
+#include "gui/FusionUiModel.h"
 #include "utils/Logger.h"
 
 #include <cmath>
@@ -24,12 +25,16 @@ namespace gui {
 
 namespace {
 
-QDoubleSpinBox* makeDoubleSpin(double minV, double maxV, double step, double val, int decimals, QWidget* parent) {
+// Widget bounds only: setRange/setDecimals are per-control constraints, NOT a
+// default table. Every value is seeded from FusionHyperparams::defaults() once
+// via setHyperparams() at the end of setupUI(), so this TU never carries a
+// second source of truth for what the tunables start at.
+QDoubleSpinBox* makeDoubleSpin(double minV, double maxV, double step, int decimals, QWidget* parent) {
     auto* s = new QDoubleSpinBox(parent);
     s->setRange(minV, maxV);
     s->setSingleStep(step);
     s->setDecimals(decimals);
-    s->setValue(val);
+    s->setValue(minV); // transient floor; setHyperparams(defaults()) overwrites it
     s->setButtonSymbols(QAbstractSpinBox::PlusMinus);
     return s;
 }
@@ -158,48 +163,49 @@ void ControlPanel::setupUI() {
     int r = 0;
 
     g->addWidget(new QLabel("Depth min (m)", grp_hp_), r, 0);
-    spin_depth_min_ = makeDoubleSpin(0.01, 3.0, 0.01, 0.05, 3, grp_hp_);
+    spin_depth_min_ = makeDoubleSpin(0.01, 3.0, 0.01, 3, grp_hp_);
     g->addWidget(spin_depth_min_, r++, 1);
 
     g->addWidget(new QLabel("Depth max (m)", grp_hp_), r, 0);
-    spin_depth_max_ = makeDoubleSpin(0.2, 12.0, 0.1, 8.0, 2, grp_hp_);
+    // Upper bound is the device's usable range, so the widget cannot even offer a
+    // value beyond what validateFusionHyperparams() would accept.
+    spin_depth_max_ = makeDoubleSpin(0.2, kDeviceMaxDepthMeters, 0.1, 2, grp_hp_);
     g->addWidget(spin_depth_max_, r++, 1);
 
     g->addWidget(new QLabel("Voxel size (m)", grp_hp_), r, 0);
-    spin_voxel_ = makeDoubleSpin(0.003, 0.05, 0.001, 0.01, 3, grp_hp_);
+    spin_voxel_ = makeDoubleSpin(0.003, 0.05, 0.001, 3, grp_hp_);
     g->addWidget(spin_voxel_, r++, 1);
 
     g->addWidget(new QLabel("Truncation (m)", grp_hp_), r, 0);
-    spin_trunc_ = makeDoubleSpin(0.01, 0.25, 0.005, 0.03, 3, grp_hp_);
+    spin_trunc_ = makeDoubleSpin(0.01, 0.25, 0.005, 3, grp_hp_);
     g->addWidget(spin_trunc_, r++, 1);
 
     g->addWidget(new QLabel("Max weight", grp_hp_), r, 0);
-    spin_max_weight_ = makeDoubleSpin(1.0, 512.0, 1.0, 128.0, 0, grp_hp_);
+    spin_max_weight_ = makeDoubleSpin(1.0, 512.0, 1.0, 0, grp_hp_);
     g->addWidget(spin_max_weight_, r++, 1);
 
     g->addWidget(new QLabel("Resolution (³)", grp_hp_), r, 0);
     spin_resolution_ = new QSpinBox(grp_hp_);
     spin_resolution_->setRange(64, 512);
     spin_resolution_->setSingleStep(32);
-    spin_resolution_->setValue(256);
     g->addWidget(spin_resolution_, r++, 1);
 
     g->addWidget(new QLabel("Origin X", grp_hp_), r, 0);
-    spin_origin_x_ = makeDoubleSpin(-4.0, 4.0, 0.05, -1.28, 2, grp_hp_);
+    spin_origin_x_ = makeDoubleSpin(-4.0, 4.0, 0.05, 2, grp_hp_);
     g->addWidget(spin_origin_x_, r++, 1);
     g->addWidget(new QLabel("Origin Y", grp_hp_), r, 0);
-    spin_origin_y_ = makeDoubleSpin(-4.0, 4.0, 0.05, -1.28, 2, grp_hp_);
+    spin_origin_y_ = makeDoubleSpin(-4.0, 4.0, 0.05, 2, grp_hp_);
     g->addWidget(spin_origin_y_, r++, 1);
     g->addWidget(new QLabel("Origin Z", grp_hp_), r, 0);
-    spin_origin_z_ = makeDoubleSpin(-2.0, 4.0, 0.05, 0.0, 2, grp_hp_);
+    spin_origin_z_ = makeDoubleSpin(-2.0, 4.0, 0.05, 2, grp_hp_);
     g->addWidget(spin_origin_z_, r++, 1);
 
     g->addWidget(new QLabel("ICP dist (m)", grp_hp_), r, 0);
-    spin_icp_dist_ = makeDoubleSpin(0.02, 0.5, 0.01, 0.1, 3, grp_hp_);
+    spin_icp_dist_ = makeDoubleSpin(0.02, 0.5, 0.01, 3, grp_hp_);
     g->addWidget(spin_icp_dist_, r++, 1);
 
     g->addWidget(new QLabel("ICP angle (°)", grp_hp_), r, 0);
-    spin_icp_angle_ = makeDoubleSpin(5.0, 90.0, 1.0, 30.0, 0, grp_hp_);
+    spin_icp_angle_ = makeDoubleSpin(5.0, 90.0, 1.0, 0, grp_hp_);
     g->addWidget(spin_icp_angle_, r++, 1);
 
     g->addWidget(new QLabel("ICP iters coarse", grp_hp_), r, 0);
@@ -238,6 +244,11 @@ void ControlPanel::setupUI() {
     inner_layout->addStretch();
     scroll->setWidget(inner);
     root->addWidget(scroll, 1);
+
+    // Seed EVERY field from the one source of truth. setHyperparams() is the same
+    // write path presets and the controller use, so the panel's starting state is
+    // exactly FusionHyperparams::defaults() and cannot drift into a parallel table.
+    setHyperparams(uiDefaultHyperparams());
 
     setMinimumWidth(260);
     setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
@@ -355,53 +366,17 @@ void ControlPanel::setCameraRotation(float pitch, float yaw, float roll) {
 }
 
 void ControlPanel::onPresetChanged(int index) {
-    if (index == 0) return; // Custom
+    if (index == 0) return; // Custom / Current
 
-    app::FusionHyperparams h = hyperparamsFromUi();
+    // Stage the whole preset as ONE value in the pure model, then apply it once.
+    // Doing it piecemeal (mutating the current UI field by field) could leave a
+    // half-written panel/controller if capture is running; one staged value plus
+    // one setHyperparams() write plus one apply signal is atomic from the user's
+    // point of view. MainWindow's apply handler re-validates the staged result.
+    app::FusionHyperparams staged =
+        applyFusionPreset(hyperparamsFromUi(), static_cast<FusionPreset>(index));
 
-    if (index == 1) { // Helmet
-        h.tsdf.voxel_size = 0.003f;
-        h.tsdf.resolution = 512;
-        h.tsdf.truncation = 0.010f;
-        h.max_depth = 1.5f;
-        h.icp.dist_threshold = 0.05f;
-        h.icp.angle_threshold = 45.0f;
-        h.icp.max_iterations[2] = 20;
-        h.icp.max_iterations[1] = 15;
-        h.icp.max_iterations[0] = 10;
-    } else if (index == 2) { // Chair
-        h.tsdf.voxel_size = 0.008f;
-        h.tsdf.resolution = 256;
-        h.tsdf.truncation = 0.025f;
-        h.max_depth = 3.0f;
-        h.icp.angle_threshold = 45.0f;
-        h.icp.max_iterations[2] = 20;
-        h.icp.max_iterations[1] = 15;
-        h.icp.max_iterations[0] = 10;
-    } else if (index == 3) { // Room
-        h.tsdf.voxel_size = 0.030f;
-        h.tsdf.resolution = 256;
-        h.tsdf.truncation = 0.100f;
-        h.icp.dist_threshold = 0.20f;
-        h.icp.angle_threshold = 60.0f;
-        h.max_depth = 8.0f;
-        h.icp.max_iterations[2] = 30;
-        h.icp.max_iterations[1] = 20;
-        h.icp.max_iterations[0] = 10;
-    } else if (index == 4) { // Human
-        h.tsdf.voxel_size = 0.005f;
-        h.tsdf.resolution = 512;
-        h.tsdf.max_weight = 64.0f;
-        h.tsdf.truncation = 0.015f;
-        h.min_depth = 0.5f;
-        h.max_depth = 2.5f;
-        h.icp.angle_threshold = 45.0f;
-        h.icp.max_iterations[2] = 20;
-        h.icp.max_iterations[1] = 15;
-        h.icp.max_iterations[0] = 10;
-    }
-
-    setHyperparams(h);
+    setHyperparams(staged);
     KFLOGF_INFO("ControlPanel", "Preset applied: %s", combo_presets_->currentText().toStdString().c_str());
     emit hyperparamsApplyClicked();
 }
