@@ -468,6 +468,27 @@ Canonical CPU determinism: repeated CPU runs over identical input are
 byte-identical where a test asserts it. That is why the EMA race above is a
 correctness defect and not a cosmetic one: it breaks the repeat contract.
 
+CPU TSDF integration determinism is **fixed by big-fix Todo 14**. `integrateCPU()`
+used to run `#pragma omp parallel for` over pixels and read-modify-write
+`voxels_[idx(vx,vy,vz)]` from every thread, so two pixels whose ray marches
+overlapped a voxel raced on `weight` / `tsdf` / color and the fused voxel changed
+run to run. It is now a deterministic two-phase merge: Phase 1 derives each
+candidate (target voxel, `tsdf_new`, color-eligibility, its own RGB) from a single
+(pixel, step) with no shared write, and Phase 2 applies every candidate **serially in
+canonical raster + march order** — increasing `y`, then increasing `x`, then increasing
+march step — through the unchanged weight / TSDF / color formulas (`w_new = 1`, weight
+cap `max_weight`, TSDF blend denominator `w_old + 1 + 1e-6f`, color blend over the same
+denominator, color eligibility `rgb && sdf > -trunc * 0.5f`). Candidates are ordered by
+a lossless `((y*width+x) << 32) | step` sequence key, so the fold is a pure function of
+the input: byte-identical across repeated runs and across OpenMP thread counts 1 / 2 /
+4, and identical to the single-thread fold. Locked by
+`tests/tsdf_integration_race_contract.cpp` (three-run byte-identical volume + mesh and
+a hand-derived double blend oracle). The depth `0.1f` floor, the `vs * 0.75f` march
+step, the `sdf < -trunc` rejection, and the NaN/Inf guards are unchanged; the
+configured `min_depth` is still owned by the later depth-domain todo (Todo 15). The
+CUDA/HIP integration kernels keep the same concurrent read-modify-write and are
+untouched — deferred, not compiled, not runtime-tested (`tsdf:T3`).
+
 GPU is not deterministic in the same sense, and this is documented rather than
 fixed: the Hessian is reduced with `atomicAdd` over ~300 blocks, so the fp32
 accumulation order varies frame to frame and the pose is not bit-reproducible.

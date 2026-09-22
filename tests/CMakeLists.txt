@@ -227,6 +227,22 @@ target_link_libraries(icp_numeric_policy_contract PRIVATE azu_test_core)
 add_test(NAME icp_numeric_policy_contract COMMAND icp_numeric_policy_contract)
 set_tests_properties(icp_numeric_policy_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 14: CPU TSDF integration determinism contract ----
+# Public TSDFVolume + MarchingCubes API only. Locks the two-phase deterministic
+# merge: three repeated runs produce byte-identical serialized voxels AND identical
+# MarchingCubes mesh bytes, and OpenMP thread counts 1/2/4 each reproduce the
+# single-thread canonical (y, x, march-step) fold. A hand-derived double oracle folds
+# one two-march-step voxel by hand (weight/tsdf/color), so a lost update or dropped
+# step changes it — never compared against product output. No device, display, GPU,
+# sensor, thread timing or filesystem. RED against the pre-fix racy integrateCPU
+# (threads 2/4 diverge from threads 1); GREEN once the stateful merge is serial.
+add_executable(tsdf_integration_race_contract tsdf_integration_race_contract.cpp)
+target_compile_definitions(tsdf_integration_race_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(tsdf_integration_race_contract PRIVATE azu_test_core)
+
+add_test(NAME tsdf_integration_race_contract COMMAND tsdf_integration_race_contract)
+set_tests_properties(tsdf_integration_race_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that

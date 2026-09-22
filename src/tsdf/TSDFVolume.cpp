@@ -1,11 +1,13 @@
 #include "tsdf/TSDFVolume.h"
 #include "utils/CoordinateMath.h"
 #include <climits>
+#include <cstdint>
 #include <iostream>
 #include <algorithm>
 #include <cmath>
 #include <mutex>
 #include <fstream>
+#include <vector>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -212,100 +214,152 @@ void TSDFVolume::integrateCPU(const float*           depth_meters,
     const Eigen::Matrix3f R_cw = pose.block<3,3>(0,0);
     const Eigen::Vector3f t_cw = pose.block<3,1>(0,3);
 
-    #pragma omp parallel for schedule(dynamic, 16)
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            float d_meas = depth_meters[y * width + x];
-            // Filter invalid depths: too close, too far, or NaN/inf
-            // Use 0.1f as minimum threshold (original behavior) to avoid regression
-            if (d_meas < 0.1f || d_meas > max_depth || 
-                std::isnan(d_meas) || std::isinf(d_meas)) {
-                if (g_tsdf_logging_enabled) {
-                    #pragma omp atomic
-                    g_tsdf_stats.depth_filtered++;
-                }
-                continue;
-            }
+    // big-fix Todo 14: deterministic two-phase CPU integration. The old kernel ran
+    // `#pragma omp parallel for` over pixels and did an unsynchronised read-modify-
+    // write of voxels_[idx] from every thread, so overlapping ray marches raced on
+    // weight/tsdf/color and the fused voxel changed run to run. Canonical fold order
+    // is (increasing y, then x, then march step) — the order one thread visits the
+    // (pixel, step) candidates. Phase 1 derives each candidate from its own (pixel,
+    // step) alone (no shared write); Phase 2 applies them in that order through the
+    // unchanged formulas, making the volume a pure function of the input.
+    //
+    // `key` is a lossless raster+march sequence number: high 32 bits = raster pixel
+    // index (y*width+x, monotone in y then x), low 32 bits = march step, so an
+    // ascending sort of `key` reproduces canonical (y, x, step) order no matter what
+    // order threads appended their candidates.
+    struct Candidate {
+        uint64_t key;         // (pixel_index << 32) | step
+        int      vidx;        // target voxel index, idx(vx, vy, vz)
+        float    tsdf_new;    // min(1, sdf / trunc), already NaN/Inf-filtered
+        float    abs_sdf;     // |sdf|, for deterministic logging accumulation only
+        bool     apply_color; // rgb present && sdf > -trunc * 0.5f
+    };
 
-            // Ray direction in camera space
-            Eigen::Vector3f ray_cam((x - cx) / fx, (y - cy) / fy, 1.0f);
-            float ray_dist_scale = ray_cam.norm(); // Euclidean / Z ratio
-            ray_cam.normalize();
+    // Logging never alters the canonical fold; when enabled its counters accumulate
+    // deterministically (integer sums in Phase 1, the float |sdf| sum in Phase 2
+    // canonical order), so an AZU_TSDF_LOG=1 run is reproducible too.
+    const bool logging = g_tsdf_logging_enabled;
+    std::vector<Candidate> candidates;
 
-            // Convert Z-depth to Euclidean distance along the ray
-            float t_meas = d_meas * ray_dist_scale;
-            float t_min  = std::max(0.1f, t_meas - trunc);
-            float t_max  = t_meas + trunc;
+    #pragma omp parallel
+    {
+        // Thread-local buffer: no lock, no per-pixel allocation; merged once per
+        // thread. Bounded by in-band/in-bounds/non-rejected (pixel, step) pairs.
+        std::vector<Candidate> local;
+        int local_depth_filtered = 0;
+        int local_truncation_clamped = 0;
 
-            // Convert to world space
-            Eigen::Vector3f ray_w = R_cw * ray_cam;
-            Eigen::Vector3f cam_pos_w = t_cw;
-
-            // March through the truncation segment
-            for (float t = t_min; t <= t_max; t += vs * 0.75f) {
-                Eigen::Vector3f wpos = cam_pos_w + ray_w * t;
-                
-                // World to voxel index
-                Eigen::Vector3f vpos = (wpos - origin) / vs;
-                int vx = static_cast<int>(std::floor(vpos.x()));
-                int vy = static_cast<int>(std::floor(vpos.y()));
-                int vz = static_cast<int>(std::floor(vpos.z()));
-
-                if (vx < 0 || vx >= res || vy < 0 || vy >= res || vz < 0 || vz >= res)
+        #pragma omp for schedule(dynamic, 16) nowait
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                float d_meas = depth_meters[y * width + x];
+                // Filter invalid depths: too close, too far, or NaN/inf.
+                // Use 0.1f as minimum threshold (original behavior) to avoid
+                // regression; the configured min_depth is owned by Todo 15, not here.
+                if (d_meas < 0.1f || d_meas > max_depth ||
+                    std::isnan(d_meas) || std::isinf(d_meas)) {
+                    if (logging) ++local_depth_filtered;
                     continue;
-
-                // Project voxel back to camera plane to get precise Z-depth difference
-                Eigen::Vector3f cpos = R_wc * wpos + t_wc;
-                float sdf = d_meas - cpos.z();
-                
-                if (sdf < -trunc) continue;
-
-                float tsdf_new = std::min(1.0f, sdf / trunc);
-                if (std::isnan(tsdf_new) || std::isinf(tsdf_new)) continue;
-                
-                if (tsdf_new >= 1.0f || tsdf_new <= -1.0f) {
-                    if (g_tsdf_logging_enabled) {
-                        #pragma omp atomic
-                        g_tsdf_stats.truncation_clamped++;
-                    }
-                }
-                
-                int vidx = idx(vx, vy, vz);
-                Voxel& vox = voxels_[vidx];
-
-                float w_old = vox.weight;
-                float w_new = 1.0f;
-                float w_sum = std::min(w_old + w_new, max_w);
-
-                float next_tsdf = (vox.tsdf * w_old + tsdf_new * w_new) / (w_old + w_new + 1e-6f);
-                if (std::isnan(next_tsdf) || std::isinf(next_tsdf)) continue;
-
-                vox.tsdf   = next_tsdf;
-                vox.weight = w_sum;
-                
-                if (g_tsdf_logging_enabled) {
-                    #pragma omp atomic
-                    g_tsdf_stats.voxels_updated++;
-                    #pragma omp critical
-                    {
-                        g_tsdf_stats.max_sdf = std::max(g_tsdf_stats.max_sdf, std::abs(sdf));
-                        g_tsdf_stats.avg_sdf += std::abs(sdf);
-                    }
                 }
 
-                if (rgb && sdf > -trunc * 0.5f) {
-                    int pidx = (y * width + x) * 3;
-                    // Use float arithmetic to avoid truncation darkening
-                    vox.r = static_cast<uint8_t>(std::round((static_cast<float>(vox.r) * w_old + static_cast<float>(rgb[pidx+0])) / (w_old + 1.0f + 1e-6f)));
-                    vox.g = static_cast<uint8_t>(std::round((static_cast<float>(vox.g) * w_old + static_cast<float>(rgb[pidx+1])) / (w_old + 1.0f + 1e-6f)));
-                    vox.b = static_cast<uint8_t>(std::round((static_cast<float>(vox.b) * w_old + static_cast<float>(rgb[pidx+2])) / (w_old + 1.0f + 1e-6f)));
-                    
-                    if (g_tsdf_logging_enabled) {
-                        #pragma omp atomic
-                        g_tsdf_stats.color_updates++;
-                    }
+                // Ray direction in camera space
+                Eigen::Vector3f ray_cam((x - cx) / fx, (y - cy) / fy, 1.0f);
+                float ray_dist_scale = ray_cam.norm(); // Euclidean / Z ratio
+                ray_cam.normalize();
+
+                // Convert Z-depth to Euclidean distance along the ray
+                float t_meas = d_meas * ray_dist_scale;
+                float t_min  = std::max(0.1f, t_meas - trunc);
+                float t_max  = t_meas + trunc;
+
+                // Convert to world space
+                Eigen::Vector3f ray_w = R_cw * ray_cam;
+                Eigen::Vector3f cam_pos_w = t_cw;
+
+                const int pixel_index = y * width + x;
+                int step = 0;
+                // March through the truncation segment; `step` numbers each march
+                // iteration ascending so it forms the low half of the sequence key.
+                for (float t = t_min; t <= t_max; t += vs * 0.75f, ++step) {
+                    Eigen::Vector3f wpos = cam_pos_w + ray_w * t;
+
+                    // World to voxel index
+                    Eigen::Vector3f vpos = (wpos - origin) / vs;
+                    int vx = static_cast<int>(std::floor(vpos.x()));
+                    int vy = static_cast<int>(std::floor(vpos.y()));
+                    int vz = static_cast<int>(std::floor(vpos.z()));
+
+                    if (vx < 0 || vx >= res || vy < 0 || vy >= res || vz < 0 || vz >= res)
+                        continue;
+
+                    // Project voxel back to camera plane to get precise Z-depth difference
+                    Eigen::Vector3f cpos = R_wc * wpos + t_wc;
+                    float sdf = d_meas - cpos.z();
+
+                    if (sdf < -trunc) continue;
+
+                    float tsdf_new = std::min(1.0f, sdf / trunc);
+                    if (std::isnan(tsdf_new) || std::isinf(tsdf_new)) continue;
+
+                    if (logging && (tsdf_new >= 1.0f || tsdf_new <= -1.0f))
+                        ++local_truncation_clamped;
+
+                    local.push_back(Candidate{
+                        (static_cast<uint64_t>(pixel_index) << 32) |
+                            static_cast<uint32_t>(step),
+                        idx(vx, vy, vz),
+                        tsdf_new,
+                        std::abs(sdf),
+                        rgb != nullptr && sdf > -trunc * 0.5f});
                 }
             }
+        }
+
+        #pragma omp critical
+        {
+            candidates.insert(candidates.end(), local.begin(), local.end());
+            if (logging) {
+                g_tsdf_stats.depth_filtered     += local_depth_filtered;
+                g_tsdf_stats.truncation_clamped += local_truncation_clamped;
+            }
+        }
+    }
+
+    // Phase 2: canonical serial fold. Candidates are applied in ascending raster +
+    // march order through the exact weight/TSDF/color formulas the old kernel used,
+    // so each voxel equals the single-threaded sequential update regardless of how
+    // Phase 1 was scheduled. Only the pure per-pixel geometry (Phase 1) is parallel.
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b) { return a.key < b.key; });
+
+    for (const Candidate& c : candidates) {
+        Voxel& vox = voxels_[static_cast<size_t>(c.vidx)];
+
+        float w_old = vox.weight;
+        float w_new = 1.0f;
+        float w_sum = std::min(w_old + w_new, max_w);
+
+        float next_tsdf = (vox.tsdf * w_old + c.tsdf_new * w_new) / (w_old + w_new + 1e-6f);
+        if (std::isnan(next_tsdf) || std::isinf(next_tsdf)) continue;
+
+        vox.tsdf   = next_tsdf;
+        vox.weight = w_sum;
+
+        if (logging) {
+            ++g_tsdf_stats.voxels_updated;
+            g_tsdf_stats.max_sdf = std::max(g_tsdf_stats.max_sdf, c.abs_sdf);
+            g_tsdf_stats.avg_sdf += c.abs_sdf;
+        }
+
+        if (c.apply_color) {
+            // Same (y, x) that produced this candidate → its own RGB sample.
+            const int pidx = static_cast<int>(c.key >> 32) * 3;
+            // Use float arithmetic to avoid truncation darkening.
+            vox.r = static_cast<uint8_t>(std::round((static_cast<float>(vox.r) * w_old + static_cast<float>(rgb[pidx+0])) / (w_old + 1.0f + 1e-6f)));
+            vox.g = static_cast<uint8_t>(std::round((static_cast<float>(vox.g) * w_old + static_cast<float>(rgb[pidx+1])) / (w_old + 1.0f + 1e-6f)));
+            vox.b = static_cast<uint8_t>(std::round((static_cast<float>(vox.b) * w_old + static_cast<float>(rgb[pidx+2])) / (w_old + 1.0f + 1e-6f)));
+
+            if (logging) ++g_tsdf_stats.color_updates;
         }
     }
     
