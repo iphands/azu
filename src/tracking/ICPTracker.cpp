@@ -6,6 +6,7 @@
 #include <cmath>
 #include <algorithm>
 #include <iostream>
+#include <limits>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -19,8 +20,20 @@ static float getFy(int level) { return static_cast<float>(sensor::FY) / (1 << le
 static float getCx(int level) { return static_cast<float>(sensor::CX) / (1 << level); }
 static float getCy(int level) { return static_cast<float>(sensor::CY) / (1 << level); }
 
+ICPParams ICPTracker::sanitizeParams(const ICPParams& params) {
+    ICPParams out = params;
+    if (!std::isfinite(out.angle_threshold)) {
+        out.angle_threshold = kAngleThresholdFallbackDeg;
+    } else if (out.angle_threshold < kAngleThresholdMinDeg) {
+        out.angle_threshold = kAngleThresholdMinDeg;
+    } else if (out.angle_threshold > kAngleThresholdMaxDeg) {
+        out.angle_threshold = kAngleThresholdMaxDeg;
+    }
+    return out;
+}
+
 ICPTracker::ICPTracker(const ICPParams& params)
-    : params_(params)
+    : params_(sanitizeParams(params))
 {}
 
 ICPResult ICPTracker::track(const sensor::FramePyramid& live,
@@ -30,13 +43,21 @@ ICPResult ICPTracker::track(const sensor::FramePyramid& live,
 {
     ICPResult result;
     result.pose = pose_estimate;
+    float last_final_step = std::numeric_limits<float>::infinity();
 
     for (int level = sensor::FramePyramid::LEVELS - 1; level >= 0; --level) {
-        result = trackLevel(live.levels[level], model, result.pose, ref_pose, level,
-                            params_.max_iterations[level]);
+        ICPResult level_result = trackLevel(live.levels[level], model, result.pose, ref_pose, level,
+                                           params_.max_iterations[level]);
+        if (std::isfinite(level_result.final_step)) {
+            last_final_step = level_result.final_step;
+        }
+        level_result.final_step = last_final_step;
+        result = level_result;
     }
 
-    result.tracking_ok = result.converged && result.inliers > 100;
+    result.tracking_ok = result.pose.allFinite() &&
+                         result.inliers > kMinInliersForOk &&
+                         (result.converged || result.final_step <= kAcceptableFinalStep);
     return result;
 }
 
@@ -61,15 +82,17 @@ ICPResult ICPTracker::trackLevel(const sensor::FrameData& live_level,
                                result.dist_filtered, result.angle_filtered))
             break;
 
-        if (inlier_count < 10) break;
+        if (inlier_count < kMinInliersForIteration) break;
 
-        A += Eigen::Matrix<float, 6, 6>::Identity() * 0.1f;
+        A += Eigen::Matrix<float, 6, 6>::Identity() * dampingForHessian(A, level);
         Eigen::Matrix<float, 6, 1> x = A.ldlt().solve(b);
 
-        if (!x.allFinite() || x.head<3>().norm() > 0.2f) {
+        if (!x.allFinite() || x.head<3>().norm() > kTranslationCapStep ||
+            x.tail<3>().norm() > kRotationCapStep) {
             break;
         }
 
+        const float step_norm = x.norm();
         float tx = x(0), ty = x(1), tz = x(2);
         float rx = x(3), ry = x(4), rz = x(5);
 
@@ -89,17 +112,14 @@ ICPResult ICPTracker::trackLevel(const sensor::FrameData& live_level,
         delta.block<3,3>(0,0) = R;
         delta(0,3) = tx; delta(1,3) = ty; delta(2,3) = tz;
 
-        result.pose     = result.pose * delta;
-        
-        // Orthonormalize rotation to prevent drift/ghosting
-        Eigen::Matrix3f R_curr = result.pose.block<3,3>(0,0);
-        Eigen::JacobiSVD<Eigen::Matrix3f> svd(R_curr, Eigen::ComputeFullU | Eigen::ComputeFullV);
-        result.pose.block<3,3>(0,0) = svd.matrixU() * svd.matrixV().transpose();
+        result.pose = result.pose * delta;
+        result.pose.block<3, 3>(0, 0) = projectToSO3(result.pose.block<3, 3>(0, 0));
 
-        result.error    = residual / static_cast<float>(std::max(inlier_count, 1));
-        result.inliers  = inlier_count;
+        result.final_step = step_norm;
+        result.error      = residual / static_cast<float>(std::max(inlier_count, 1));
+        result.inliers    = inlier_count;
 
-        if (x.norm() < 5e-5f) {
+        if (step_norm < kConvergenceStep) {
             result.converged = true;
             break;
         }
@@ -237,7 +257,7 @@ bool ICPTracker::buildLinearSystem(const sensor::FrameData& live,
             int midx = my * sensor::FRAME_W + mx;
             const Eigen::Vector3f& model_v_world = model.vertices[midx];
             const Eigen::Vector3f& model_n_world = model.normals[midx];
-            if (model_v_world.norm() < 1e-6f || model_n_world.norm() < 1e-6f) continue;
+            if (!modelVertexIsValid(model_v_world) || !normalIsValid(model_n_world)) continue;
             acc.valid_model++;
 
             // Transform live vertex to world space for distance check
@@ -249,7 +269,7 @@ bool ICPTracker::buildLinearSystem(const sensor::FrameData& live,
             }
 
             const Eigen::Vector3f& live_n = live.normals[idx];
-            if (live_n.z() == 0.0f) continue;
+            if (!normalIsValid(live_n)) continue;
             
             // Map live normal to world space for angle check
             Eigen::Vector3f n_live_world = R_cw * live_n;

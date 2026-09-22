@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Eigen/Dense>
+
 #include <algorithm>
 #include <cmath>
 
@@ -50,6 +52,61 @@ inline constexpr float kDepthJumpRelFrac    = 0.05f;
 
 inline float depthJumpThreshold(float depth_m) {
     return std::max(kDepthJumpBaseMeters, depth_m * kDepthJumpRelFrac);
+}
+
+// Canonical CPU ICP numeric-policy constants (big-fix Todo 13). These values and
+// the predicates below are the single CPU source of truth for adaptive damping,
+// step caps, validity gates, SO(3) projection, and the accepted-step success
+// rule. CUDA/HIP ports remain deferred backend work.
+inline constexpr float kDampingDefault       = 0.1f;
+inline constexpr float kDampingLevel0        = 0.01f;
+inline constexpr float kDampingEscalated     = 1.0f;
+inline constexpr float kCondEscalate         = 1e7f;
+inline constexpr float kMinEigEscalate       = 1e-4f;
+inline constexpr float kTranslationCapStep   = 0.2f;
+inline constexpr float kRotationCapStep      = 0.5f;
+inline constexpr float kModelVertexNormSqMin = 1e-12f;
+inline constexpr float kNormalNormSqMin      = 0.9f;
+inline constexpr float kConvergenceStep      = 5e-5f;
+inline constexpr float kAcceptableFinalStep  = 1e-3f;
+inline constexpr float kAngleThresholdFallbackDeg = 30.0f;
+inline constexpr float kAngleThresholdMinDeg      = 0.0f;
+inline constexpr float kAngleThresholdMaxDeg      = 85.0f;
+inline constexpr int   kMinInliersForIteration = 10;
+inline constexpr int   kMinInliersForOk        = 100;
+
+inline bool modelVertexIsValid(const Eigen::Vector3f& v) {
+    return v.allFinite() && v.squaredNorm() > kModelVertexNormSqMin;
+}
+
+inline bool normalIsValid(const Eigen::Vector3f& n) {
+    return n.allFinite() && n.squaredNorm() > kNormalNormSqMin;
+}
+
+inline float dampingForHessian(const Eigen::Matrix<float, 6, 6>& A, int level) {
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<float, 6, 6>> solver(A);
+    if (solver.info() != Eigen::Success) return kDampingEscalated;
+
+    const Eigen::Matrix<float, 6, 1> eig = solver.eigenvalues();
+    const float min_eig = eig[0];
+    const float max_eig = eig[eig.size() - 1];
+    if (!std::isfinite(min_eig) || !std::isfinite(max_eig) || min_eig < kMinEigEscalate) {
+        return kDampingEscalated;
+    }
+    if (max_eig > kCondEscalate * min_eig) {
+        return kDampingEscalated;
+    }
+    return level == 0 ? kDampingLevel0 : kDampingDefault;
+}
+
+inline Eigen::Matrix3f projectToSO3(const Eigen::Matrix3f& M) {
+    Eigen::JacobiSVD<Eigen::Matrix3f> svd(M, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix3f U = svd.matrixU();
+    const Eigen::Matrix3f V = svd.matrixV();
+    if ((U * V.transpose()).determinant() < 0.0f) {
+        U.col(2) = -U.col(2);
+    }
+    return U * V.transpose();
 }
 
 } // namespace tracking

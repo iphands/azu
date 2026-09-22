@@ -211,6 +211,22 @@ target_link_libraries(icp_weighting_contract PRIVATE azu_test_core)
 add_test(NAME icp_weighting_contract COMMAND icp_weighting_contract)
 set_tests_properties(icp_weighting_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 13: CPU ICP numeric-policy contract ----
+# Public ICPTracker::track / params() / setParams() only. One single-threaded
+# contract locks the canonical CPU numeric policy: adaptive Tikhonov damping with
+# ill-conditioned escalation, translation and rotation step caps, squared-norm
+# model/live-normal gates, determinant-corrected SO(3) projection, the acceptable
+# final-step success rule, angle-threshold clamping, and an identity default
+# ICPResult::pose. Every expected number is an independent hand-derived double
+# oracle (closed-form normal-equation solutions), not a product-code snapshot.
+# No device, display, GPU, sensor, thread timing or filesystem.
+add_executable(icp_numeric_policy_contract icp_numeric_policy_contract.cpp)
+target_compile_definitions(icp_numeric_policy_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(icp_numeric_policy_contract PRIVATE azu_test_core)
+
+add_test(NAME icp_numeric_policy_contract COMMAND icp_numeric_policy_contract)
+set_tests_properties(icp_numeric_policy_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that

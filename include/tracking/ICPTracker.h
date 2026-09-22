@@ -2,6 +2,7 @@
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <limits>
 #include <vector>
 #include "sensor/FrameData.h"
 #ifdef CUDA_ENABLED
@@ -24,11 +25,12 @@ struct ICPParams {
 };
 
 struct ICPResult {
-    Eigen::Matrix4f pose;        // Updated camera pose (world-from-camera)
-    float           error       = 0.0f;
-    int             inliers     = 0;
-    bool            converged   = false;
+    Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
+    float           error      = 0.0f;
+    int             inliers    = 0;
+    bool            converged  = false;
     bool            tracking_ok = false;
+    float           final_step = std::numeric_limits<float>::infinity();
 
     // Diagnostic counters
     int             valid_live_points  = 0;
@@ -98,10 +100,12 @@ public:
 #endif
 
     const ICPParams& params() const { return params_; }
-    void setParams(const ICPParams& p) { params_ = p; }
+    void setParams(const ICPParams& p) { params_ = sanitizeParams(p); }
     void setNumThreads(int n) { num_threads_.store(n); }
 
 private:
+    static ICPParams sanitizeParams(const ICPParams& params);
+
     ICPParams params_;
     std::atomic<int> num_threads_{0};
 

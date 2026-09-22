@@ -303,17 +303,15 @@ Canonical CPU ICP policy:
 
 Current CPU behavior (`src/tracking/ICPTracker.cpp`):
 
-- Damping is a constant `A += I * 0.1f` at every level, with no
-  `SelfAdjointEigenSolver`, no condition-number test, and no escalation path.
-  **Known CPU defect** — the CPU is the backend that is missing the canonical
-  adaptive policy that the GPU already implements
-  (`ICPTracker_cuda.cu:419-435`: level-0 `0.01f`, escalation `1.0f`,
-  `cond > 1e7f || min_eig < 1e-4f`). The canonical rule is the adaptive one;
-  CPU converges to a different fixed point at level 0 by a factor of 10.
-- Translation is capped at `0.2f`; **rotation is never capped**, so an
-  unbounded per-iteration rotation is accepted. GPU caps it at `0.5f`.
-  **Known CPU defect** (`cross-backend:A10`). The only backstop is
-  `PipelineController.cpp`'s post-hoc `angle > 0.52f` whole-pose rejection.
+- Adaptive Tikhonov damping is implemented as of big-fix Todo 13 through
+  `include/tracking/ICPShared.h`: level 0 uses `0.01`, coarse levels use `0.1`,
+  and the solver escalates the diagonal to `1.0` when the undamped Hessian has
+  `cond > 1e7` or `min_eig < 1e-4`. Locked by
+  `tests/icp_numeric_policy_contract.cpp`.
+- Translation and rotation are capped at `0.2 m` and `0.5 rad` per accepted
+  update. An update violating either cap is rejected without mutating the pose
+  or `final_step`; `PipelineController.cpp`'s post-hoc whole-pose check remains a
+  pipeline safety net, not the per-iteration cap.
 - Huber weight `k = 0.02` **fixed by big-fix Todo 12**: it now applies
   consistently to the curvature (`A += w*J*Jᵀ`) and the gradient
   (`b -= J*(w*e)`), and the reported objective is the true Huber loss
@@ -334,33 +332,46 @@ Current CPU behavior (`src/tracking/ICPTracker.cpp`):
   depth each leave the 11 clean correspondences' pose and objective
   bit-identical). Backend parity is deferred as `tracking:ALL-3` (both backends
   still sample only `J[0]`/`J[3]` and never test the residual).
-- SVD re-orthonormalization is `svd.matrixU() * svd.matrixV().transpose()` with
-  **no determinant correction**, identically on CPU and both backends. `U·Vᵀ`
-  can have `det = -1`, which is a reflection and not a rotation; the correct
-  form is `U·diag(1,1,det(UVᵀ))·Vᵀ`. Zero `determinant`/`.det()` hits anywhere
-  in `src/tracking/` or `include/tracking/`. This is a shared defect and must
-  not be filed as a backend divergence.
-- `include/tracking/ICPTracker.h` `ICPResult::pose` is declared without an
-  initializer, so a result that returns before the pose is written carries an
-  indeterminate matrix.
+- SVD re-orthonormalization uses the shared determinant-corrected `projectToSO3`
+  helper as of big-fix Todo 13: full SVD, flip the last `U` column when
+  `det(U·Vᵀ) < 0`, then return `U·diag(1,1,det(U·Vᵀ))·Vᵀ`. The result is a proper
+  rotation, not a reflection. Backend parity is deferred as `tracking:GPU-8`.
+- `ICPResult` initializes `pose` to identity and `final_step` to `+infinity`.
+  `final_step` is the Euclidean norm of the last accepted six-vector update
+  (translation in metres and rotation in radians); it remains `+infinity` when no
+  update is accepted. `tracking_ok = pose.allFinite() && inliers > 100 &&
+  (converged || final_step <= 1e-3)`.
+- `ICPParams::angle_threshold` is clamped to `[0,85]` degrees at construction and
+  in `setParams()`; a non-finite value falls back to `30`.
 - `ICPParams::min_depth` / `max_depth` are assigned from
   `include/app/FusionHyperparams.h` and are **never read** by any of the three
   backends. Canonical: either honor them or delete them; a GUI-facing field that
   silently does nothing is not a contract.
 - Shared defaults, single source of truth, already canonical:
   `max_iterations{10, 5, 4}`, `dist_threshold = 0.1f`, `angle_threshold = 30.0f`
-  from `include/tracking/ICPTracker.h`.
+  from `include/tracking/ICPTracker.h`, sanitized through the `ICPTracker`
+  constructor and `setParams()`.
 - CPU excludes the 1-pixel image border from the correspondence scan
-  (`for y in [1, H-1)`, `for x in [1, W-1)`); the GPU scans the full frame. CPU
-  increments `valid_live` only after the `v_ref.z > 0.001f` test; the GPU
-  increments it before. CPU additionally gates on a live normal with
-  `live_n.z() == 0.0f` (itself a bug: `(0,1,0)` and a `(1,0,0)` sentinel both
-  pass), which the GPU does not do at all. Consequence:
-  `metrics_.icp_overlap_pct`, computed as `valid_model_points /
-  valid_live_points`, is not comparable across backends. Canonical: one
-  definition per counter, CPU-defined, and the distance/angle gates must be
-  evaluated in one named space (CPU measures in world space, GPU in
-  reference-camera space).
+  (`for y in [1, H-1)`, `for x in [1, W-1)`); the GPU scans the full frame.
+  Canonical CPU counter definitions: `valid_live_points` counts finite live
+  vertices that pass the positive reference-camera depth test;
+  `projected_points` counts those whose rounded model pixel is in bounds;
+  `valid_model_points` counts projected samples after model vertex/normal
+  validity gates and before distance/angle filtering; `dist_filtered` counts
+  valid-model samples outside `dist_threshold`; `angle_filtered` counts
+  distance-passing samples whose live normal is valid but fails the angle test.
+  A live-normal failure is a silent drop and does not increment `angle_filtered`.
+- Validity predicates are shared as of big-fix Todo 13: model vertices must be
+  finite with `||v||² > 1e-12`; model and live normals must be finite with
+  `||n||² > 0.9`. There is no upper normal bound and surviving normals are not
+  renormalized.
+- Consequence: `metrics_.icp_overlap_pct`, computed as `valid_model_points /
+  valid_live_points`, is not yet comparable across backends because the GPU still
+  places `valid_live` differently and evaluates distance/angle in
+  reference-camera space while CPU uses world space. Canonical: one definition
+  per counter, CPU-defined, and the distance/angle gates must be evaluated in one
+  named space. Backend port is deferred as `tracking:A10`, `tracking:A11`, and
+  `tracking:A17`.
 - CPU pyramid downsampling (`src/sensor/FrameData.cpp` `downsample()`) **has
   the depth-jump guard as of big-fix Todo 12**. A 2×2 block whose valid depths
   span more than the shared `depthJumpThreshold(d_min) = max(0.03, 0.05·d_min)`

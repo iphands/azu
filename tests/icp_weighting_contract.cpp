@@ -12,9 +12,10 @@
 //
 // The oracle is hand-derived in double from the fixture definition (literal
 // expected numerators/denominators), never by calling the product code or a
-// helper. It locks the CANONICAL triple and discriminates against the three
-// rejected formulations: unweighted curvature (-0.12/11.1), w^2 curvature with
-// w^2*e gradient (-0.105/10.1625), and the (w*e)^2 objective (0.0014/11).
+// helper. Todo 13 makes the undamped Hessian's zero eigenvalues escalate the
+// level-0 damping to 1.0, so the canonical triple is locked against
+// unweighted curvature (-0.12/12), w^2 curvature with w^2*e gradient
+// (-0.105/11.0625), and the (w*e)^2 objective (0.0014/11).
 // Public API only (ICPTracker::track, buildFramePyramid). No device, display,
 // GPU, sensor, thread timing or filesystem.
 
@@ -68,24 +69,24 @@ const float kInf = std::numeric_limits<float>::infinity();
 // optical center carries err = 0.08 (w = 0.25). The 10 inliers are five pixel
 // pairs point-symmetric about the optical center (319.5, 239.5), so their
 // cross-coupling into rows 3..5 cancels exactly and t_z decouples:
-//   A(2,2) = sum(w_i * Jz^2) + 0.1 damping = 10*1 + 0.25 + 0.1 = 10.35
-//   b(2)   = -sum(w_i * e_i)              = -(10*0.01 + 0.25*0.08) = -0.12
-//   t_z    = -0.12 / 10.35                        (canonical, w curvature)
-//   t_z    = -0.12 / (11 + 0.1) = -0.12/11.1      (unweighted curvature: pre-fix)
-//   t_z    = -0.105 / (10 + 0.25^2 + 0.1)         (w^2 curvature + w^2 e: option B)
+//   A(2,2) = sum(w_i * Jz^2) + 1.0 escalated damping = 10*1 + 0.25 + 1 = 11.25
+//   b(2)   = -sum(w_i * e_i)                        = -(10*0.01 + 0.25*0.08) = -0.12
+//   t_z    = -0.12 / 11.25                          (canonical, w curvature)
+//   t_z    = -0.12 / (11 + 1) = -0.12/12            (unweighted curvature)
+//   t_z    = -0.105 / (10 + 0.25^2 + 1)             (w^2 curvature + w^2 e: option B)
 // Objective per correspondence is psi(t) = t^2 (t <= k) or 2*k*t - k^2 (t > k):
 //   error = (10*0.01^2 + (2*0.02*0.08 - 0.02^2)) / 11 = 0.0038/11
 //   the rejected (w*e)^2 objective would give (10*0.0001 + 0.0004)/11 = 0.0014/11.
 // ---------------------------------------------------------------------------
 
 // Hand-derived canonical references (double, from the fixture definition only).
-constexpr double kTzCanonical = -0.12 / 10.35;          // -0.01159420
-constexpr double kTzUnweighted = -0.12 / 11.1;          // -0.01081081 (pre-fix)
-constexpr double kTzWSquared = -0.105 / 10.1625;        // -0.01033211 (option B)
+constexpr double kTzCanonical = -0.12 / 11.25;          // -0.01066667 (escalated damping)
+constexpr double kTzUnweighted = -0.12 / 12.0;          // -0.01000000 (unweighted curvature)
+constexpr double kTzWSquared = -0.105 / 11.0625;        // -0.00949153 (option B)
 constexpr double kErrCanonical = 0.0038 / 11.0;         //  3.4545455e-4
 constexpr double kErrWeightedSq = 0.0014 / 11.0;        //  1.2727273e-4 (pre-fix)
 
-// Discrimination gaps: |canonical-unweighted| ~ 7.8e-4, |canonical-w2| ~ 1.3e-3,
+// Discrimination gaps: |canonical-unweighted| ~ 6.7e-4, |canonical-w2| ~ 1.2e-3,
 // |errCanonical-errWeightedSq| ~ 2.2e-4. Float evaluation noise is ~1e-8, so a
 // 5e-6 match tolerance and 2e-4 gap floors keep every assertion decisive.
 constexpr double kTolMatch = 5e-6;
@@ -185,7 +186,7 @@ void testCanonicalWeighting() {
 
     const double tz = static_cast<double>(r.pose(2, 3));
     CHECK(std::abs(tz - kTzCanonical) <= kTolMatch,
-          "t_z == canonical -0.12/10.35 = " + std::to_string(kTzCanonical) +
+          "t_z == canonical -0.12/11.25 = " + std::to_string(kTzCanonical) +
               ", got " + std::to_string(tz));
     CHECK(std::abs(tz - kTzUnweighted) >= kGapFloor,
           "t_z is NOT the unweighted-curvature value " + std::to_string(kTzUnweighted) +
@@ -221,13 +222,16 @@ void testRejectsInfModelNormal() {
     const RunPair rp = runFixture(kInfModelNormalExtra);
     const ICPResult& r = rp.first;
 
-    // The (0,0,+Inf) model normal yields a +Inf residual: the correspondence is
-    // rejected before accumulation, so the 11 valid correspondences reproduce the
-    // clean result bit-for-bit. It passes the pre-accumulation model-norm gate, so
-    // it IS counted by the valid_model diagnostic (rejection happens later).
+    // The (0,0,+Inf) model normal is rejected by the squared-norm validity gate
+    // before valid_model is incremented. The sample is still projected, but only
+    // the 11 clean model points count; the clean correspondences reproduce the
+    // clean result bit-for-bit.
+    CHECK(r.projected_points == 12,
+          "inf normal: corrupt sample is projected (12), got " +
+              std::to_string(r.projected_points));
     CHECK(r.inliers == 11, "inf normal: inliers stays 11, got " + std::to_string(r.inliers));
-    CHECK(r.valid_model_points == 12,
-          "inf normal: corrupt sample counted by valid_model then rejected (12), got " +
+    CHECK(r.valid_model_points == 11,
+          "inf normal: invalid model normal is not counted by valid_model (11), got " +
               std::to_string(r.valid_model_points));
     CHECK(r.dist_filtered == 0 && r.angle_filtered == 0, "inf normal: corrupt sample not dist/angle filtered");
     CHECK(r.pose.allFinite() && std::isfinite(r.error), "inf normal: pose and error remain finite");
@@ -244,14 +248,15 @@ void testRejectsNaNResidual() {
     const RunPair rp = runFixture(kNaNModelDepthExtra);
     const ICPResult& r = rp.first;
 
-    // A NaN model depth produces a NaN residual with ALL SIX Jacobian entries
-    // finite, so a Jacobian-only guard cannot stop it: the residual itself must
-    // be checked before the weight is computed. Pre-fix the NaN poisoned b and
-    // the solve (inliers reported 0, pose never updated). Post-fix the remaining
-    // 11 correspondences reproduce the clean result bit-for-bit.
+    // A NaN model depth is rejected by the finite model-vertex validity gate
+    // before valid_model is incremented. The sample is still projected, but the
+    // remaining 11 correspondences reproduce the clean result bit-for-bit.
+    CHECK(r.projected_points == 12,
+          "nan residual: corrupt sample is projected (12), got " +
+              std::to_string(r.projected_points));
     CHECK(r.inliers == 11, "nan residual: inliers stays 11, got " + std::to_string(r.inliers));
-    CHECK(r.valid_model_points == 12,
-          "nan residual: corrupt sample counted by valid_model then rejected (12), got " +
+    CHECK(r.valid_model_points == 11,
+          "nan residual: invalid model vertex is not counted by valid_model (11), got " +
               std::to_string(r.valid_model_points));
     CHECK(r.pose.allFinite() && std::isfinite(r.error), "nan residual: pose and error remain finite");
     CHECK(poseBitEq(r.pose, clean.first.pose), "nan residual: pose bit-identical to clean run");
