@@ -12,14 +12,28 @@ unless its layer is named:
 
 - **Canonical** — the rule this run declares correct. Backends must later
   converge here.
-- **Current CPU behavior** — what the CPU code does today on HEAD `7151f5f`.
-  It is not automatically canonical.
+- **Current CPU behavior** — what the CPU code does today on the HEAD pinned
+  below. It is not automatically canonical.
 - **Known CPU defect** — current CPU behavior that contradicts the canonical
   rule and is owned by a later big-fix todo. Recorded here so the divergence is
-  not rediscovered.
+  not rediscovered. A defect this plan already repaired is **not** one of these:
+  it is labeled CPU-fixed, and that label never implies a backend agrees.
 - **Deferred backend** — a CUDA/HIP divergence from the canonical rule. Only
   the ID and the deferral live in `docs/CUDA_HIP_DEFERRED_CHANGES.md`; nothing
   backend was compiled or runtime-tested.
+
+**Pinned baseline: HEAD `a520cb9`.** Every "Current CPU behavior" statement
+below describes the CPU sources at that commit. The pin this file carried
+(`7151f5f`, the Todo 4 table-consolidation commit) predates the CPU repairs this
+plan landed afterwards — the edge-table repair, the shared PLY header, the dead
+code removal and the logger/timer hygiene — so statements written against it had
+drifted out of truth even though the code they described had been fixed.
+
+Line-number citations here are point-in-time, taken at the pinned HEAD, and they
+drift the moment the cited file is edited. That is why each one names its symbol
+on the same line. When a number and its symbol disagree, the symbol is right and
+the number is stale: re-derive with `grep -n '<symbol>' <file>` rather than
+trusting any number in this file.
 
 ## Depth domain
 
@@ -73,10 +87,14 @@ can never be written into a depth frame. `isDepthMetersInBand()` is the shared
 finite-plus-band predicate and `isUsableRawDepth()` (valid raw AND in-band
 meters) is the neighbour predicate for every filtering window.
 
-All four CPU depth passes go through that boundary: `buildFrameData()`,
-`denoiseDepthSpatial()`, `applyDepthEma()`, `fillDepthHoles()`,
-`guidedDepthFilter()` and `computeDepthGradient()`. Two further CPU-only rules
-live with them and are locked by `tests/depth_domain_contract.cpp` and
+All six CPU depth passes go through that boundary, and the named call is the
+site each one consults it: `buildFrameData()`
+(`src/sensor/FrameData.cpp:155`, `cpuDepthMeters()`), `denoiseDepthSpatial()`
+(`src/sensor/SignalConditioner_omp.cpp:443`), `applyDepthEma()` (`:495`),
+`fillDepthHoles()` (`:605`), `guidedDepthFilter()` (`:643`) — all
+`cpuDepthMeters()` — and `computeDepthGradient()` (`:126`,
+`isUsableRawDepth()`). Two further CPU-only rules live with them and are locked
+by `tests/depth_domain_contract.cpp` and
 `tests/depth_ema_determinism_contract.cpp`:
 
 - Hole fill may change **only** pixels that are raw `0`. Raw `2047` is written
@@ -114,7 +132,9 @@ Todo 8 rule). Locked by `tests/tsdf_integration_min_depth_contract.cpp`.
 The band is live on **both** consumers (**fixed by big-fix Todo 24**):
 `trackingLoop()` and `integrationLoop()` each take one `hyperparamsSnapshot()`
 per processed frame — after that frame is popped and before anything consumes it
-(`src/app/PipelineController.cpp:663`, `:986`) — so a `setHyperparams()` issued
+(`hyperparamsSnapshot()` in `trackingLoop()` at
+`src/app/PipelineController.cpp:754`, and in `integrationLoop()` at `:1075`) —
+so a `setHyperparams()` issued
 while the pipeline runs reaches the ICP, the preprocessor and the next
 integrated frame without a restart. The pre-Todo-24 shape, where
 `integrationLoop()` cached `d_min` / `d_max` **once** before its worker loop and
@@ -162,11 +182,18 @@ Current CPU behavior:
   `EMPTY_TSDF = 1.0f` / `EMPTY_WEIGHT = 0.0f` (plus
   `EMPTY_COLOR = 128.0f / 255.0f`, which publishes the neutral byte `128`), and
   `unlocked_reset()`, `getTSDF()` and the `raycast()` empty-space markers use
-  them. Nine raw `1.0f` literals remain in `src/tsdf/TSDFVolume.cpp` and none of
-  them is an empty-voxel marker: two are the ray projection `z = 1`, two are the
-  `[-1,1]` truncation clamp, one is the per-frame weight increment `w_new`,
-  three are the color fusion denominators, one is the point-cloud
-  `weight > 1.0f` gate. The backends still carry no such constant, and CPU
+  them. Seven lines of `src/tsdf/TSDFVolume.cpp` still carry the raw literal
+  `1.0f` (eight textual occurrences — the diagnostic line carries two), and none
+  of them is an empty-voxel marker. Site by site: the ray projection `z = 1`
+  twice, `ray_cam(..., 1.0f)` at `:283` (integration) and `:425` (raycast); the
+  `[-1,1]` truncation clamp once, `tsdf_new = std::min(1.0f, sdf / trunc)` at
+  `:321`; the clamping diagnostic once, `tsdf_new >= 1.0f || tsdf_new <= -1.0f`
+  at `:324`; the per-frame weight increment `w_new = 1.0f` at `:359`; the color
+  fusion denominator once, `denom = w_old + 1.0f + 1e-6f` at `:383` — one
+  literal and not three, because the three color channels divide by that single
+  `denom`, and the TSDF blend at `:362` reaches the same value through the named
+  `w_new` instead of a second literal;
+  and the point-cloud `weight > 1.0f` gate at `:631`. The backends still carry no such constant, and CPU
   meshing applies its own named `kWeightEpsilon = 0.001f` rather than
   `EMPTY_WEIGHT`: one shared epsilon remains open (`tsdf:T2`, `tsdf:T5`,
   `tsdf:T11`, `tsdf:T24`).
@@ -183,13 +210,26 @@ Current CPU behavior:
   `max_weight` change left voxels fused under the old parameters, and
   `worldToVoxel()` / `voxelToWorld()` reinterpreted them through the new
   geometry. An exactly-equal parameter set clears nothing.
-- `include/tsdf/TSDFVolume.h` `voxelAt()` is documented "bounds checked" while
-  `src/tsdf/TSDFVolume.cpp` implements it as a bare `voxels_[idx(x, y, z)]`
-  with no bounds test. **Known CPU defect**: either bounds-check it or fix the
-  comment; the header must not promise a check that does not exist.
+- `include/tsdf/TSDFVolume.h` `voxelAt()` documents a **precondition**, not a
+  service it performs: `x, y, z` are already inside `[0, resolution)` and the
+  caller consults `inBounds()` or its own loop bounds first (header comment
+  `:113-116`). Both overloads in `src/tsdf/TSDFVolume.cpp` enforce that
+  precondition with `assert(inBounds(x, y, z))` immediately before the indexed
+  read — `voxelAt() const` at `:552`, `voxelAt()` at `:557` — so it is
+  assert-checked in a debug build and deliberately bare in a release build,
+  where the accessor sits in the meshing hot path. **CPU-fixed**:
+  the header used to advertise an automatic check that the body did not
+  implement; what it advertises now is exactly what the body does, and the CPU
+  gate keeps the removed phrasing out of `TSDFVolume.*`
+  (`scripts/test-cpu-big-fix.sh:279`, the dead-symbol guard labelled
+  `tsdf:T24 false bounds-checked doc claim`). Violating the
+  precondition in a release build is a caller bug, and nothing here promises it
+  is caught.
 - `include/tsdf/VoxelGPU.h` `VoxelGPU` is 32 bytes with `float padding[3]`
   (12 permanently unused bytes per voxel) and no `static_assert` on its size;
-  host `Voxel` is 12 bytes with `uint8_t` color. The layout translation happens
+  host `Voxel` is 20 bytes — five `float`s (`tsdf, weight, r, g, b`) with
+  `alignof == 4`, color stored as float sRGB — which is the same fact the color
+  section states below as "20 B vs 32 B". The layout translation happens
   in exactly one place per backend. Deferred as `cross-backend:B3`.
 
 Canonical integration gate: `integrate()` honors the band **passed to it** — both as
@@ -203,7 +243,8 @@ the band reaches integration only through the public entry point's arguments.
 (which drives the band through `integrate()`'s parameters). Deferred backend instance:
 `tsdf:T8`. The snapshot lifecycle that kept the GUI slider stale for integration until
 restart was Todo 24's scope rather than a Todo 15 defect, and Todo 24 closed it on CPU
-(per-frame snapshot at `PipelineController.cpp:986`, locked by
+(per-frame `hyperparamsSnapshot()` inside `integrationLoop()` at
+`PipelineController.cpp:1075`, locked by
 `tests/pipeline_hyperparams_contract.cpp`); the backend instance stays deferred as
 `cross-backend:A28`.
 
@@ -229,9 +270,11 @@ Canonical ray crossing: a TSDF exit crossing (`prev < 0 && cur >= 0`) must be de
 not only the entry crossing. CPU detects both directions, so a ray that starts inside
 material reports the back face (with the flipped normal) instead of nothing, and one
 empty sample no longer resets a pending crossing — the old `prev_tsdf = EMPTY_TSDF`
-reset could also *fabricate* a crossing for an interior start. CUDA and HIP still detect
-only `prev_tsdf > 0.0f && tsdf <= 0.0f`: **known CPU defect fixed by big-fix Todo 15**,
-deferred backend parity as `tsdf:T26`.
+reset could also *fabricate* a crossing for an interior start. The CPU rule is
+**CPU-fixed by big-fix Todo 15**: `src/tsdf/TSDFVolume.cpp:446` accepts either
+direction with `(f_prev > 0.0f && f_cur <= 0.0f) || (f_prev < 0.0f && f_cur >= 0.0f)`.
+CUDA and HIP still test only `prev_tsdf > 0.0f && tsdf <= 0.0f`, so backend
+parity is deferred as `tsdf:T26` (not compiled, not runtime-tested here).
 
 Canonical `worldToVoxel` / projection rounding: floor semantics. Every CPU
 coordinate conversion now floors through the shared helper
@@ -289,18 +332,39 @@ the derived fixture (`meshing:B5` / `cross-backend:A1`; deferred, not compiled,
 not runtime-tested on this lane — matching the order is that todo's job, not
 this one's).
 
-Known CPU defect (carried deliberately): `edge_table[213] = 0x835`,
-`edge_table[214] = 0xb3f`, `edge_table[215] = 0xa36` in all three copies
-(CPU header line 57, CUDA line 62, HIP line 58). The canonical reference values
-are `0x83f` / `0xb35` / `0xa3c`, and the correct mirror row already exists in
-all three files at CPU header line 36, CUDA line 41, HIP line 37 — the corrupt
-row is its own mirror, which is what identifies it as corruption rather than a
-variant. Todo 4 was a value-preserving move, so the corruption is intentional
-and untouched; todo 6 adds the failing analytic tests and todo 7 corrects the
-shared header only. The `// fix: 0x835→0xb35 variant` comment at
-`include/meshing/MarchingCubesTables.h:57` is itself wrong: it claims a fix and
-names the wrong target (`[213]` canonical is `0x83f`, not `0xb35`). Deferred
-backend propagation: `cross-backend:A7`.
+Canonical CPU edge table — **CPU-fixed by big-fix Todo 7** (commit `f09bfc2`
+"fix(meshing): repair CPU marching cubes edge table"): the shared CPU table
+`include/meshing/MarchingCubesTables.h` carries `edge_table[213] = 0x83f`,
+`edge_table[214] = 0xb35`, `edge_table[215] = 0xa3c` on the `edge_table` data row
+that holds indices 208-215 (`:59`), and that repair is recorded in the header's
+own comment block (`:8-10`), not as an inline marker on the data row. These are
+the canonical crossing-edge values, and with them the whole CPU table satisfies
+the mirror identity `edge_table[i] == edge_table[255-i]` for all 256 entries.
+That identity is what identified the old triplet as corruption rather than a
+variant: the mirror of indices 208-215 is the row holding indices 40-47
+(`MarchingCubesTables.h:38`), and it already carried the correct reversed
+sequence `0xa3c / 0xb35 / 0x83f` in every copy.
+
+The corruption is therefore confined to the two **deferred** copies, which still
+carry `0x835 / 0xb3f / 0xa36`: `src/meshing/MarchingCubes_cuda.cu:62` and
+`src/meshing/MarchingCubes_hip.hip:58`. Each of them breaks the mirror identity
+at exactly indices 40/41/42 and 213/214/215, which is the same test the CPU
+table now passes. Timeline: Todo 4 (`7151f5f`) was the value-preserving move
+into the shared header; Todo 6 added the analytic table/sphere contracts that
+pinned the defect and go green against exactly these three repaired CPU values;
+Todo 7 repaired the shared CPU header only. Locked by
+`tests/marching_cubes_table_contract.cpp` — the Todo 6 first-principles oracle
+that was RED before the repair and is GREEN against exactly these three values —
+and by `tests/marching_cubes_sphere_contract.cpp`, which pins
+`{213, 0x83f} {214, 0xb35} {215, 0xa3c}` at `:97`. Backend propagation stays deferred
+as `cross-backend:A7` — not compiled, not runtime-tested in this run.
+
+There is no `// fix: 0x835→0xb35 variant` comment anywhere in the shared header,
+and there never was one to critique: the only lines in
+`include/meshing/MarchingCubesTables.h` matching `fix` are `:4` (the Todo 4
+provenance note) and `:8` (the first line of the Todo 7 repair block). The
+canonical target of `[213]` is `0x83f`, and that is what the CPU table now
+stores.
 
 Canonical mesh vertex validity (CPU, established by big-fix todo 16):
 
@@ -425,11 +489,24 @@ Current CPU behavior:
   the handedness flip. Any winding-rule change must be re-checked against this
   transform, because the export flips handedness twice and can mask a winding
   bug in one of the two stages.
-- `src/export/PLYExporter.cpp` writes binary PLY with
-  `property uint8 red/green/blue` but the ASCII writer emits
-  `property uchar ...` plus `property list uchar uint vertex_indices`. Schema
-  drift between the two writers for the same logical mesh. **Known CPU defect**
-  (owned by the export todo): one schema, one spelling, both writers.
+- `src/export/PLYExporter.cpp` emits **one** header for both formats:
+  `headerText()` (`:91-105`) builds every element/property line, and the binary
+  writer (`writeBinary`, calling it at `:209`) and the ASCII writer
+  (`writeASCII`, calling it at `:224`) both append it with only the format token
+  differing (`binary_little_endian` vs `ascii`), over the same `writeRecords()`
+  body. So both publish `property uchar red/green/blue` and
+  `property list uchar int vertex_indices` for the same logical mesh. **CPU-fixed
+  by big-fix Todo 30** (commit `7b36d5b` "fix(export): validate and robustify CPU
+  PLY writer") — one schema, one spelling, both writers. The spellings
+  this passage used to blame on the two writers (`property uint8 …` in binary,
+  `property list uchar uint …` in ASCII) do not occur anywhere in the file. The
+  one residual nuance is signedness, not drift: the shared header declares the
+  index type as `int` while the binary sink writes each index with
+  `appendU32LE()` — same 4-byte width, identical for both formats — and the
+  per-face count byte is the constant `3` (`:154`). The only other asymmetry is
+  a guard, not a schema: `writeBinary()` refuses a big-endian host before
+  opening the file (`:198-202`), because it emits a little-endian payload; ASCII
+  needs no such check.
  - `src/meshing/MarchingCubes.cpp` interpolates the edge color in float sRGB with
    the same parameter that produced the vertex position and turns it into the
    canonical byte through `kfusion::utils::srgbFloatToUint8`
@@ -684,7 +761,7 @@ consumer sized `FRAME_W * scale × FRAME_H * scale` read out of bounds. Locked b
 public `applyEASU_CPU` / `applyCAS_CPU` passes.
 
 Canonical upscaled-RGB consumer: either consumed or deleted — still open. The
-only consumer, the commented pair at `src/app/PipelineController.cpp:552-553` in
+only consumer, the commented pair at `src/app/PipelineController.cpp:782-783` in
 `trackingLoop()`, stays disabled (its note now says a future consumer must check
 the availability contract first), so the product still produces the buffer every
 frame and still textures from raw RGB. Enabling it is future scope, not this
@@ -777,10 +854,10 @@ thread-count execution paths keep their own shape and stay deferred as
 
 - **Owner snapshot per frame.** `hyperparamsSnapshot()` is the only read path to
   `hyperparams_`, and both workers call it exactly once per processed frame,
-  after that frame is popped and before anything consumes it (`:663` tracking,
-  `:986` integration). No preprocess / `track()` / `integrate()` call runs under
+  after that frame is popped and before anything consumes it (`trackingLoop()`
+  `:754`, `integrationLoop()` `:1075`). No preprocess / `track()` / `integrate()` call runs under
   `hyper_mutex_`, which is a leaf guard around the copy alone.
-- **Application is serialized by lifecycle.** `setHyperparams()` (`:251`) runs
+- **Application is serialized by lifecycle.** `setHyperparams()` (`:271`) runs
   under `control_mutex_`, the same lock `start()` / `stop()` / `reset()` take, so
   it can never interleave with a start or a shutdown. It then takes
   `hyper_mutex_`, `tracker_mutex_`, `tsdf_mutex_` (exclusive, because
@@ -797,26 +874,31 @@ thread-count execution paths keep their own shape and stay deferred as
   EMA and the upscaled buffer. `tsdf_mutex_` keeps its existing shared-read /
   exclusive-write split. Queue, pose, metrics and callback locks are never held
   together with a component lock.
-- **Callbacks are copied, never shared.** `setMetricsCallback()`,
-  `setFrameReadyCallback()` and `setMeshReadyCallback()` assign under
-  `callback_mutex_`; `frameReadyCallbackCopy()`, `meshReadyCallbackCopy()` and
-  `hasFrameReadyCallback()` (`:307`) read it under the same lock. Every call
-  site — `dispatchUiFrame()` (`:553`), the meshing loop (`:1296`) and `stop()`'s
-  final full-model view — takes the copy first and invokes **that copy** outside
+- **Callbacks are copied, never shared.** The controller has exactly two
+  callback setters, `setFrameReadyCallback()` (`:312`) and
+  `setMeshReadyCallback()` (`:317`), and both assign under
+  `callback_mutex_`; `frameReadyCallbackCopy()` (`:322`), `meshReadyCallbackCopy()`
+  (`:327`) and `hasFrameReadyCallback()` (`:332`) read it under the same lock.
+  Metrics are not a callback: the GUI pulls them through `metricsSnapshot()`
+  (`:254`), and no `setMetricsCallback()` exists on the controller. Every call
+  site — `dispatchUiFrame()` (`:595`, copy taken at `:599`), the meshing-loop
+  publish inside `meshingLoop()` (`:1325`, copy taken at `:1439`) and `stop()`'s
+  final full-model view (`:469`) — takes the copy first and invokes **that copy** outside
   `callback_mutex_`, because a subscriber is arbitrary UI code that may
   legitimately re-enter the controller. `dispatchUiFrame()` captures only the
   copy and the shared frame in the queued lambda, never `this`, so a later setter
   cannot change what an in-flight dispatch delivers.
-- **Thread counts move only at safe points.** `setNumThreads()` (`:340`)
+- **Thread counts move only at safe points.** `setNumThreads()` (`:355`)
   publishes the request first; while running it parks the value
   (`pending_num_threads_`, then `threads_pending_` as the release/acquire edge)
   and `applyPendingThreadCount()` applies it in `trackingLoop()` after the pop
-  and before the frame is processed (`:658`), so the tracker is never resized
+  and before the frame is processed (called at `:749`, definition `:348`), so the tracker is never resized
   mid-`track()`. While stopped it re-checks `running_` under `control_mutex_`
   and applies immediately, so a `start()` that won the race cannot have a worker
   already tracking with the old count.
 - **Terminal state is published last.** `stop()` stores `Stopped` only after all
-  three workers have joined (`:407`), because `trackingLoop()` stores
+  three workers have joined (`stop()` at `:377`, joins at `:433-438`, the store
+  at `:443`), because `trackingLoop()` stores
   `Running` / `TrackingLost` as it finishes a frame; storing it before the join
   let a mid-frame worker overwrite the terminal state after `stop()` had already
   returned.
@@ -834,59 +916,63 @@ Current behavior in `src/app/PipelineController.cpp`, **fixed by big-fix Todo 25
 (CPU only — the CUDA / HIP worker loops keep their own shape and stay deferred as
 `cross-backend:A28`):
 
-- **A start clears the motion model.** `startInternal()` (`:65`) writes
-  `last_pose_ = Identity` under `pose_mutex_` and un-arms the mesh request block
-  (`mesh_requests_.shutdown = false`, `:238`), so the first tracked frame is
+- **A start clears the motion model.** `startInternal()` (`:64`) writes
+  `last_pose_ = Identity` under `pose_mutex_` (the write at `:89`) and un-arms the mesh request block
+  (`mesh_requests_.shutdown = false`, `:236`), so the first tracked frame is
   scored against identity and the world origin, never against the pose the
-  previous session ended on. `reset()` (`:508`) does the same (`:549`) plus
+  previous session ended on. `reset()` (`:501`) does the same (`:542`) plus
   `frame_count_ = 0` and a fresh `metrics_`, both **inside** `metrics_mutex_`
-  (`:562`) — pre-Todo-25 those two writes were unsynchronized against the
+  (`:552-556`, the zeroing at `:554`) — pre-Todo-25 those two writes were unsynchronized against the
   metrics reader. Neither `start()` nor `reset()` requires the other first.
 - **Both queues retain the newest work.** `raw_queue_` capacity
-  `kRawQueueCapacity = 3` (`include/app/PipelineController.h:199`),
-  `integration_queue_` capacity `kIntegrationQueueCapacity = 3` (`:200`). When a
+  `kRawQueueCapacity = 3` (`include/app/PipelineController.h:216`),
+  `integration_queue_` capacity `kIntegrationQueueCapacity = 3` (`:217`). When a
   push finds the queue full the **oldest** entry is displaced, so a slow consumer
   sheds stale input instead of growing memory without bound and instead of
   forcing the producer to block on a live capture callback. The displaced frame is
-  destructed **outside** the queue lock (`src/app/PipelineController.cpp:670`),
+  destructed **outside** the queue lock — `displaced.reset()` in `onRawFrame()`
+  at `src/app/PipelineController.cpp:673`, and the same shape in
+  `enqueueForIntegration()` at `:722` —
   because a pooled `FrameData` deleter re-enters the sensor free-list.
 - **Eviction is counted, not silent.** `dropped_frames`
-  (`onRawFrame`, `:697`), `dropped_integration_frames`
-  (`enqueueForIntegration`, `:733`) and `dropped_pre_model_frames` (frames
-  discarded while waiting for the first model, `trackingLoop`, `:831`) live inside
+  (in `onRawFrame()` at `:650`, incremented at `:689`), `dropped_integration_frames`
+  (in `enqueueForIntegration()` at `:702`, incremented at `:725`) and `dropped_pre_model_frames` (frames
+  discarded while waiting for the first model, in `trackingLoop()` at `:729`,
+  incremented at `:823`) live inside
   `metrics_` and are written only under `metrics_mutex_`, which is a leaf: no
   queue lock is ever taken while it is held. They reach the UI through
   `metricsSnapshot()` and are zeroed by `reset()` with the rest of `metrics_`.
   Tracking and integration never block on a full queue, so the counters are the
   only visible sign of overload — which is why they are canonical surface.
-- **Frames move by ownership, not by copy.** `enqueueForIntegration()` (`:710`)
+- **Frames move by ownership, not by copy.** `enqueueForIntegration()` (`:702`)
   takes the `shared_ptr<FrameData>` by value and the tracking loop passes it with
-  `std::move` (`:810`, `:1040`). Pre-Todo-25 the tracking loop copied the
+  `std::move` (`:802`, `:1032`). Pre-Todo-25 the tracking loop copied the
   `shared_ptr` into the queue and kept a live local, so the pooled buffer could
   return to `acquireFreeData()` while still queued.
 - **Mesh requests are versioned, and nobody waits for a result.** `requestMesh()`
-  (`:1467`) increments `requested` under `mesh_requests_.mtx` and returns the
-  version; `meshingLoop()` (`:1332`) waits on the condition variable, claims the
+  (`:1460`) increments `requested` under `mesh_requests_.mtx` and returns the
+  version; `meshingLoop()` (`:1325`) waits on the condition variable, claims the
   newest requested version, extracts, and publishes with `(version, generation)`
   tags. The invariant is `served <= claimed <= requested`. A requester that needs
-  the answer — PLY/GLB export (`:1517`, `:1545`) — calls
-  `awaitMeshVersion(version, 5s)` (`:1501`), a **bounded** wait released by
+  the answer — PLY/GLB export (`exportPLY()` `:1540`, `exportGLB()` `:1547`, both
+  delegating to `exportMesh()` `:1502`) — calls
+  `awaitMeshVersion(version, 5s)` (`:1494`, invoked at `:1512`), a **bounded** wait released by
   `stop()`; the integration loop's cadence never waits at all.
-- **Cadence is a clock, not a frame count.** `requestMeshIfCadenceDue()` (`:1491`)
-  is called once per integrated frame (`:1328`) and requests at most once per
-  `mesh_cadence_us_` (default 500000 µs, `include/app/PipelineController.h:303`),
+- **Cadence is a clock, not a frame count.** `requestMeshIfCadenceDue()` (`:1484`)
+  is called once per integrated frame (`integrationLoop()`, `:1321`) and requests at most once per
+  `mesh_cadence_us_` (default 500000 µs, `include/app/PipelineController.h:319`),
   with the clock primed to the epoch at start so every session issues exactly one
   bootstrap request. The pre-Todo-25 `MESH_TRIGGER_FRAMES` counter made mesh rate a
   function of frame count, so it drifted with tracking quality.
-- **A superseded result cannot be published.** `invalidateMeshState()` (`:1477`)
+- **A superseded result cannot be published.** `invalidateMeshState()` (`:1470`)
   bumps `generation` and drains `requested`/`claimed`; a worker that was already
   extracting captured its generation at claim time and drops the result instead of
   publishing it (`stale_drops`). `served` and `served_generation` are deliberately
   left alone, because they describe the mesh that *is* published: inventing a
   served version would wake a waiter for a mesh that was never produced, so a
   waiter on a drained version times out instead — the same visible outcome the
-  pre-Todo-25 export path had when its flag was cleared. `stop()` sets
-  `mesh_requests_.shutdown` (`:423`), which releases every waiter and every parked
+  pre-Todo-25 export path had when its flag was cleared. `stop()` (`:377`) sets
+  `mesh_requests_.shutdown` (`:416`), which releases every waiter and every parked
   worker.
 
 Locked by `tests/pipeline_state_contract.cpp` and
@@ -906,7 +992,7 @@ stale model frame. Deferred as `pipeline:PC-02`.
 Canonical depth band reaches the consumer: `min_depth` / `max_depth` must be
 read inside the integration loop, per processed frame, not snapshotted before it.
 CPU satisfies this since big-fix Todo 24: `integrationLoop()` reads
-`hyperparamsSnapshot()` at `src/app/PipelineController.cpp:986`, immediately
+`hyperparamsSnapshot()` at `src/app/PipelineController.cpp:1075`, immediately
 after popping a frame and before `integrate()` sees it, so a live slider change
 takes effect on the next integrated frame. The pre-Todo-24 cache
 (`d_min`/`d_max` stored once before the `while (running_.load())` loop) is gone.
