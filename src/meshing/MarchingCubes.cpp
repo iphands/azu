@@ -302,7 +302,8 @@ std::shared_ptr<MeshData> MarchingCubes::extract(const tsdf::TSDFVolume& volume,
                     const int ec = tables::tri_table[cube_idx][t + 2];
                     if (!edge_ok[ea] || !edge_ok[eb] || !edge_ok[ec]) continue;
                     const int tri_edges[3] = {ea, eb, ec};
-                    // Reverse winding (2, 1, 0 instead of 0, 1, 2) to fix front-face culling
+                    // Derived outward convention: reverse table order (2, 1, 0); forward (0, 1, 2)
+                    // is inward under the signed-distance fixture. See docs/CANONICAL_SEMANTICS.md.
                     for (int i = 2; i >= 0; --i) {
                         const int e = tri_edges[i];
                         const uint32_t vidx = static_cast<uint32_t>(sl.pos.size());

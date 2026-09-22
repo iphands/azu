@@ -330,6 +330,27 @@ set_tests_properties(mesh_color_invariant_contract PROPERTIES LABELS cpu TIMEOUT
 add_test(NAME mesh_truncation_progress_contract COMMAND mesh_truncation_progress_contract)
 set_tests_properties(mesh_truncation_progress_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 18: CPU winding-convention derivation contract ----
+# Public TSDFVolume + MarchingCubes::extract only. Derives the authoritative CPU
+# triangle-winding convention from signed-volume / outward-normal mathematics over
+# an analytic signed-distance sphere (negative inside, positive outside, verified
+# voxel-by-voxel before extraction) — NEVER from a hardcoded expected tri_table
+# order and never from current product output. Section 0 self-derives the rule
+# V_signed = (1/6) sum a.(b x c) > 0 <=> outward on a hand-built unit cube; the
+# sphere sections then require V_signed > 0 (inscribed band 0.99*V0 < V < V0),
+# closed-manifold winding, a strict per-face radial test, a per-cube both-candidate
+# derivation over independently interpolated crossing vertices, and byte-identical
+# geometry across repeats and OpenMP threads 1/2/4. No device, display, GPU,
+# sensor, thread timing or filesystem. LOCK at todo 18 (the reverse emission order
+# already satisfies the derived rule; the todo proves it and pins it, with the
+# mutation flip of the emission order as the falsification witness).
+add_executable(marching_cubes_winding_contract marching_cubes_winding_contract.cpp)
+target_compile_definitions(marching_cubes_winding_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(marching_cubes_winding_contract PRIVATE azu_test_core)
+
+add_test(NAME marching_cubes_winding_contract COMMAND marching_cubes_winding_contract)
+set_tests_properties(marching_cubes_winding_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that

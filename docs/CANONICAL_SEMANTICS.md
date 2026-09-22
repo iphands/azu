@@ -211,23 +211,40 @@ The CUDA and HIP TUs still carry hand-copied duplicates (`meshing:D1`,
 `cross-backend:A8`).
 
 Canonical winding rule: **the outward-normal fixture is the CPU authoritative
-winding rule.** The CPU signed-volume / outward-normal test derived from the
-reference sphere construction (big-fix todo 6) is the single arbiter of
-triangle orientation for this run. A mesh is correct when its face normals
-point away from the signed-volume interior, and the CPU test is what decides
-that. Backends do not get their own winding opinion: CUDA and HIP winding must
-later be derived from the same fixture, and any backend that disagrees is the
-one that is wrong.
+winding rule, and the rule is derived, not chosen.** In right-handed world
+space (`e_x × e_y = e_z`), the divergence theorem makes the signed volume
+`V_signed = (1/6) Σ a·(b×c)` of a closed surface positive exactly when every
+face normal points outward; for a signed-distance sphere the outward normal is
+the direction of increasing tsdf, away from the known center. So the outward
+convention is a theorem about the reference sphere construction, never a vote
+of table rows. `tests/marching_cubes_winding_contract.cpp` (big-fix Todo 18)
+establishes the rule on a hand-built unit cube before touching any product
+mesh, verifies the sphere fixture's sign structure voxel-by-voxel, and requires
+`V_signed > 0` (within the derived inscribed-mesh band), a strict per-face
+radial test, and a per-cube derivation that evaluates BOTH windings of
+independently interpolated crossing vertices. Backends do not get their own
+winding opinion: CUDA and HIP winding must later be derived from the same
+fixture, and any backend that disagrees is the one that is wrong.
 
-Current CPU behavior: `src/meshing/MarchingCubes.cpp` emits triangles in
-reverse table order (`for (int i = 2; i >= 0; --i)`, comment "Reverse winding
-(2, 1, 0 instead of 0, 1, 2) to fix front-face culling"). HIP matches CPU
-(`2, 1, 0`); CUDA emits forward order `0, 1, 2` with no explanatory comment,
-so the CUDA file currently reads as the unpatched original
-(`meshing:B5` / `cross-backend:A1`). Whether `2, 1, 0` is actually right is
-exactly the question todo 6's fixture answers; until then the CPU reverse order
-is canonical *by definition of the fixture*, and the fixture is the artifact
-that gets validated.
+Derived CPU convention (Todo 18; derivation record in
+`.omo/evidence/big-fix/winding-derived-sign.txt`): with the shared table's edge
+incidence, the corner-sign rule "`tsdf < 0` = inside", and crossings
+interpolated from the canonical lower endpoint, the outward order of every
+emitted triangle is the **reverse table order `(2, 1, 0)`**; the forward order
+`(0, 1, 2)` is mathematically inward under the same fixture. `tri_table` is
+consulted only for *which edges* form a triangle, never for their orientation —
+no expected table order is hardcoded anywhere in the contract. Current CPU
+behavior therefore stands unchanged: `src/meshing/MarchingCubes.cpp` emits
+`for (int i = 2; i >= 0; --i)`, now labeled the derived convention (the old
+"fix front-face culling" comment was an ad hoc description of the same order)
+and locked by the new contract plus the pre-existing sphere outward test, both
+of which reject a flip to `0, 1, 2` (mutation witness: signed volume flips to
+exactly `-0.1127967361`, 8588/8588 faces inward). HIP emits the same literal
+`2, 1, 0` order; CUDA emits forward `0, 1, 2` with no explanatory comment, so
+the CUDA file currently reads as the unpatched original and is inward under
+the derived fixture (`meshing:B5` / `cross-backend:A1`; deferred, not compiled,
+not runtime-tested on this lane — matching the order is that todo's job, not
+this one's).
 
 Known CPU defect (carried deliberately): `edge_table[213] = 0x835`,
 `edge_table[214] = 0xb3f`, `edge_table[215] = 0xa36` in all three copies
@@ -309,8 +326,9 @@ its sequence is a pure function of the resolution; a resolution below 2 returns 
 empty mesh instead of dividing a `(resolution - 2)` progress span. Locked by
 `tests/mesh_welding_contract.cpp`, `tests/mesh_color_invariant_contract.cpp` and
 `tests/mesh_truncation_progress_contract.cpp`. The CPU reverse-winding emission
-(`2, 1, 0`) is unchanged and still owed to the winding todo; the unclamped
-float→uint8 color cast (below) is unchanged and still owed to the color todo.
+(`2, 1, 0`) is now the derived, locked winding convention (winding section
+above; Todo 18), no longer an open item; the unclamped float→uint8 color cast
+(below) is unchanged and still owed to the color todo.
 
 ## Color pipeline and export
 

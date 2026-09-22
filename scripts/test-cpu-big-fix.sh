@@ -29,7 +29,8 @@ CPU_LABEL="cpu"
 # appended the three TSDF raycast/depth-band contracts; todo 16 appended
 # marching_cubes_frontier_contract; todo 17 appended the three CPU mesh-invariant
 # contracts (mesh_welding_contract, mesh_color_invariant_contract,
-# mesh_truncation_progress_contract); every
+# mesh_truncation_progress_contract); todo 18 appended
+# marching_cubes_winding_contract; every
 # name is enforced as registered (the list only ever grows, so the guard never
 # weakens).
 REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_contract"
@@ -39,7 +40,7 @@ REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_co
     "tsdf_raycast_contract" "tsdf_integration_min_depth_contract"
     "tsdf_subvoxel_thin_feature_contract" "marching_cubes_frontier_contract"
     "mesh_welding_contract" "mesh_color_invariant_contract"
-    "mesh_truncation_progress_contract")
+    "mesh_truncation_progress_contract" "marching_cubes_winding_contract")
 # Real controller coupling, proven post-build: a source-only replica that
 # re-declares its own look-alike seam methods has none of these symbols. Both
 # real-controller seam binaries must carry them...
