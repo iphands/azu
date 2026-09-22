@@ -61,7 +61,10 @@ if(NOT GPU_BACKEND STREQUAL "CPU")
         if(CMAKE_HIP_COMPILER)
             enable_language(HIP)
             set(HIP_AVAILABLE TRUE)
-            add_compile_definitions(HIP_ENABLED __HIP_PLATFORM_AMD__)
+            # KIN-BIG-FIX(todo2): HIP_ENABLED moved to target-level definitions on
+            # KinectFusionQt below. Directory-scoped macros would otherwise leak
+            # into the CPU-only test targets. Production behavior unchanged: the
+            # app target is the only GPU consumer target.
             set(CMAKE_HIP_STANDARD 17)
             # Ryzen 5 5650U iGPU (Vega/Cezanne)
             set(CMAKE_HIP_ARCHITECTURES gfx90c)
@@ -79,7 +82,8 @@ if(NOT GPU_BACKEND STREQUAL "CPU")
         if(CMAKE_CUDA_COMPILER)
             enable_language(CUDA)
             set(CUDA_AVAILABLE TRUE)
-            add_compile_definitions(CUDA_ENABLED)
+            # KIN-BIG-FIX(todo2): CUDA_ENABLED moved to target-level definitions on
+            # KinectFusionQt below (see HIP note). Production behavior unchanged.
             set(CMAKE_CUDA_STANDARD 17)
             find_package(CUDAToolkit REQUIRED)
             message(STATUS "CUDA found: ${CMAKE_CUDA_COMPILER} (archs: ${CMAKE_CUDA_ARCHITECTURES})")
@@ -199,6 +203,17 @@ if(CUDA_AVAILABLE)
     target_include_directories(KinectFusionQt PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 endif()
 
+# KIN-BIG-FIX(todo2): back-end macros are target-scoped (not directory-scoped) so
+# the CPU-only test targets (tests/) can never inherit CUDA_ENABLED/HIP_ENABLED.
+# Same effective flags as the previous add_compile_definitions() lines for the
+# production target; KinectFusionQt is the only GPU consumer target.
+if(CUDA_AVAILABLE)
+    target_compile_definitions(KinectFusionQt PRIVATE CUDA_ENABLED)
+endif()
+if(HIP_AVAILABLE)
+    target_compile_definitions(KinectFusionQt PRIVATE HIP_ENABLED __HIP_PLATFORM_AMD__)
+endif()
+
 # ---- Link Libraries ----
 target_link_libraries(KinectFusionQt PRIVATE
     Qt6::Widgets
@@ -237,6 +252,17 @@ endif()
 
 if(WIN32)
     target_link_libraries(KinectFusionQt PRIVATE winmm)
+endif()
+
+# ---- CPU-only headless test harness (big-fix todo 2) ----
+# Conditionally enabled, CPU-only: enable_testing()/include(CTest) run nowhere
+# else, so no CUDA/HIP toolchain is ever required for this lane, and GPU
+# back-end build dirs (which carry GPU consumer code) stay test-free.
+if(GPU_BACKEND STREQUAL "CPU" AND BUILD_TESTING)
+    message(STATUS "BUILD_TESTING=ON with GPU_BACKEND=CPU — enabling CTest harness in tests/")
+    enable_testing()
+    include(CTest)
+    add_subdirectory(tests)
 endif()
 
 # ---- Diagnostic Summary ----

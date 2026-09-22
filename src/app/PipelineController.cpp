@@ -48,6 +48,20 @@ PipelineController::PipelineController(sensor::PreprocessBackend preferred_backe
 PipelineController::~PipelineController() { stop(); }
 
 bool PipelineController::start() {
+    return startInternal(true);
+}
+
+#ifdef AZU_PIPELINE_TEST_SEAM
+// Test seam: identical startup EXCEPT sensor_->init()/sensor_->start() are
+// bypassed, so headless tests never open a Kinect device. Everything else —
+// state reset, back-end selection, preprocessor, worker threads — is the real
+// production code path.
+bool PipelineController::startWithoutSensorForTests() {
+    return startInternal(false);
+}
+#endif
+
+bool PipelineController::startInternal(bool engage_sensor) {
   std::lock_guard<std::mutex> ctrl_lk(control_mutex_);
   if (running_.load())
     return true;
@@ -70,14 +84,18 @@ bool PipelineController::start() {
         onRawFrame(std::move(raw));
     });
 
-    if (!sensor_->init()) {
+    if (!engage_sensor) {
+        KFLOG_WARN("Pipeline",
+                   "TEST SEAM active: sensor init/start bypassed; RawFrames must "
+                   "arrive via injectRawFrameForTests().");
+    } else if (!sensor_->init()) {
         KFLOG_ERROR("Pipeline", "Sensor initialization FAILED. Is the Kinect connected?");
         running_.store(false);
         state_.store(PipelineState::Error);
         return false;
     }
 
-    if (!sensor_->start()) {
+    if (engage_sensor && !sensor_->start()) {
         KFLOG_ERROR("Pipeline", "Sensor start FAILED. Stream could not be opened.");
         running_.store(false);
         state_.store(PipelineState::Error);
@@ -349,6 +367,70 @@ void PipelineController::configurePreprocessor() {
                 sensor::backendName(preferred_backend_),
                 sensor::backendName(resolved));
 }
+
+#ifdef AZU_PIPELINE_TEST_SEAM
+namespace {
+struct UiFrameTestState {
+    std::mutex mtx;
+    std::function<void(const sensor::FrameData&)> hook;
+};
+UiFrameTestState& ui_frame_test_state() {
+    static UiFrameTestState state;
+    return state;
+}
+std::atomic<int> g_seam_ui_deliveries{0};
+} // namespace
+#endif
+
+void PipelineController::dispatchUiFrame(std::shared_ptr<sensor::FrameData> ui_frame) {
+    if (qApp) {
+        QMetaObject::invokeMethod(
+            qApp,
+            [this, ui_frame]() {
+                if (frame_ready_cb_)
+                    frame_ready_cb_(*ui_frame);
+            },
+            Qt::QueuedConnection);
+        return;
+    }
+#ifdef AZU_PIPELINE_TEST_SEAM
+    std::function<void(const sensor::FrameData&)> hook;
+    {
+        std::lock_guard<std::mutex> lk(ui_frame_test_state().mtx);
+        hook = ui_frame_test_state().hook;
+    }
+    if (hook) {
+        g_seam_ui_deliveries.fetch_add(1, std::memory_order_relaxed);
+        hook(*ui_frame);
+        return;
+    }
+    if (frame_ready_cb_) {
+        g_seam_ui_deliveries.fetch_add(1, std::memory_order_relaxed);
+        frame_ready_cb_(*ui_frame);
+    }
+    // No hook and no callback: deterministic no-op; null qApp is never touched.
+#endif
+}
+
+#ifdef AZU_PIPELINE_TEST_SEAM
+void PipelineController::registerUiFrameTestHookForTests(
+    std::function<void(const sensor::FrameData&)> hook) {
+    std::lock_guard<std::mutex> lk(ui_frame_test_state().mtx);
+    ui_frame_test_state().hook = std::move(hook);
+}
+
+int PipelineController::uiFrameDeliveryCountForTests() {
+    return g_seam_ui_deliveries.load(std::memory_order_relaxed);
+}
+
+void PipelineController::resetUiFrameTestStateForTests() {
+    {
+        std::lock_guard<std::mutex> lk(ui_frame_test_state().mtx);
+        ui_frame_test_state().hook = nullptr;
+    }
+    g_seam_ui_deliveries.store(0, std::memory_order_relaxed);
+}
+#endif
 
 // Called from sensor capture thread — must be lightweight
 void PipelineController::onRawFrame(std::shared_ptr<sensor::RawFrame> raw) {
@@ -817,13 +899,7 @@ void PipelineController::integrationLoop() {
             }
             ui_frame->pose = Eigen::Matrix4f::Identity();
 
-            QMetaObject::invokeMethod(
-                qApp,
-                [this, ui_frame]() {
-                  if (frame_ready_cb_)
-                    frame_ready_cb_(*ui_frame);
-                },
-                Qt::QueuedConnection);
+            dispatchUiFrame(std::move(ui_frame));
           }
       };
 #endif
@@ -869,13 +945,7 @@ void PipelineController::integrationLoop() {
               ui_frame->depth_meters[i] = (h_v[i].z != 0.0f || h_v[i].x != 0.0f || h_v[i].y != 0.0f) ? 1.0f : 0.0f;
             }
 
-            QMetaObject::invokeMethod(
-                qApp,
-                [this, ui_frame]() {
-                  if (frame_ready_cb_)
-                    frame_ready_cb_(*ui_frame);
-                },
-                Qt::QueuedConnection);
+            dispatchUiFrame(std::move(ui_frame));
           }
       } else {
           emitCpuPreview();
@@ -928,13 +998,7 @@ void PipelineController::integrationLoop() {
               ui_frame->depth_meters[i] = (h_v[i].z != 0.0f || h_v[i].x != 0.0f || h_v[i].y != 0.0f) ? 1.0f : 0.0f;
             }
 
-            QMetaObject::invokeMethod(
-                qApp,
-                [this, ui_frame]() {
-                  if (frame_ready_cb_)
-                    frame_ready_cb_(*ui_frame);
-                },
-                Qt::QueuedConnection);
+            dispatchUiFrame(std::move(ui_frame));
           }
       } else {
           // Fall through to CPU raycast

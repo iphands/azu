@@ -210,8 +210,19 @@ private:
     sensor::cudaStream_t                  cuda_stream_ = nullptr;
     mutable std::mutex                    control_mutex_;
 
+    bool startInternal(bool engage_sensor);
     void onRawFrame(std::shared_ptr<sensor::RawFrame> raw);
     void configurePreprocessor();
+    /**
+     * Centralized UI-frame callback delivery.
+     * Production (qApp exists): queued delivery on the GUI thread via
+     * QMetaObject::invokeMethod(qApp, ...) — identical to the previous inline code.
+     * Under AZU_PIPELINE_TEST_SEAM with qApp == nullptr: synchronous delivery
+     * through the registered test hook (or frame_ready_cb_), recording the
+     * delivery count. With neither registered: deterministic no-op — a null
+     * qApp is never dereferenced.
+     */
+    void dispatchUiFrame(std::shared_ptr<sensor::FrameData> ui_frame);
     void trackingLoop();
     void integrationLoop();
     void meshingLoop();
@@ -225,6 +236,23 @@ public:
         num_threads_.store(n);
         if (tracker_) tracker_->setNumThreads(n);
     }
+
+#ifdef AZU_PIPELINE_TEST_SEAM
+    // ---- Headless test seam (compile-time; defined only for test targets) ----
+    // Starts the real controller and all worker threads, bypassing ONLY
+    // sensor_->init()/sensor_->start(); no Kinect device is ever opened.
+    bool startWithoutSensorForTests();
+    // Feeds a frame through the production onRawFrame()/raw-queue path.
+    void injectRawFrameForTests(std::shared_ptr<sensor::RawFrame> raw) {
+        onRawFrame(std::move(raw));
+    }
+    // Hook invoked synchronously by dispatchUiFrame() when qApp is null.
+    static void registerUiFrameTestHookForTests(std::function<void(const sensor::FrameData&)> hook);
+    // Number of UI-frame callbacks delivered through the null-qApp seam path.
+    static int  uiFrameDeliveryCountForTests();
+    // Clears hook + delivery counter (call before each seam test).
+    static void resetUiFrameTestStateForTests();
+#endif
 };
 
 } // namespace app
