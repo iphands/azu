@@ -5,17 +5,19 @@
 // former `MarchingCubes::edge_table` / `MarchingCubes::tri_table` definitions
 // in src/meshing/MarchingCubes.cpp at commit 3cb69d2; no value was altered.
 //
-// KNOWN CORRUPTION (carried over verbatim, deliberately NOT fixed here):
-//   edge_table[213] = 0x835, edge_table[214] = 0xb3f, edge_table[215] = 0xa36
-//   (canonical reference values are 0x83f / 0xb35 / 0xa3c).
-// Todo 6 of the big-fix plan adds the analytic table/sphere tests that fail
-// against these entries; Todo 7 corrects them in this header. The trailing
-// "// fix:" comment on row 208-215 is the misleading CPU comment Todo 7 removes.
+// EDGE TABLE REPAIR (big-fix Todo 7): rows 213/214/215 are repaired in this
+// shared CPU table to the canonical crossing-edge values
+//   edge_table[213] = 0x83f, edge_table[214] = 0xb35, edge_table[215] = 0xa3c
+// (they previously carried three corrupt values verbatim from the
+// pre-consolidation table; Todo 6's analytic table/sphere contracts pinned the
+// defect and go green against exactly these three repaired values).
 //
 // `inline constexpr` (C++17) gives exactly one entity and one .rodata image per
 // binary shared by every translation unit - no per-TU table copy, no ODR hazard.
-// The CUDA/HIP translation units keep their private duplicate copies and remain
-// deferred migration items; see docs/CUDA_HIP_DEFERRED_CHANGES.md
+// The CUDA/HIP translation units keep their private duplicate copies, which
+// remain corrupt and are deferred migration items (this repair compiled and
+// tested the CPU lane only - no CUDA/HIP compilation or runtime testing was
+// performed); see docs/CUDA_HIP_DEFERRED_CHANGES.md
 // (`meshing:D1`, `cross-backend:A8`, `cross-backend:A7`).
 //
 // allow: SIZE_OK - indivisible 256x17 constant data table, not logic.
@@ -54,7 +56,7 @@ inline constexpr int edge_table[256] = {
 0x36c, 0x265, 0x16f, 0x66 , 0x76a, 0x663, 0x569, 0x460,
 0xca0, 0xda9, 0xea3, 0xfaa, 0x8a6, 0x9af, 0xaa5, 0xbac,
 0x4ac, 0x5a5, 0x6af, 0x7a6, 0xaa , 0x1a3, 0x2a9, 0x3a0,
-0xd30, 0xc39, 0xf33, 0xe3a, 0x936, 0x835, 0xb3f, 0xa36,  // fix: 0x835→0xb35 variant
+0xd30, 0xc39, 0xf33, 0xe3a, 0x936, 0x83f, 0xb35, 0xa3c,
 0x53c, 0x435, 0x73f, 0x636, 0x13a, 0x33 , 0x339, 0x230,
 0xe90, 0xf99, 0xc93, 0xd9a, 0xa96, 0xb9f, 0x895, 0x99c,
 0x69c, 0x795, 0x49f, 0x596, 0x29a, 0x393, 0x99 , 0x190,

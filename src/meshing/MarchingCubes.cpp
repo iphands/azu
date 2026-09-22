@@ -35,9 +35,10 @@ MarchingCubes::~MarchingCubes() {
 // ---------------------------------------------------------------------------
 // Lookup tables (edge_table / tri_table) live in the single shared CPU source
 // of truth: include/meshing/MarchingCubesTables.h
-// (kfusion::meshing::tables::{edge_table, tri_table}). Values are unchanged
-// from the former class-static definitions; the known corrupt
-// edge_table[213/214/215] entries are owned by big-fix Todos 6-7, not fixed here.
+// (kfusion::meshing::tables::{edge_table, tri_table}). big-fix Todo 7 repaired
+// edge_table[213/214/215] there to the canonical crossing-edge values
+// 0x83f / 0xb35 / 0xa3c; the CUDA/HIP duplicate copies remain corrupt and
+// deferred (not compiled or runtime-tested on the CPU lane).
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------

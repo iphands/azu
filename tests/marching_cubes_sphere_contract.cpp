@@ -3,16 +3,18 @@
 // over a deterministic signed-distance volume and asserts the geometry the CPU
 // meshing stage is contracted to produce.
 //
-// Why this fixture avoids the corrupt configs: cube configurations 213/214/215 read
-// uninitialized edge_verts/edge_norms/edge_colors slots through the CURRENT table
-// (their edge masks are missing bits the tri rows still reference), so extracting a
-// cube with one of those configs is undefined behavior until big-fix todo 7 repairs
-// the table. This fixture is a fully interior, center-aligned analytic sphere whose
-// every potentially-meshed cube configuration is enumerated here FIRST, from the same
-// corner-sign rule MarchingCubes::extract uses, and proven not to be 213/214/215
-// before extract() is ever called. The pre-extraction enumeration is the safety gate:
-// if it ever saw a corrupt config it fails the test and returns WITHOUT calling
-// extract(), so the test can only ever fail through a well-defined assertion, never UB.
+// Why the fixture and its gates stay UB-free: before big-fix todo 7 repaired the
+// shared table, cube configurations 213/214/215 read uninitialized
+// edge_verts/edge_norms/edge_colors slots (their corrupt edge masks were missing
+// bits the tri rows still referenced), so extracting such a cube was undefined
+// behavior. Two fail-closed gates keep this test out of UB regardless of table
+// state: Gate 0 refuses to call extract() while any of those three rows deviates
+// from the independently derived canonical masks (0x83f/0xb35/0xa3c), and Gate 1
+// enumerates every potentially-meshed cube configuration FIRST, from the same
+// corner-sign rule MarchingCubes::extract uses, proving none is 213/214/215. If
+// either gate fires, the test fails through a well-defined assertion and returns
+// WITHOUT calling extract() — never UB. Todo 7 repaired the three rows, so Gate 0
+// now passes and the extraction assertions below run.
 //
 // The assertions are derived from signed-volume geometry, not from current code
 // comments or current broken behavior:
@@ -273,12 +275,13 @@ void testOutwardOrientation(const MeshData& m, const Sphere& s) {
 } // namespace
 
 int main() {
-    // Gate 0 (fail-before-fix safety precondition): refuse to exercise extraction
-    // while the shared table still mis-marks the corrupt 213/214/215 masks, because
-    // extracting those cube configs reads uninitialized edge slots. This is pure
-    // integer math over the table and returns before any volume work or extract(),
-    // so the sphere test is red at todo 6 without ever reaching undefined behavior,
-    // and turns green into the extraction assertions below once todo 7 fixes the table.
+    // Gate 0 (fail-closed safety precondition, written fail-before-fix): refuse to
+    // exercise extraction while the shared table mis-marks the 213/214/215 masks,
+    // because extracting those cube configs reads uninitialized edge slots. This is
+    // pure integer math over the table and returns before any volume work or
+    // extract(), so the test can never reach undefined behavior through the table.
+    // It was RED at todo 6; todo 7 repaired the rows to 0x83f/0xb35/0xa3c, so it
+    // now passes and the extraction assertions below run.
     if (!corruptTableEntriesAreRepaired()) {
         std::printf("marching_cubes_sphere_contract: FAIL "
                     "(edge_table 213/214/215 not repaired; not calling extract())\n");

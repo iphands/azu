@@ -2,11 +2,13 @@
 // crossing-edge oracle for all 256 rows of the shared CPU edge table
 // (kfusion::meshing::tables::edge_table in include/meshing/MarchingCubesTables.h).
 //
-// FAIL-BEFORE-FIX: this test is EXPECTED to be RED at todo 6 and GREEN only after
-// todo 7 repairs the three known-corrupt rows. The current CPU/shared table carries
-//   edge_table[213] = 0x835 (canonical 0x83f)
-//   edge_table[214] = 0xb3f (canonical 0xb35)
-//   edge_table[215] = 0xa36 (canonical 0xa3c)
+// FAIL-BEFORE-FIX: this test was RED at todo 6 and turned GREEN when todo 7
+// repaired the three known-corrupt rows of the shared CPU table to the
+// canonical crossing-edge values the oracle independently derives:
+//   edge_table[213] = 0x83f (was the corrupt 0x835)
+//   edge_table[214] = 0xb35 (was the corrupt 0xb3f)
+//   edge_table[215] = 0xa3c (was the corrupt 0xa36)
+// Any future crossing-edge mismatch fails this test again.
 // This oracle recomputes every mask from corner sign patterns alone, so it names
 // exactly those three rows and nothing else. It never reads uninitialized memory,
 // never depends on a sanitizer, timing, or undefined behavior: it is a pure,
@@ -95,8 +97,9 @@ void testOracleKnownAnchors() {
     if (crossingEdgeMask(0x01) != 0x109) { std::printf("FAIL: oracle anchor 0x01\n"); ++g_failures; }
     // config 0xFF: all corners inside -> no crossing edge.
     if (crossingEdgeMask(0xFF) != 0x000) { std::printf("FAIL: oracle anchor 0xFF\n"); ++g_failures; }
-    // The canonical values for the three corrupt rows, asserted independently so the
-    // red verdict is attributable to the table, not to a mis-derived oracle.
+    // The canonical values for the three historically-corrupt rows (repaired by
+    // todo 7), asserted independently so any table verdict is attributable to the
+    // table, not to a mis-derived oracle.
     if (crossingEdgeMask(213) != 0x83f) { std::printf("FAIL: oracle anchor 213\n"); ++g_failures; }
     if (crossingEdgeMask(214) != 0xb35) { std::printf("FAIL: oracle anchor 214\n"); ++g_failures; }
     if (crossingEdgeMask(215) != 0xa3c) { std::printf("FAIL: oracle anchor 215\n"); ++g_failures; }
