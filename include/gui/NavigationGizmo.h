@@ -12,21 +12,26 @@ public:
     explicit NavigationGizmo(QWidget* parent = nullptr);
 
 signals:
-    void cameraRotationChanged(int pitch, int yaw, int roll);
+    // Float degrees: an int signature rounded sub-degree drags away to nothing.
+    void cameraRotationChanged(float pitch, float yaw, float roll);
 
 public slots:
-    void setCameraRotation(int pitch, int yaw, int roll);
+    void setCameraRotation(float pitch, float yaw, float roll);
 
 protected:
     void paintEvent(QPaintEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
+    void enterEvent(QEnterEvent* event) override;
+    void leaveEvent(QEvent* event) override;
 
 private:
-    int pitch_ = 0;
-    int yaw_ = 0;
-    int roll_ = 0;
+    float pitch_ = 0.0f;
+    float yaw_   = 0.0f;
+    float roll_  = 0.0f;
     QPoint last_mouse_pos_;
+    bool   dragging_ = false;
 };
 
 } // namespace gui

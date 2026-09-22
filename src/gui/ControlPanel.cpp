@@ -17,6 +17,8 @@
 #include "gui/NavigationGizmo.h"
 #include "utils/Logger.h"
 
+#include <cmath>
+
 namespace kfusion {
 namespace gui {
 
@@ -30,6 +32,14 @@ QDoubleSpinBox* makeDoubleSpin(double minV, double maxV, double step, double val
     s->setValue(val);
     s->setButtonSymbols(QAbstractSpinBox::PlusMinus);
     return s;
+}
+
+// Same (-180, 180] range the integer version had, without rounding the value.
+float wrapDegrees(float deg) {
+    float wrapped = std::fmod(deg, 360.0f);
+    if (wrapped > 180.0f)       wrapped -= 360.0f;
+    else if (wrapped < -180.0f) wrapped += 360.0f;
+    return wrapped;
 }
 
 } // namespace
@@ -333,16 +343,13 @@ void ControlPanel::setBusy(bool busy) {
     btn_reset_->setEnabled(!busy);
 }
 
-void ControlPanel::setCameraRotation(int pitch, int yaw, int roll) {
+void ControlPanel::setCameraRotation(float pitch, float yaw, float roll) {
     // Block signals to avoid infinite loop between mouse updates and slider updates
     nav_gizmo_->blockSignals(true);
 
-    // Normalize values to -180..180
-    pitch = (pitch % 360 + 360) % 360; if (pitch > 180) pitch -= 360;
-    yaw   = (yaw % 360 + 360) % 360;   if (yaw > 180) yaw -= 360;
-    roll  = (roll % 360 + 360) % 360;  if (roll > 180) roll -= 360;
-
-    nav_gizmo_->setCameraRotation(pitch, yaw, roll);
+    nav_gizmo_->setCameraRotation(wrapDegrees(pitch),
+                                  wrapDegrees(yaw),
+                                  wrapDegrees(roll));
 
     nav_gizmo_->blockSignals(false);
 }

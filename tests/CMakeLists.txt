@@ -31,7 +31,13 @@ file(GLOB AZU_TEST_CORE_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/src/utils/*.cpp"
 )
 
-add_library(azu_test_core STATIC ${AZU_TEST_CORE_SOURCES})
+add_library(azu_test_core STATIC ${AZU_TEST_CORE_SOURCES}
+    # big-fix todo 27: the camera is pure Eigen math with no GL/display/device
+    # dependency, unlike PreviewRenderer/ShaderProgram, so it is listed as an
+    # explicit source instead of a src/rendering/*.cpp glob. The camera contract
+    # below must exercise THIS translation unit, not a local replica.
+    "${CMAKE_SOURCE_DIR}/src/rendering/Camera.cpp"
+)
 target_compile_definitions(azu_test_core PUBLIC ${AZU_TEST_DEFS})
 target_include_directories(azu_test_core PUBLIC
     "${CMAKE_SOURCE_DIR}/include"
@@ -554,6 +560,25 @@ set_tests_properties(kinect_pairing_contract PROPERTIES LABELS cpu TIMEOUT 120)
 add_test(NAME glb_linear_color_contract COMMAND glb_linear_color_contract)
 set_tests_properties(glb_linear_color_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 27: CPU camera orbit/pan/basis + first-frame tick clamp ----
+# camera_basis_contract drives the REAL src/rendering/Camera.cpp (linked through
+# azu_test_core, gate 10 below) through its public API only: cameraBasis(),
+# orbitEye(), viewMatrix(), pan(), move(), rotate(), zoom() and the pure
+# clampFrameDeltaSeconds() tick policy. Expected matrices are hand-derived from
+# the orbit-eye definition eye = target - distance*forward plus orthonormal and
+# on-axis-target invariants, so the pre-fix "+distance*sin(pitch)" eye and the
+# pre-fix roll-free pan basis both fail instead of silently passing. Locks the
+# negative-Y convention at four yaw octants, roll-aware right/up for pan and
+# WASD/QE, Orbit<->Free view continuity, and that only the first tick is
+# replaced by the nominal one. Pure Eigen arithmetic: no OpenGL context, device,
+# display, GPU, sensor, network, wall-clock oracle, thread timing or filesystem.
+add_executable(camera_basis_contract camera_basis_contract.cpp)
+target_compile_definitions(camera_basis_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(camera_basis_contract PRIVATE azu_test_core)
+
+add_test(NAME camera_basis_contract COMMAND camera_basis_contract)
+set_tests_properties(camera_basis_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that
@@ -898,4 +923,66 @@ if(NOT "${AZU_EXPORT_TEST_LINKS}" MATCHES "azu_test_pipeline")
         "got: ${AZU_EXPORT_TEST_LINKS}")
 endif()
 
-message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract + pipeline_state_contract + pipeline_mesh_cadence_contract + pipeline_export_mesh_contract registered (label=cpu)")
+# 10) big-fix todo 27: camera_basis_contract must drive the REAL camera
+#     translation unit through the real camera API. Same discipline as gate
+#     1/4/5/6/7/8/9: comments are stripped, so only a genuine call shape
+#     (receiver '.'/'>'/'::' + name + '(') satisfies it, and the real
+#     src/rendering/Camera.cpp has to be an ELEMENT of azu_test_core's own
+#     source list -- a test that re-declares its own Camera/orbitEye replica in
+#     the test file cannot pass either half of this gate.
+get_target_property(AZU_CAMERA_TEST_SOURCES camera_basis_contract SOURCES)
+if(NOT AZU_CAMERA_TEST_SOURCES)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: camera_basis_contract has no SOURCES.")
+endif()
+set(AZU_CAMERA_TEST_TEXT "")
+foreach(_azu_camera_src ${AZU_CAMERA_TEST_SOURCES})
+    get_filename_component(_azu_camera_abs "${_azu_camera_src}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(NOT EXISTS "${_azu_camera_abs}")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: registered camera_basis_contract source ${_azu_camera_abs} does not exist.")
+    endif()
+    file(READ "${_azu_camera_abs}" _azu_camera_txt)
+    azu_strip_c_comments(_azu_camera_txt_code _azu_camera_txt)
+    string(APPEND AZU_CAMERA_TEST_TEXT "${_azu_camera_txt_code}")
+endforeach()
+# The surfaces todo 27 owns: the one orbit-eye helper, the one shared basis
+# helper, the matrix both feed, the two consumers that must go through that
+# basis, and the pure first-frame tick policy.
+foreach(_azu_camera_call orbitEye cameraBasis viewMatrix pan move rotate zoom
+                        clampFrameDeltaSeconds setMode setRoll)
+    if(NOT AZU_CAMERA_TEST_TEXT MATCHES "[.>:]${_azu_camera_call}[ \t\r\n]*\\(")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: the camera_basis_contract source must call ${_azu_camera_call}() "
+            "on the real kfusion::rendering::Camera / camera API "
+            "(a comment or string literal naming it is not a call). "
+            "A local orbit/basis replica does not satisfy this todo.")
+    endif()
+endforeach()
+get_target_property(AZU_CAMERA_TEST_LINKS camera_basis_contract LINK_LIBRARIES)
+if(NOT "${AZU_CAMERA_TEST_LINKS}" MATCHES "azu_test_core")
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: camera_basis_contract must link azu_test_core, "
+        "got: ${AZU_CAMERA_TEST_LINKS}")
+endif()
+# Positive coupling: the library it links has to CARRY the real camera TU.
+get_target_property(AZU_TEST_CORE_LIB_SOURCES azu_test_core SOURCES)
+if(NOT AZU_TEST_CORE_LIB_SOURCES)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: azu_test_core has no SOURCES.")
+endif()
+set(AZU_TEST_CORE_HAS_CAMERA_TU FALSE)
+foreach(_azu_core_src ${AZU_TEST_CORE_LIB_SOURCES})
+    file(TO_CMAKE_PATH "${_azu_core_src}" _azu_core_norm)
+    if(_azu_core_norm MATCHES "(^|/)src/rendering/Camera\\.cpp$")
+        set(AZU_TEST_CORE_HAS_CAMERA_TU TRUE)
+    endif()
+endforeach()
+if(NOT AZU_TEST_CORE_HAS_CAMERA_TU)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: azu_test_core must compile the real src/rendering/Camera.cpp "
+        "as one source-list element; camera_basis_contract would otherwise test a replica "
+        "instead of the product camera.")
+endif()
+
+message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract + pipeline_state_contract + pipeline_mesh_cadence_contract + pipeline_export_mesh_contract + camera_basis_contract registered (label=cpu)")

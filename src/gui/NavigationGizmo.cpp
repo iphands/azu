@@ -39,7 +39,7 @@ NavigationGizmo::NavigationGizmo(QWidget* parent) : QWidget(parent) {
     setCursor(Qt::OpenHandCursor);
 }
 
-void NavigationGizmo::setCameraRotation(int pitch, int yaw, int roll) {
+void NavigationGizmo::setCameraRotation(float pitch, float yaw, float roll) {
     pitch_ = pitch;
     yaw_ = yaw;
     roll_ = roll;
@@ -49,6 +49,7 @@ void NavigationGizmo::setCameraRotation(int pitch, int yaw, int roll) {
 void NavigationGizmo::mousePressEvent(QMouseEvent* event) {
     if (event->button() == Qt::LeftButton) {
         last_mouse_pos_ = event->pos();
+        dragging_ = true;
         setCursor(Qt::ClosedHandCursor);
     }
 }
@@ -58,13 +59,31 @@ void NavigationGizmo::mouseMoveEvent(QMouseEvent* event) {
         QPoint delta = event->pos() - last_mouse_pos_;
         last_mouse_pos_ = event->pos();
 
-        // Blender drag: dragging changes rotation
-        yaw_ += delta.x();
-        pitch_ += delta.y();
+        // Blender drag: dragging changes rotation, in float degrees
+        yaw_   += static_cast<float>(delta.x());
+        pitch_ += static_cast<float>(delta.y());
 
         emit cameraRotationChanged(pitch_, yaw_, roll_);
         update();
     }
+}
+
+void NavigationGizmo::mouseReleaseEvent(QMouseEvent* event) {
+    if (event->button() != Qt::LeftButton) return;
+    dragging_ = false;
+    // setCursor() overrides are sticky; nothing else resets the clenched fist.
+    setCursor(Qt::OpenHandCursor);
+}
+
+void NavigationGizmo::enterEvent(QEnterEvent* event) {
+    QWidget::enterEvent(event);
+    if (!dragging_) setCursor(Qt::OpenHandCursor);
+}
+
+void NavigationGizmo::leaveEvent(QEvent* event) {
+    QWidget::leaveEvent(event);
+    // Qt keeps the mouse grab through a drag, so keep the fist until release.
+    if (!dragging_) setCursor(Qt::OpenHandCursor);
 }
 
 void NavigationGizmo::paintEvent(QPaintEvent* event) {

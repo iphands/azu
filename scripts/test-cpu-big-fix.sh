@@ -38,8 +38,11 @@ CPU_LABEL="cpu"
 # pipeline_state_contract and pipeline_mesh_cadence_contract (29 CPU tests in
 # total); todo 26 INTENTIONALLY appended pipeline_export_mesh_contract as the
 # 30th CPU test (the shared exportMesh helper behind the non-blocking GUI
-# export); every name is enforced as registered (the list only ever grows, so
-# the guard never weakens).
+# export); todo 27 INTENTIONALLY appended camera_basis_contract as the 31st CPU
+# test (the real src/rendering/Camera.cpp orbit/pan/basis math plus the pure
+# first-frame tick clamp, which needs no Qt, display or OpenGL context); every
+# name is enforced as registered (the list only ever grows, so the guard never
+# weakens).
 REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_contract"
     "marching_cubes_table_contract" "marching_cubes_sphere_contract" "tsdf_reset_contract"
     "mesh_validation_contract" "coordinate_rounding_contract" "icp_weighting_contract"
@@ -57,7 +60,9 @@ REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_co
     # mesh request cadence.
     "pipeline_state_contract" "pipeline_mesh_cadence_contract"
     # todo 26: shared exportMesh(path, writer_fn) helper behind exportPLY/exportGLB.
-    "pipeline_export_mesh_contract")
+    "pipeline_export_mesh_contract"
+    # todo 27: real Camera orbit/pan/basis math + the pure first-frame tick clamp.
+    "camera_basis_contract")
 # Real controller coupling, proven post-build: a source-only replica that
 # re-declares its own look-alike seam methods has none of these symbols. Both
 # real-controller seam binaries must carry them...

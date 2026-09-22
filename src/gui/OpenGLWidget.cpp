@@ -6,6 +6,17 @@
 namespace kfusion {
 namespace gui {
 
+namespace {
+
+// Radians live inside Camera, degrees live in the UI. Both conversions are
+// float so no rotation-feedback path narrows through double or truncates
+// through int on its way between the viewport and the panel.
+constexpr float kRadToDeg = 180.0f / 3.14159265358979323846f;
+constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+constexpr double kNanoPerSecond = 1.0 / 1000000000.0;
+
+} // namespace
+
 OpenGLWidget::OpenGLWidget(QWidget* parent)
     : QOpenGLWidget(parent)
 {
@@ -21,7 +32,7 @@ OpenGLWidget::OpenGLWidget(QWidget* parent)
     
     physics_timer_ = new QTimer(this);
     connect(physics_timer_, &QTimer::timeout, this, &OpenGLWidget::updatePhysics);
-    physics_timer_->start(16); // ~60 fps
+    physics_timer_->start(static_cast<int>(kPhysicsTickSeconds * 1000.0f)); // ~60 fps
     frame_timer_.start();
 }
 
@@ -83,12 +94,12 @@ void OpenGLWidget::setVolumeBoxOutside(bool outside) {
     }
 }
 
-void OpenGLWidget::setCameraRotation(int pitch, int yaw, int roll) {
+void OpenGLWidget::setCameraRotation(float pitch, float yaw, float roll) {
     if (!renderer_) return;
     auto& cam = renderer_->camera();
-    cam.setElevation(-pitch * M_PI / 180.0f); // Map Pitch to elevation
-    cam.setAzimuth(-yaw * M_PI / 180.0f);     // Map Yaw to azimuth
-    cam.setRoll(roll * M_PI / 180.0f);        // Map Roll
+    cam.setElevation(-pitch * kDegToRad); // Map Pitch to elevation
+    cam.setAzimuth(-yaw * kDegToRad);     // Map Yaw to azimuth
+    cam.setRoll(roll * kDegToRad);        // Map Roll
     update();
 }
 
@@ -107,6 +118,15 @@ void OpenGLWidget::resizeGL(int w, int h) {
 
 void OpenGLWidget::paintGL() {
     if (renderer_) renderer_->render();
+}
+
+void OpenGLWidget::syncRotationFeedback() {
+    if (!renderer_) return;
+    const auto& cam = renderer_->camera();
+    // Radians inside Camera -> float degrees out; one place, no truncation.
+    emit cameraRotated(-cam.elevation() * kRadToDeg,
+                       -cam.azimuth()   * kRadToDeg,
+                        cam.roll()      * kRadToDeg);
 }
 
 void OpenGLWidget::mousePressEvent(QMouseEvent* e) {
@@ -147,13 +167,8 @@ void OpenGLWidget::mouseMoveEvent(QMouseEvent* e) {
     }
     
     // Emit rotation back to sliders
-    auto& cam = renderer_->camera();
-    emit cameraRotated(
-        -cam.elevation() * 180.0f / M_PI,
-        -cam.azimuth() * 180.0f / M_PI,
-        cam.roll() * 180.0f / M_PI
-    );
-    
+    syncRotationFeedback();
+
     update();
 }
 
@@ -211,7 +226,15 @@ void OpenGLWidget::focusOutEvent(QFocusEvent* e) {
 }
 
 void OpenGLWidget::updatePhysics() {
-    float dt = static_cast<float>(frame_timer_.restart()) / 1000.0f;
+    // QElapsedTimer counts nanoseconds, so the tick has to be scaled by
+    // 1e-9 to be seconds; the pre-fix /1000 fed microseconds to the
+    // integrator and made free-flight move ~1000x too far.
+    const double elapsed_seconds =
+        static_cast<double>(frame_timer_.restart()) * kNanoPerSecond;
+    const float dt = rendering::clampFrameDeltaSeconds(elapsed_seconds,
+                                                      first_physics_tick_,
+                                                      kPhysicsTickSeconds);
+    first_physics_tick_ = false;
     if (!renderer_) return;
 
     float speed = 2.0f; // meters per second
@@ -232,12 +255,7 @@ void OpenGLWidget::updatePhysics() {
         update();
 
         // Sync sliders
-        auto& cam = renderer_->camera();
-        emit cameraRotated(
-            -cam.elevation() * 180.0f / M_PI,
-            -cam.azimuth() * 180.0f / M_PI,
-            cam.roll() * 180.0f / M_PI
-        );
+        syncRotationFeedback();
     }
 }
 

@@ -37,14 +37,14 @@ signals:
     void volumeCageToggled(bool visible);
     void threadsChanged(int n);
     void hyperparamsApplyClicked();
-    void cameraRotationChanged(int pitch, int yaw, int roll);
+    void cameraRotationChanged(float pitch, float yaw, float roll);
 
 public slots:
     void onPipelineStarted();
     void onPipelineStopped();
     void setExportEnabled(bool enabled);
     void setBusy(bool busy);
-    void setCameraRotation(int pitch, int yaw, int roll);
+    void setCameraRotation(float pitch, float yaw, float roll);
     void onPresetChanged(int index);
 
 private:

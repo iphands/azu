@@ -30,10 +30,11 @@ public:
     void setVolumeBoxOutside(bool outside);
 
 signals:
-    void cameraRotated(int pitch, int yaw, int roll);
+    // Float degrees end-to-end: an int signature truncated sub-degree drags to 0.
+    void cameraRotated(float pitch, float yaw, float roll);
 
 public slots:
-    void setCameraRotation(int pitch, int yaw, int roll);
+    void setCameraRotation(float pitch, float yaw, float roll);
 
 protected:
     void initializeGL() override;
@@ -51,6 +52,13 @@ private slots:
     void updatePhysics();
 
 private:
+    void syncRotationFeedback();
+
+    // The physics timer starts with this exact interval and
+    // clampFrameDeltaSeconds() replaces the first frame with it, so the nominal
+    // tick and the real tick rate can never drift apart.
+    static constexpr float kPhysicsTickSeconds = 0.016f;
+
     std::unique_ptr<rendering::PreviewRenderer> renderer_;
 
     // Volume-cage state cache: MainWindow pushes the box before initializeGL
@@ -65,6 +73,7 @@ private:
     
     QTimer* physics_timer_;
     QElapsedTimer frame_timer_;
+    bool first_physics_tick_ = true;
     std::set<int> pressed_keys_;
     
     // Axis constraints for panning
