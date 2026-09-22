@@ -63,8 +63,18 @@ CPU_LABEL="cpu"
 # published mean divides by its contributing sample count, that a zero-contribution
 # frame publishes 0.0 rather than NaN, that the counters partition the raster, and
 # that each channel creates no file at all when its env gate is absent, each scenario
-# in its own fork+execve child inside a private mkdtemp tree); every name is
-# enforced as registered (the list only ever grows, so the guard never weakens).
+# in its own fork+execve child inside a private mkdtemp tree); and INTENTIONALLY
+# appended gl_diagnostics_contract as the 37th CPU test (the real Qt-free
+# src/gui/GlDiagnostics.cpp: canonical EGL codes 0x3000..0x300E decoded to their exact
+# names including the reported 0x3009 BAD_MATCH, unknown codes falling back to
+# EGL_UNKNOWN(0x..), the BAD_MATCH hint naming both real causes plus the
+# __EGL_VENDOR_LIBRARY_FILENAMES dual-vendor lever, the desktop-only format ladder that
+# opens at 3.3 Core + MSAA, trades MSAA away as its only downgrade and is then exhausted
+# with no sub-3.3 / no ES rung, meetsRendererFloor accepting only DesktopGL+Core+>=3.3,
+# and compareGlFormat treating an MSAA downgrade as adequate-but-not-matching while an
+# ES/sub-3.3 context is inadequate — all decodable with no display, GPU or GL context);
+# every name is enforced as registered (the list only ever grows, so the guard never
+# weakens).
 REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_contract"
     "marching_cubes_table_contract" "marching_cubes_sphere_contract" "tsdf_reset_contract"
     "mesh_validation_contract" "coordinate_rounding_contract" "icp_weighting_contract"
@@ -95,7 +105,10 @@ REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_co
     "logger_timer_contract"
     # todo 33: real TSDF/SignalConditioner/FrameData stats means over their
     # contributing sample counts, read back from the CSV channel itself.
-    "stats_denominator_contract")
+    "stats_denominator_contract"
+    # GUI GL launch: real Qt-free EGL-code decode + desktop-only format ladder +
+    # renderer-floor / requested-vs-actual comparison, decodable with no display.
+    "gl_diagnostics_contract")
 # Real controller coupling, proven post-build: a source-only replica that
 # re-declares its own look-alike seam methods has none of these symbols. Both
 # real-controller seam binaries must carry them...

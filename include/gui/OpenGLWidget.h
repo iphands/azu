@@ -61,6 +61,11 @@ private:
 
     std::unique_ptr<rendering::PreviewRenderer> renderer_;
 
+    // True once initializeGL confirmed the live context clears the renderer's
+    // desktop-3.3-Core floor. Gates the one-time "GL inadequate" paint warning so
+    // a mis-capable host logs the reason instead of silently showing a black box.
+    bool gl_adequate_ = false;
+
     // Volume-cage state cache: MainWindow pushes the box before initializeGL
     // creates renderer_; flush to renderer_ at creation time.
     Eigen::Vector3f cage_origin_{0.0f, 0.0f, 0.0f};

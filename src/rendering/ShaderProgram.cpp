@@ -1,6 +1,8 @@
 #include "rendering/ShaderProgram.h"
 #include <iostream>
+#include <string>
 #include <vector>
+#include "utils/Logger.h"
 
 namespace kfusion {
 namespace rendering {
@@ -26,9 +28,16 @@ unsigned int ShaderProgram::compileShader(unsigned int type, const char* src) {
     if (!success) {
         int log_len = 0;
         glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &log_len);
-        std::vector<char> log(log_len);
-        glGetShaderInfoLog(shader, log_len, nullptr, log.data());
-        std::cerr << "[Shader] Compile error: " << log.data() << "\n";
+        std::vector<char> log(log_len > 0 ? log_len : 0);
+        std::string log_text;
+        if (log_len > 0) {
+            glGetShaderInfoLog(shader, log_len, nullptr, log.data());
+            log_text = log.data();
+        }
+        // Route through the project logger so a headless/offscreen run captures
+        // the compile failure (previously a bare std::cerr a redirected run lost).
+        KFLOG_ERROR("shader", "compile failed: " + log_text);
+        std::cerr << "[Shader] Compile error: " << log_text << "\n";
         glDeleteShader(shader);
         return 0;
     }
@@ -62,9 +71,14 @@ bool ShaderProgram::load(const char* vert_src, const char* frag_src) {
     if (!success) {
         int log_len = 0;
         glGetProgramiv(program, GL_INFO_LOG_LENGTH, &log_len);
-        std::vector<char> log(log_len);
-        glGetProgramInfoLog(program, log_len, nullptr, log.data());
-        std::cerr << "[Shader] Link error: " << log.data() << "\n";
+        std::vector<char> log(log_len > 0 ? log_len : 0);
+        std::string log_text;
+        if (log_len > 0) {
+            glGetProgramInfoLog(program, log_len, nullptr, log.data());
+            log_text = log.data();
+        }
+        KFLOG_ERROR("shader", "link failed: " + log_text);
+        std::cerr << "[Shader] Link error: " << log_text << "\n";
         glDeleteProgram(program);
         return false;
     }

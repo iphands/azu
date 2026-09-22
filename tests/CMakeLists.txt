@@ -43,6 +43,13 @@ add_library(azu_test_core STATIC ${AZU_TEST_CORE_SOURCES}
     # src/gui/*.cpp glob. The UI contract below must exercise THIS real model TU --
     # the same code the widgets compile through the src/gui glob -- not a replica.
     "${CMAKE_SOURCE_DIR}/src/gui/FusionUiModel.cpp"
+    # GUI GL-launch diagnostics: the EGL-code decode, desktop-only format ladder
+    # and requested-vs-actual comparison are stdlib-only (no Qt/OpenGL/EGL/display),
+    # unlike OpenGLWidget/PreviewRenderer, so it is an explicit source rather than a
+    # src/gui/*.cpp glob. gl_diagnostics_contract below must exercise THIS real TU,
+    # which is exactly why the module keeps every QSurfaceFormat touch in the
+    # separate Qt-only header gui/GlFormatQt.h instead of here.
+    "${CMAKE_SOURCE_DIR}/src/gui/GlDiagnostics.cpp"
 )
 target_compile_definitions(azu_test_core PUBLIC ${AZU_TEST_DEFS})
 target_include_directories(azu_test_core PUBLIC
@@ -604,6 +611,28 @@ target_link_libraries(fusion_ui_validation_contract PRIVATE azu_test_core)
 
 add_test(NAME fusion_ui_validation_contract COMMAND fusion_ui_validation_contract)
 set_tests_properties(fusion_ui_validation_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
+# ---- GUI GL-launch diagnostics: CPU Qt-free EGL/ladder/floor contract ----
+# gl_diagnostics_contract drives the REAL src/gui/GlDiagnostics.cpp (linked through
+# azu_test_core, gate 16 below) through its public namespace only. It locks that the
+# canonical EGL codes 0x3000..0x300E decode to their exact names (incl. the reported
+# 0x3009 BAD_MATCH and the 0x3003/0x3005/0x3008/0x300D/0x300E family) while unknown
+# codes fall back to EGL_UNKNOWN(0x..); that BAD_MATCH's hint names BOTH real-world
+# causes and the __EGL_VENDOR_LIBRARY_FILENAMES dual-vendor lever while SUCCESS and
+# unknown codes carry no hint; that decodeEglErrorFromText pulls the bare "3009" out
+# of Qt's free-form text and ignores code-free messages; that the format ladder is
+# desktop-only, opens at 3.3 Core + MSAA, trades MSAA away as its one downgrade and
+# is then EXHAUSTED (no sub-3.3 / no ES rung); that meetsRendererFloor accepts only
+# DesktopGL+Core+>=3.3; and that compareGlFormat treats an MSAA downgrade as
+# adequate-but-not-matching while an ES/sub-3.3 context is inadequate. No Qt
+# Widgets, OpenGL context, EGL, display, device, GPU, sensor or filesystem.
+# Expectations are independent rule statements, never product snapshots.
+add_executable(gl_diagnostics_contract gl_diagnostics_contract.cpp)
+target_compile_definitions(gl_diagnostics_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(gl_diagnostics_contract PRIVATE azu_test_core)
+
+add_test(NAME gl_diagnostics_contract COMMAND gl_diagnostics_contract)
+set_tests_properties(gl_diagnostics_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
 # ---- big-fix todo 30: CPU PLY writer schema / byte / failure contract ----
 # ply_writer_contract drives the REAL src/export/PLYExporter.cpp (carried by
@@ -1376,4 +1405,61 @@ foreach(_azu_needed_stat src/tsdf/TSDFVolume src/sensor/SignalConditioner_omp sr
     endif()
 endforeach()
 
-message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract + pipeline_state_contract + pipeline_mesh_cadence_contract + pipeline_export_mesh_contract + camera_basis_contract + fusion_ui_validation_contract + ply_writer_contract + glb_writer_contract + logger_timer_contract + stats_denominator_contract registered (label=cpu)")
+# 16) GUI GL-launch diagnostics: gl_diagnostics_contract must drive the REAL Qt-free
+#     GlDiagnostics translation unit, not a header-only or in-test replica. Same
+#     discipline as gate 1/4/5/6/7/8/9/10/11: comments are stripped, so only a
+#     genuine namespace-qualified CALL SHAPE (receiver '.'/'>'/'::' + name + '(')
+#     satisfies the call checks; the real src/gui/GlDiagnostics.cpp must be an
+#     ELEMENT of azu_test_core's own source list; and the target must link
+#     azu_test_core. A test that re-declared its own eglErrorName / meetsRendererFloor
+#     replica could not pass the source-coupling half (it would collide with the real
+#     definitions the linked library carries) and could not satisfy the call shapes
+#     without the kfusion::gui '::' qualification the real header demands. The nine
+#     demanded calls are the whole public surface, so a partial replica is rejected.
+get_target_property(AZU_GLDIAG_TEST_SOURCES gl_diagnostics_contract SOURCES)
+if(NOT AZU_GLDIAG_TEST_SOURCES)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: gl_diagnostics_contract has no SOURCES.")
+endif()
+set(AZU_GLDIAG_TEST_TEXT "")
+foreach(_azu_gsrc ${AZU_GLDIAG_TEST_SOURCES})
+    get_filename_component(_azu_gabs "${_azu_gsrc}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(NOT EXISTS "${_azu_gabs}")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: registered gl_diagnostics_contract source ${_azu_gabs} does not exist.")
+    endif()
+    file(READ "${_azu_gabs}" _azu_gtxt)
+    azu_strip_c_comments(_azu_gtxt_code _azu_gtxt)
+    string(APPEND AZU_GLDIAG_TEST_TEXT "${_azu_gtxt_code}")
+endforeach()
+foreach(_azu_gcall eglErrorName eglErrorHint decodeEglError decodeEglErrorFromText
+                   glFormatLadder nextFormatRung meetsRendererFloor describeGlFormat compareGlFormat)
+    if(NOT AZU_GLDIAG_TEST_TEXT MATCHES "[.>:]${_azu_gcall}[ \t\r\n]*\\(")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: the gl_diagnostics_contract source must call ${_azu_gcall}() "
+            "on the real kfusion::gui module (a comment or string literal naming it is not a call). "
+            "A local EGL/ladder/floor replica does not satisfy this todo.")
+    endif()
+endforeach()
+get_target_property(AZU_GLDIAG_TEST_LINKS gl_diagnostics_contract LINK_LIBRARIES)
+if(NOT "${AZU_GLDIAG_TEST_LINKS}" MATCHES "azu_test_core")
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: gl_diagnostics_contract must link azu_test_core, "
+        "got: ${AZU_GLDIAG_TEST_LINKS}")
+endif()
+# Positive coupling: azu_test_core has to CARRY the real GL diagnostics TU.
+set(AZU_TEST_CORE_HAS_GLDIAG_TU FALSE)
+foreach(_azu_core_src ${AZU_TEST_CORE_LIB_SOURCES})
+    file(TO_CMAKE_PATH "${_azu_core_src}" _azu_core_norm)
+    if(_azu_core_norm MATCHES "(^|/)src/gui/GlDiagnostics\\.cpp$")
+        set(AZU_TEST_CORE_HAS_GLDIAG_TU TRUE)
+    endif()
+endforeach()
+if(NOT AZU_TEST_CORE_HAS_GLDIAG_TU)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: azu_test_core must compile the real src/gui/GlDiagnostics.cpp "
+        "as one source-list element; gl_diagnostics_contract would otherwise test a "
+        "replica instead of the product GL diagnostics.")
+endif()
+
+message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract + pipeline_state_contract + pipeline_mesh_cadence_contract + pipeline_export_mesh_contract + camera_basis_contract + fusion_ui_validation_contract + ply_writer_contract + glb_writer_contract + logger_timer_contract + stats_denominator_contract + gl_diagnostics_contract registered (label=cpu)")

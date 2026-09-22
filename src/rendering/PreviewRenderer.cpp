@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include "utils/Logger.h"
 
 namespace kfusion {
 namespace rendering {
@@ -159,12 +160,18 @@ void PreviewRenderer::initialize() {
     glEnable(GL_PROGRAM_POINT_SIZE);
     glClearColor(0.08f, 0.09f, 0.11f, 1.0f);
 
-    if (!pc_shader_.load(POINTCLOUD_VERT, POINTCLOUD_FRAG))
+    if (!pc_shader_.load(POINTCLOUD_VERT, POINTCLOUD_FRAG)) {
+        KFLOG_ERROR("renderer", "point-cloud shader failed to load; point cloud disabled");
         std::cerr << "[Renderer] point-cloud shader failed to load; point cloud disabled\n";
-    if (!mesh_shader_.load(MESH_VERT, MESH_FRAG))
+    }
+    if (!mesh_shader_.load(MESH_VERT, MESH_FRAG)) {
+        KFLOG_ERROR("renderer", "mesh shader failed to load; mesh mode disabled");
         std::cerr << "[Renderer] mesh shader failed to load; mesh mode disabled\n";
-    if (!cage_shader_.load(CAGE_VERT, CAGE_FRAG))
+    }
+    if (!cage_shader_.load(CAGE_VERT, CAGE_FRAG)) {
+        KFLOG_ERROR("renderer", "cage shader failed to load; volume cage disabled");
         std::cerr << "[Renderer] cage shader failed to load; volume cage disabled\n";
+    }
 
     initPointCloudBuffers();
     initMeshBuffers();

@@ -1,7 +1,12 @@
 #include "gui/OpenGLWidget.h"
 #include <QMouseEvent>
 #include <QWheelEvent>
+#include <QOpenGLContext>
 #include <QSurfaceFormat>
+#include <cstdio>
+#include <string>
+#include "gui/GlFormatQt.h"
+#include "utils/Logger.h"
 
 namespace kfusion {
 namespace gui {
@@ -20,12 +25,11 @@ constexpr double kNanoPerSecond = 1.0 / 1000000000.0;
 OpenGLWidget::OpenGLWidget(QWidget* parent)
     : QOpenGLWidget(parent)
 {
-    QSurfaceFormat fmt;
-    fmt.setVersion(3, 3);
-    fmt.setProfile(QSurfaceFormat::CoreProfile);
-    fmt.setDepthBufferSize(24);
-    fmt.setSamples(4);
-    setFormat(fmt);
+    // The surface format is inherited from QSurfaceFormat::defaultFormat(), which
+    // main() negotiated against the ladder (3.3 Core, MSAA dropped only if the
+    // host could not satisfy it). Forcing samples(4) here re-introduced the
+    // EGL_BAD_MATCH this fix removes, so the widget deliberately does NOT set its
+    // own format; initializeGL validates whatever context actually resulted.
 
     setMinimumSize(640, 480);
     setFocusPolicy(Qt::StrongFocus); // Required to receive keyboard events
@@ -105,6 +109,65 @@ void OpenGLWidget::setCameraRotation(float pitch, float yaw, float roll) {
 
 void OpenGLWidget::initializeGL() {
     initializeOpenGLFunctions();
+
+    // Validate the context Qt actually created against the renderer's hard floor
+    // and log requested vs real, so a launch problem is legible from the log
+    // alone. A context that dropped MSAA is a success (the ladder trades samples
+    // away first); one below 3.3 Core, or an ES context, is named as a failure
+    // because the shaders are '#version 330 core'.
+    const auto requested_spec = kfusion::gui::toGlFormat(format());
+    auto actual_spec = requested_spec;
+    QOpenGLContext* ctx = context();
+    if (ctx) {
+        actual_spec = kfusion::gui::toGlFormat(ctx->format());
+        const unsigned char* version = glGetString(GL_VERSION);
+        int major = 0, minor = 0;
+        if (version &&
+            std::sscanf(reinterpret_cast<const char*>(version), "%d.%d", &major, &minor) == 2) {
+            actual_spec.major = major;
+            actual_spec.minor = minor;
+        }
+    } else {
+        actual_spec.renderable = kfusion::gui::GlRenderableType::Unknown;
+        actual_spec.profile = kfusion::gui::GlProfile::Unknown;
+    }
+
+    const auto gl_str = [this](GLenum name) -> std::string {
+        const unsigned char* raw = glGetString(name);
+        return raw ? std::string(reinterpret_cast<const char*>(raw)) : std::string("(null)");
+    };
+
+    const auto cmp = kfusion::gui::compareGlFormat(requested_spec, actual_spec);
+    gl_adequate_ = cmp.adequate;
+
+    KFLOG_INFO("gl", "OpenGLWidget requested " + kfusion::gui::describeGlFormat(requested_spec) +
+                         " | actual " + kfusion::gui::describeGlFormat(actual_spec));
+    KFLOG_INFO("gl", std::string("GL_VENDOR=") + gl_str(GL_VENDOR) + " | GL_RENDERER=" +
+                         gl_str(GL_RENDERER) + " | GL_VERSION=" + gl_str(GL_VERSION) +
+                         " | GL_SHADING_LANGUAGE_VERSION=" + gl_str(GL_SHADING_LANGUAGE_VERSION));
+
+    if (!cmp.adequate) {
+        std::string why;
+        for (const std::string& reason : cmp.reasons) {
+            why += reason;
+            why += "; ";
+        }
+        KFLOG_ERROR("gl", "context does NOT clear the desktop 3.3 Core floor (" + why +
+                              "): the preview shaders need '#version 330 core', so rendering "
+                              "will fail on this context");
+    } else if (!cmp.matches_request) {
+        // Adequate but not what was asked for (typically MSAA down a rung): say
+        // which rung was settled on, truthfully, without calling it an error.
+        std::string note;
+        for (const std::string& reason : cmp.reasons) {
+            note += reason;
+            note += "; ";
+        }
+        KFLOG_WARN("gl", "context adequate but downgraded from request: " + note);
+    } else {
+        KFLOG_INFO("gl", "context adequate and matches the requested format");
+    }
+
     renderer_ = std::make_unique<rendering::PreviewRenderer>();
     renderer_->initialize();
     renderer_->setVolumeBox(cage_origin_, cage_size_);
