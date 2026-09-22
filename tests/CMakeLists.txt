@@ -100,8 +100,30 @@ set_tests_properties(pipeline_test_seam_smoke PROPERTIES
     # process even if a worker thread misbehaves.
 )
 
-# ---- Mechanical anti-synthetic gate (configure-time, not a grep comment) ----
-# 1) The registered pipeline_test_seam_smoke source must actually call the
+# ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
+# big-fix todo 3 hardening of the todo 2 gate:
+#   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that
+#       named the seam identifiers only inside a comment while still linking
+#       azu_test_pipeline. Comments are now stripped and the gate demands a
+#       CALL SHAPE (receiver '.'/'>'/':' + name + '('), so prose no longer
+#       configures. scripts/test-cpu-big-fix.sh adds the matching post-build
+#       nm -C coupling guard; a source-only replica with its own look-alike
+#       methods dies there instead.
+#   F2 fix: the controller TU check used to anchor the joined SOURCES string,
+#       i.e. it false-failed as soon as a second TU was appended. The real TU
+#       is now required as one path element anywhere in the list.
+
+# Strip /* ... */ then // comments from a source-text variable. Stripping only
+# ever removes text, so an over-eager match can fail the gate closed but can
+# never manufacture a call shape.
+function(azu_strip_c_comments out_var in_var)
+    set(_azu_t "${${in_var}}")
+    string(REGEX REPLACE "/\\*([^*]|\\*+[^*/])*\\*+/" "" _azu_t "${_azu_t}")
+    string(REGEX REPLACE "//[^\n]*" "" _azu_t "${_azu_t}")
+    set(${out_var} "${_azu_t}" PARENT_SCOPE)
+endfunction()
+
+# 1) The registered pipeline_test_seam_smoke source must actually CALL the
 #    seam API (a synthetic queue/worker replica fails here).
 get_target_property(AZU_SEAM_TEST_SOURCES pipeline_test_seam_smoke SOURCES)
 if(NOT AZU_SEAM_TEST_SOURCES)
@@ -116,22 +138,36 @@ foreach(_azu_seam_src ${AZU_SEAM_TEST_SOURCES})
             "ANTI-SYNTHETIC GATE: registered pipeline test source ${_azu_seam_abs} does not exist.")
     endif()
     file(READ "${_azu_seam_abs}" _azu_seam_txt)
-    string(APPEND AZU_SEAM_TEST_TEXT "${_azu_seam_txt}")
+    azu_strip_c_comments(_azu_seam_txt_code _azu_seam_txt)
+    string(APPEND AZU_SEAM_TEST_TEXT "${_azu_seam_txt_code}")
 endforeach()
 foreach(_azu_required_call startWithoutSensorForTests injectRawFrameForTests)
-    if(NOT AZU_SEAM_TEST_TEXT MATCHES "${_azu_required_call}")
+    if(NOT AZU_SEAM_TEST_TEXT MATCHES "[.>:]${_azu_required_call}[ \t\r\n]*\\(")
         message(FATAL_ERROR
             "ANTI-SYNTHETIC GATE: the pipeline_test_seam_smoke source must call ${_azu_required_call}() "
-            "on the real PipelineController. A replacement queue/worker replica does not satisfy this todo.")
+            "on the real PipelineController (a comment or string literal naming it is not a call). "
+            "A replacement queue/worker replica does not satisfy this todo.")
     endif()
 endforeach()
 
 # 2) azu_test_pipeline must compile the REAL controller translation unit.
+#    Required as a source-list ELEMENT (any position), not as the string tail.
 get_target_property(AZU_PIPELINE_LIB_SOURCES azu_test_pipeline SOURCES)
-if(NOT "${AZU_PIPELINE_LIB_SOURCES}" MATCHES "src/app/PipelineController\\.cpp$")
+if(NOT AZU_PIPELINE_LIB_SOURCES)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: azu_test_pipeline has no SOURCES.")
+endif()
+set(AZU_PIPELINE_LIB_HAS_REAL_TU FALSE)
+foreach(_azu_pipeline_src ${AZU_PIPELINE_LIB_SOURCES})
+    file(TO_CMAKE_PATH "${_azu_pipeline_src}" _azu_pipeline_norm)
+    if(_azu_pipeline_norm MATCHES "(^|/)src/app/PipelineController\\.cpp$")
+        set(AZU_PIPELINE_LIB_HAS_REAL_TU TRUE)
+    endif()
+endforeach()
+if(NOT AZU_PIPELINE_LIB_HAS_REAL_TU)
     message(FATAL_ERROR
         "ANTI-SYNTHETIC GATE: azu_test_pipeline SOURCES must include src/app/PipelineController.cpp "
-        "(the real controller object), got: ${AZU_PIPELINE_LIB_SOURCES}")
+        "as one source element (any position), got: ${AZU_PIPELINE_LIB_SOURCES}")
 endif()
 if(NOT EXISTS "${CMAKE_SOURCE_DIR}/src/app/PipelineController.cpp")
     message(FATAL_ERROR
