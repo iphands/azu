@@ -824,6 +824,74 @@ thread-count execution paths keep their own shape and stay deferred as
 Locked by `tests/pipeline_hyperparams_contract.cpp` (seam-driven, CPU label, no
 device).
 
+## Pipeline lifecycle state, queue backpressure and mesh requests
+
+Canonical rule: a start begins with no motion model and no published mesh, every
+queue is bounded with a named eviction policy that is counted, and a mesh result
+can only be published if it was extracted against the current session's volume.
+
+Current behavior in `src/app/PipelineController.cpp`, **fixed by big-fix Todo 25**
+(CPU only — the CUDA / HIP worker loops keep their own shape and stay deferred as
+`cross-backend:A28`):
+
+- **A start clears the motion model.** `startInternal()` (`:65`) writes
+  `last_pose_ = Identity` under `pose_mutex_` and un-arms the mesh request block
+  (`mesh_requests_.shutdown = false`, `:238`), so the first tracked frame is
+  scored against identity and the world origin, never against the pose the
+  previous session ended on. `reset()` (`:508`) does the same (`:549`) plus
+  `frame_count_ = 0` and a fresh `metrics_`, both **inside** `metrics_mutex_`
+  (`:562`) — pre-Todo-25 those two writes were unsynchronized against the
+  metrics reader. Neither `start()` nor `reset()` requires the other first.
+- **Both queues retain the newest work.** `raw_queue_` capacity
+  `kRawQueueCapacity = 3` (`include/app/PipelineController.h:199`),
+  `integration_queue_` capacity `kIntegrationQueueCapacity = 3` (`:200`). When a
+  push finds the queue full the **oldest** entry is displaced, so a slow consumer
+  sheds stale input instead of growing memory without bound and instead of
+  forcing the producer to block on a live capture callback. The displaced frame is
+  destructed **outside** the queue lock (`src/app/PipelineController.cpp:670`),
+  because a pooled `FrameData` deleter re-enters the sensor free-list.
+- **Eviction is counted, not silent.** `dropped_frames`
+  (`onRawFrame`, `:697`), `dropped_integration_frames`
+  (`enqueueForIntegration`, `:733`) and `dropped_pre_model_frames` (frames
+  discarded while waiting for the first model, `trackingLoop`, `:831`) live inside
+  `metrics_` and are written only under `metrics_mutex_`, which is a leaf: no
+  queue lock is ever taken while it is held. They reach the UI through
+  `metricsSnapshot()` and are zeroed by `reset()` with the rest of `metrics_`.
+  Tracking and integration never block on a full queue, so the counters are the
+  only visible sign of overload — which is why they are canonical surface.
+- **Frames move by ownership, not by copy.** `enqueueForIntegration()` (`:710`)
+  takes the `shared_ptr<FrameData>` by value and the tracking loop passes it with
+  `std::move` (`:810`, `:1040`). Pre-Todo-25 the tracking loop copied the
+  `shared_ptr` into the queue and kept a live local, so the pooled buffer could
+  return to `acquireFreeData()` while still queued.
+- **Mesh requests are versioned, and nobody waits for a result.** `requestMesh()`
+  (`:1467`) increments `requested` under `mesh_requests_.mtx` and returns the
+  version; `meshingLoop()` (`:1332`) waits on the condition variable, claims the
+  newest requested version, extracts, and publishes with `(version, generation)`
+  tags. The invariant is `served <= claimed <= requested`. A requester that needs
+  the answer — PLY/GLB export (`:1517`, `:1545`) — calls
+  `awaitMeshVersion(version, 5s)` (`:1501`), a **bounded** wait released by
+  `stop()`; the integration loop's cadence never waits at all.
+- **Cadence is a clock, not a frame count.** `requestMeshIfCadenceDue()` (`:1491`)
+  is called once per integrated frame (`:1328`) and requests at most once per
+  `mesh_cadence_us_` (default 500000 µs, `include/app/PipelineController.h:303`),
+  with the clock primed to the epoch at start so every session issues exactly one
+  bootstrap request. The pre-Todo-25 `MESH_TRIGGER_FRAMES` counter made mesh rate a
+  function of frame count, so it drifted with tracking quality.
+- **A superseded result cannot be published.** `invalidateMeshState()` (`:1477`)
+  bumps `generation` and drains `requested`/`claimed`; a worker that was already
+  extracting captured its generation at claim time and drops the result instead of
+  publishing it (`stale_drops`). `served` and `served_generation` are deliberately
+  left alone, because they describe the mesh that *is* published: inventing a
+  served version would wake a waiter for a mesh that was never produced, so a
+  waiter on a drained version times out instead — the same visible outcome the
+  pre-Todo-25 export path had when its flag was cleared. `stop()` sets
+  `mesh_requests_.shutdown` (`:423`), which releases every waiter and every parked
+  worker.
+
+Locked by `tests/pipeline_state_contract.cpp` and
+`tests/pipeline_mesh_cadence_contract.cpp` (seam-driven, CPU label, no device).
+
 ## Pipeline publication
 
 Canonical rule: a published model frame implies a raycast-written buffer.

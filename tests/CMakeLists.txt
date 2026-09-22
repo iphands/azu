@@ -137,6 +137,41 @@ set_tests_properties(pipeline_hyperparams_contract PROPERTIES
     # against a worker that stops draining its queue entirely.
 )
 
+# ---- big-fix todo 25: CPU-only reset/start-state + queue backpressure contract ----
+# Drives the real controller through start/stop/reset cycles with the tracking and
+# integration workers parked at seam gates (a parked worker holds no lock, so the
+# queues fill behind it and the retain-latest eviction policy becomes exactly
+# determined). Asserts a cleared motion model after start(), counted raw and
+# integration evictions, and metrics_mutex_ free at shutdown. Every wait is
+# decided by a production-advanced counter; TIMEOUT is the hang detector.
+add_executable(pipeline_state_contract pipeline_state_contract.cpp)
+target_compile_definitions(pipeline_state_contract PRIVATE ${AZU_PIPELINE_TEST_DEFS})
+target_link_libraries(pipeline_state_contract PRIVATE azu_test_pipeline)
+
+add_test(NAME pipeline_state_contract COMMAND pipeline_state_contract)
+set_tests_properties(pipeline_state_contract PROPERTIES
+    LABELS cpu TIMEOUT 120
+    # ~6 bounded pump phases; the cap protects against a parked worker that is
+    # never released or a queue that stops draining.
+)
+
+# ---- big-fix todo 25: CPU-only mesh request / cadence contract ----
+# Pins the mesh cadence through the seam so exactly one automatic (bootstrap)
+# request exists per start, then issues explicit versioned requests, including
+# one issued while an extraction is parked mid-worker and one pending across
+# reset(). Asserts per-version extraction/publish tagging, the stale-generation
+# drop, the reset drain, and that tracking advances while a mesh runs.
+add_executable(pipeline_mesh_cadence_contract pipeline_mesh_cadence_contract.cpp)
+target_compile_definitions(pipeline_mesh_cadence_contract PRIVATE ${AZU_PIPELINE_TEST_DEFS})
+target_link_libraries(pipeline_mesh_cadence_contract PRIVATE azu_test_pipeline)
+
+add_test(NAME pipeline_mesh_cadence_contract COMMAND pipeline_mesh_cadence_contract)
+set_tests_properties(pipeline_mesh_cadence_contract PROPERTIES
+    LABELS cpu TIMEOUT 120
+    # Six real CPU marching-cubes extractions plus bounded pumps; the cap is the
+    # hang detector for a mesh worker that never wakes.
+)
+
 # ---- big-fix todo 6: Marching Cubes fail-before-fix contracts ----
 # marching_cubes_table_contract is CPU-only (header + integer math, no volume)
 # and validates all 256 rows against an independent crossing-edge oracle: it
@@ -722,4 +757,89 @@ if(NOT "${AZU_HYPER_TEST_LINKS}" MATCHES "azu_test_pipeline")
         "got: ${AZU_HYPER_TEST_LINKS}")
 endif()
 
-message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract registered (label=cpu)")
+# 7) big-fix todo 25: pipeline_state_contract must drive the REAL controller
+#    reset/start path and BOTH product queues. Same discipline as gate 1/4/5/6:
+#    comments are stripped, so only a genuine call shape (receiver '.'/'>'/'::' +
+#    name + '(') satisfies the gate. The required calls are exactly the surfaces
+#    this todo owns: the motion model (currentPose / lastPoseForTests /
+#    lastMotionModelForTests), both bounded queues' eviction counters as observed
+#    through metricsSnapshot, the seam gates that make eviction determined, and
+#    the shutdown lock probe.
+get_target_property(AZU_STATE_TEST_SOURCES pipeline_state_contract SOURCES)
+if(NOT AZU_STATE_TEST_SOURCES)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: pipeline_state_contract has no SOURCES.")
+endif()
+set(AZU_STATE_TEST_TEXT "")
+foreach(_azu_state_src ${AZU_STATE_TEST_SOURCES})
+    get_filename_component(_azu_state_abs "${_azu_state_src}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(NOT EXISTS "${_azu_state_abs}")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: registered pipeline_state_contract source ${_azu_state_abs} does not exist.")
+    endif()
+    file(READ "${_azu_state_abs}" _azu_state_txt)
+    azu_strip_c_comments(_azu_state_txt_code _azu_state_txt)
+    string(APPEND AZU_STATE_TEST_TEXT "${_azu_state_txt_code}")
+endforeach()
+foreach(_azu_state_call startWithoutSensorForTests injectRawFrameForTests stop reset
+                        currentPose lastPoseForTests lastMotionModelForTests metricsSnapshot
+                        pauseTrackingWorkerForTests pauseIntegrationWorkerForTests
+                        resumePipelineWorkersForTests trackingWorkerParkedForTests
+                        integrationWorkerParkedForTests rawQueueDepthForTests
+                        integrationQueueDepthForTests metricsMutexIsFreeForTests
+                        lastTrackingDepthBandForTests)
+    if(NOT AZU_STATE_TEST_TEXT MATCHES "[.>:]${_azu_state_call}[ \t\r\n]*\\(")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: the pipeline_state_contract source must call ${_azu_state_call}() "
+            "on the real PipelineController (a comment or string literal naming it is not a call). "
+            "A queue/state replica does not satisfy this todo.")
+    endif()
+endforeach()
+get_target_property(AZU_STATE_TEST_LINKS pipeline_state_contract LINK_LIBRARIES)
+if(NOT "${AZU_STATE_TEST_LINKS}" MATCHES "azu_test_pipeline")
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: pipeline_state_contract must link azu_test_pipeline, "
+        "got: ${AZU_STATE_TEST_LINKS}")
+endif()
+
+# 8) big-fix todo 25: pipeline_mesh_cadence_contract must drive the REAL mesh
+#    worker. The required calls are the versioned request protocol (explicit
+#    request + reset invalidation), the cadence setter that makes the automatic
+#    request count exact, the claimed-version list the parked worker reports, and
+#    the version/generation counters that carry the oracle.
+get_target_property(AZU_MESH_TEST_SOURCES pipeline_mesh_cadence_contract SOURCES)
+if(NOT AZU_MESH_TEST_SOURCES)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: pipeline_mesh_cadence_contract has no SOURCES.")
+endif()
+set(AZU_MESH_TEST_TEXT "")
+foreach(_azu_mesh_src ${AZU_MESH_TEST_SOURCES})
+    get_filename_component(_azu_mesh_abs "${_azu_mesh_src}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(NOT EXISTS "${_azu_mesh_abs}")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: registered pipeline_mesh_cadence_contract source ${_azu_mesh_abs} does not exist.")
+    endif()
+    file(READ "${_azu_mesh_abs}" _azu_mesh_txt)
+    azu_strip_c_comments(_azu_mesh_txt_code _azu_mesh_txt)
+    string(APPEND AZU_MESH_TEST_TEXT "${_azu_mesh_txt_code}")
+endforeach()
+foreach(_azu_mesh_call startWithoutSensorForTests injectRawFrameForTests stop reset
+                       setMeshCadenceIntervalForTests requestMeshForTests
+                       invalidateMeshStateForTests meshStateForTests
+                       armMeshExtractionHoldForTests releaseMeshExtractionHoldForTests
+                       meshHookVersionsForTests lastTrackingDepthBandForTests)
+    if(NOT AZU_MESH_TEST_TEXT MATCHES "[.>:]${_azu_mesh_call}[ \t\r\n]*\\(")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: the pipeline_mesh_cadence_contract source must call ${_azu_mesh_call}() "
+            "on the real PipelineController (a comment or string literal naming it is not a call). "
+            "A cadence/counter replica does not satisfy this todo.")
+    endif()
+endforeach()
+get_target_property(AZU_MESH_TEST_LINKS pipeline_mesh_cadence_contract LINK_LIBRARIES)
+if(NOT "${AZU_MESH_TEST_LINKS}" MATCHES "azu_test_pipeline")
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: pipeline_mesh_cadence_contract must link azu_test_pipeline, "
+        "got: ${AZU_MESH_TEST_LINKS}")
+endif()
+
+message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract + pipeline_state_contract + pipeline_mesh_cadence_contract registered (label=cpu)")

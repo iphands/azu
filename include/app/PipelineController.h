@@ -6,9 +6,11 @@
 #include <mutex>
 #include <shared_mutex>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <queue>
 #include <string>
+#include <vector>
 #include <chrono>
 
 #include "sensor/KinectSensor.h"
@@ -57,6 +59,22 @@ struct PipelineMetrics {
     size_t   mesh_triangles     = 0;
     float    mesh_extract_pct   = 0.0f;
     float    export_pct         = 0.0f;
+    // Dropped-frame accounting (big-fix Todo 25). Every field counts frames the
+    // pipeline itself threw away, split by CAUSE, and every one is written only
+    // under metrics_mutex_ and cleared by reset(). A reader that sees a growing
+    // counter knows which stage was saturated without any log parsing.
+    //  * dropped_frames: raw-queue evictions. The raw queue is retain-latest
+    //    (capacity kRawQueueCapacity), so a newer arrival displaces the OLDEST
+    //    queued frame — the discarded id is always the stale one, never the
+    //    newest.
+    //  * dropped_integration_frames: the same retain-latest policy applied to the
+    //    integration queue (capacity kIntegrationQueueCapacity).
+    //  * dropped_pre_model_frames: frames discarded while the session's first
+    //    raycast model does not exist yet; tracking cannot ICP before it does,
+    //    so startup bursts lose frames by design and that loss is now visible.
+    int      dropped_frames            = 0;
+    int      dropped_integration_frames = 0;
+    int      dropped_pre_model_frames  = 0;
     PipelineState state         = PipelineState::Idle;
 };
 
@@ -170,6 +188,17 @@ private:
     };
     std::shared_ptr<DataPool> data_pool_state_;
 
+    // Frame queues are BOUNDED and RETAIN-LATEST (big-fix Todo 25): a push that
+    // finds the queue at capacity displaces the OLDEST queued frame instead of
+    // rejecting the arriving one. Rejecting the newest meant a burst during a
+    // slow stretch threw away exactly the frame the pipeline most needed (the
+    // freshest geometry) while keeping the stale ones, and it was invisible.
+    // Eviction is bounded by the capacity, the displaced frame is destructed
+    // outside the queue lock (its pooled deleter takes the pool mutex), and it
+    // is counted in metrics_.dropped_frames / dropped_integration_frames.
+    static constexpr size_t kRawQueueCapacity        = 3;
+    static constexpr size_t kIntegrationQueueCapacity = 3;
+
     // Raw frame queue (sensor callback → tracking thread)
     std::queue<std::shared_ptr<sensor::RawFrame>>  raw_queue_;
     std::mutex                                     tracking_queue_mutex_;
@@ -237,9 +266,41 @@ private:
         }
     } model_buffers_;
 
-    // Mesh extraction trigger
-    std::atomic<bool>                     mesh_extraction_requested_{false};
-    std::atomic<bool>                     is_meshing_{false};
+    // Mesh extraction trigger — versioned request protocol (big-fix Todo 25).
+    // A request used to be a bool the worker cleared between load() and store(),
+    // which silently lost every request landing in that window and could never
+    // say which volume a published mesh described. A request is now a monotonic
+    // version number, so it is an edge that cannot be swallowed:
+    //   requested - newest version anyone has asked for
+    //   claimed   - newest version the worker has begun serving (<= requested)
+    //   served    - version the last PUBLISHED mesh describes (<= claimed; 0 = none)
+    //   generation - bumped by reset(); a mesh extracted against an older
+    //                generation describes a volume that no longer exists, so it
+    //                is dropped, never published.
+    // Invariant: served <= claimed <= requested, and every published mesh is
+    // tagged (served, served_generation). A request that arrives while an
+    // extraction is in flight only leaves requested > claimed, so it is served
+    // next: coalesced at most down to the newest pending version, never lost.
+    struct MeshRequests {
+        std::mutex              mtx;
+        std::condition_variable cv;
+        uint64_t requested  = 0;
+        uint64_t claimed    = 0;
+        uint64_t served     = 0;
+        uint64_t generation = 0;
+        uint64_t served_generation = 0;
+        // Same no-lost-wakeup contract as the two frame queues: stop() flips it
+        // and notifies while holding mtx, the worker evaluates it inside the
+        // same wait predicate.
+        bool     shutdown   = false;
+    };
+    MeshRequests mesh_requests_;
+    // Cadence owner: the integration thread requests a mesh at most once per
+    // mesh_cadence_us_, on its own clock, and never waits for the result.
+    // last_mesh_request_ is written ONLY by the integration worker (start()
+    // primes it to the clock epoch so the first integrated frame requests one).
+    std::chrono::microseconds last_mesh_request_{std::chrono::microseconds::zero()};
+    std::atomic<int64_t>      mesh_cadence_us_{500000};
     std::atomic<float>                    mesh_extract_progress_{0.0f};
     std::atomic<float>                    export_progress_{0.0f};
     std::atomic<bool>                     use_gpu_{false};
@@ -251,6 +312,26 @@ private:
 
     bool startInternal(bool engage_sensor);
     void onRawFrame(std::shared_ptr<sensor::RawFrame> raw);
+    /**
+     * Retain-latest push onto the integration queue. `frame` is moved in, so the
+     * queue becomes its ONLY owner: a copied shared_ptr would hand the same pooled
+     * FrameData back to acquireFreeData() while the queue still referenced it.
+     * At capacity the oldest queued frame is displaced and destructed outside the
+     * queue lock; the eviction is counted under metrics_mutex_.
+     */
+    void enqueueForIntegration(std::shared_ptr<sensor::FrameData> frame);
+    /** Bump mesh_requests_.requested and wake the worker. Never blocks, never waits. */
+    uint64_t requestMesh();
+    /**
+     * Drop every pending mesh request and invalidate every in-flight extraction:
+     * called by reset(), whose volume no longer exists, so no mesh computed
+     * against the old generation may be published afterwards.
+     */
+    void invalidateMeshState();
+    /** True once the meshing worker has published the mesh described by `version`. */
+    bool awaitMeshVersion(uint64_t version, std::chrono::milliseconds timeout);
+    /** Time-based mesh cadence: request at most one extraction per mesh_cadence_us_. */
+    void requestMeshIfCadenceDue();
     void configurePreprocessor();
     /**
      * Centralized UI-frame callback delivery.
@@ -324,6 +405,63 @@ public:
     bool callbackMutexIsFreeForTests() const;
     bool trackerMutexIsFreeForTests() const;
     bool tsdfMutexIsFreeForTests() const;
+    bool metricsMutexIsFreeForTests();
+
+    // ---- Todo 25 state seam: motion model + queue backpressure ----
+
+    /** The motion model a frame was actually predicted with, at the pose lock. */
+    struct MotionModelObservation {
+        uint64_t        generation = 0;  // predictions recorded since construction
+        Eigen::Matrix4f prev_pose{Eigen::Matrix4f::Identity()};
+        Eigen::Matrix4f predicted_pose{Eigen::Matrix4f::Identity()};
+        /** last_pose_ as the motion model found it, BEFORE this frame updated it. */
+        Eigen::Matrix4f last_pose_before{Eigen::Matrix4f::Identity()};
+        bool            valid = false;
+    };
+    MotionModelObservation lastMotionModelForTests();
+    /** frame_id of the last RawFrame the tracking worker popped off the queue. */
+    uint64_t lastPoppedFrameIdForTests();
+    Eigen::Matrix4f lastPoseForTests();
+    size_t rawQueueDepthForTests();
+    size_t integrationQueueDepthForTests();
+
+    /**
+     * Worker gates. A parked worker holds NO lock (the gate sits at the top of
+     * the loop body, before the queue wait), so queues fill up behind it: this is
+     * how a test builds DETERMINISTIC backpressure instead of racing a fast
+     * worker. stop() always releases both gates, so a parked worker can never
+     * deadlock a shutdown.
+     */
+    void pauseTrackingWorkerForTests();
+    void pauseIntegrationWorkerForTests();
+    void resumePipelineWorkersForTests();
+    bool trackingWorkerParkedForTests();
+    bool integrationWorkerParkedForTests();
+
+    // ---- Todo 25 mesh seam: versioned requests + cadence ----
+
+    struct MeshStateObservation {
+        uint64_t requested = 0;
+        uint64_t claimed = 0;
+        uint64_t served = 0;
+        uint64_t generation = 0;
+        uint64_t served_generation = 0;
+        uint64_t extractions = 0;  // extractions actually run
+        uint64_t publishes = 0;    // meshes published to SharedMesh
+        uint64_t stale_drops = 0;  // results dropped for an old generation
+    };
+    MeshStateObservation meshStateForTests();
+    /** Same entry point the cadence uses; returns the assigned version. */
+    uint64_t requestMeshForTests();
+    /** Exactly what reset() does to mesh state, callable without stopping. */
+    void invalidateMeshStateForTests();
+    /** Park the next `count` extractions inside the worker (holds no volume lock). */
+    void armMeshExtractionHoldForTests(int count);
+    void releaseMeshExtractionHoldForTests();
+    /** Versions the worker claimed at each hook entry, in order. */
+    std::vector<uint64_t> meshHookVersionsForTests();
+    /** Cadence interval override; production default is 500 ms. */
+    void setMeshCadenceIntervalForTests(std::chrono::microseconds interval);
 
 private:
     struct SeamObservation {
@@ -332,10 +470,44 @@ private:
         DepthBandObservation integration_band;
         int applied_threads  = 0;
         int applied_sr_scale = 0;
+        MotionModelObservation motion;
+        uint64_t last_popped_frame_id = 0;
+        uint64_t mesh_extractions = 0;
+        uint64_t mesh_publishes = 0;
+        uint64_t mesh_stale_drops = 0;
+        std::vector<uint64_t> mesh_hook_versions;
     };
     SeamObservation seam_obs_;
-    void recordTrackingBandForTests(const FusionHyperparams& h);
+    void recordTrackingBandForTests(const FusionHyperparams& h, uint64_t frame_id);
     void recordIntegrationBandForTests(float min_depth, float max_depth);
+    void recordMotionModelForTests(const Eigen::Matrix4f& prev_pose,
+                                   const Eigen::Matrix4f& predicted,
+                                   const Eigen::Matrix4f& last_pose_before);
+    void recordMeshExtractionForTests();
+    void recordMeshPublishForTests();
+    void recordMeshStaleDropForTests();
+
+    /** Park the calling worker at `gate` while paused; holds no other lock. */
+    struct WorkerGate {
+        std::mutex              mtx;
+        std::condition_variable cv;
+        bool                    paused = false;
+        bool                    parked = false;
+    };
+    void waitForWorkerGate(WorkerGate& gate);
+    void releaseWorkerGate(WorkerGate& gate);
+    WorkerGate tracking_gate_;
+    WorkerGate integration_gate_;
+
+    /** Park inside meshingLoop() for `holds` extractions, claiming each version. */
+    struct MeshHook {
+        std::mutex              mtx;
+        std::condition_variable cv;
+        int                     holds = 0;
+        bool                    released = false;
+    };
+    void engageMeshExtractionHookForTests(uint64_t claimed_version);
+    MeshHook mesh_hook_;
 public:
 #endif
 };

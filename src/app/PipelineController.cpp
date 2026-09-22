@@ -77,8 +77,18 @@ bool PipelineController::startInternal(bool engage_sensor) {
     success_log_counter_  = 0;
     hip_ui_skip_          = 0;
     {
+        // The motion model belongs to ONE session. last_pose_ is the previous
+        // frame's pose, and the pose-to-pose predictor forms
+        // delta = last_pose_.inverse() * current_pose_; leaving a pose from an
+        // earlier session here makes the FIRST prediction of the new session a
+        // jump across the stop/start gap (and across any reset in between),
+        // against a model that has not seen that motion. start() therefore clears
+        // the whole model: the first tracked frame is predicted from identity by
+        // identity, i.e. no stale first prediction is possible, and start() never
+        // requires a prior reset to get that.
         std::lock_guard<std::mutex> lk(pose_mutex_);
-        current_pose_  = Eigen::Matrix4f::Identity();
+        current_pose_ = Eigen::Matrix4f::Identity();
+        last_pose_    = Eigen::Matrix4f::Identity();
     }
     // Set frame callback before starting capture
     sensor_->setFrameCallback([this](std::shared_ptr<sensor::RawFrame> raw) {
@@ -217,6 +227,18 @@ bool PipelineController::startInternal(bool engage_sensor) {
         integration_shutdown_ = false;
         while (!integration_queue_.empty()) integration_queue_.pop();
     }
+    // The mesh worker's shutdown predicate follows the same guarded-queue rule,
+    // and its version counters stay monotonic across restarts: bumping nothing
+    // here keeps (served <= claimed <= requested) meaningful over a stop/start,
+    // while clearing shutdown lets the fresh worker wait instead of exiting.
+    // The cadence clock is primed to the epoch so the first integrated frame of
+    // this session is immediately due for a mesh request.
+    {
+        std::lock_guard<std::mutex> lk(mesh_requests_.mtx);
+        mesh_requests_.shutdown = false;
+        mesh_requests_.cv.notify_all();
+    }
+    last_mesh_request_ = std::chrono::microseconds::zero();
 
     // Launch pipeline threads
     tracking_thread_    = std::thread(&PipelineController::trackingLoop, this);
@@ -393,6 +415,27 @@ void PipelineController::stop() {
       integration_shutdown_ = true;
       integration_queue_cv_.notify_all();
   }
+  // Same guarded-predicate rule for the meshing worker: flip and notify while
+  // holding mesh_requests_.mtx, so a worker that is between "checked the
+  // predicate" and "registered on the cv" cannot miss the shutdown.
+  {
+      std::lock_guard<std::mutex> lk(mesh_requests_.mtx);
+      mesh_requests_.shutdown = true;
+      mesh_requests_.cv.notify_all();
+  }
+#ifdef AZU_PIPELINE_TEST_SEAM
+  // A seam test may stop() while a worker is parked at a test gate or inside the
+  // mesh hook; releasing them here keeps join() from waiting on a park that only
+  // the test could lift.
+  releaseWorkerGate(tracking_gate_);
+  releaseWorkerGate(integration_gate_);
+  {
+      std::lock_guard<std::mutex> lk(mesh_hook_.mtx);
+      mesh_hook_.holds = 0;
+      mesh_hook_.released = true;
+      mesh_hook_.cv.notify_all();
+  }
+#endif
 
   if (tracking_thread_.joinable())
     tracking_thread_.join();
@@ -481,7 +524,7 @@ void PipelineController::reset() {
         while (!integration_queue_.empty()) integration_queue_.pop();
     }
 
-    mesh_extraction_requested_.store(false);
+    invalidateMeshState();
 
     {
         std::lock_guard<std::mutex> lk(model_buffers_.mtx);
@@ -506,12 +549,19 @@ void PipelineController::reset() {
         last_pose_ = Eigen::Matrix4f::Identity();
     }
     first_frame_          = true;
-    frame_count_          = 0;
     ui_skip_counter_      = 0;
     lost_log_counter_     = 0;
     success_log_counter_  = 0;
     hip_ui_skip_          = 0;
-    metrics_      = PipelineMetrics{};
+    // frame_count_ and metrics_ are a pair guarded by metrics_mutex_ everywhere
+    // else (onRawFrame writes both under it), so the reset that zeroes them takes
+    // the same lock; control_mutex_ does not, because it serialises lifecycle and
+    // this reset previously raced a metricsSnapshot() reader.
+    {
+        std::lock_guard<std::mutex> lk(metrics_mutex_);
+        frame_count_ = 0;
+        metrics_     = PipelineMetrics{};
+    }
     {
         std::lock_guard<std::mutex> pp_lk(preprocessor_mutex_);
         if (preprocessor_) {
@@ -609,14 +659,26 @@ void PipelineController::onRawFrame(std::shared_ptr<sensor::RawFrame> raw) {
   if (!running_.load())
     return;
 
+  // Retain-latest, bounded: at capacity the OLDEST queued frame is displaced.
+  // The old policy rejected the arriving frame instead, so a burst while the
+  // tracking worker was busy threw away the freshest geometry and kept the stale
+  // frames — the exact inversion of what a tracking pipeline needs, and silent.
+  std::shared_ptr<sensor::RawFrame> displaced;
+  bool displaced_a_frame = false;
   {
     std::lock_guard<std::mutex> lk(tracking_queue_mutex_);
-    if (raw_queue_.size() < 3) {
-      // Store raw frame — processing happens in tracking thread
-      raw_queue_.push(std::move(raw));
+    if (raw_queue_.size() >= kRawQueueCapacity) {
+      displaced = std::move(raw_queue_.front());
+      raw_queue_.pop();
+      displaced_a_frame = true;
     }
+    raw_queue_.push(std::move(raw));
   }
   tracking_queue_cv_.notify_one();
+  // The displaced frame's pooled deleter takes the sensor pool mutex, so it is
+  // destructed here — past the queue lock — exactly like KinectSensor's
+  // publishLatest() does for the frame it replaces.
+  displaced.reset();
 
   // Update capture FPS
   auto now = steady_clock::now();
@@ -625,21 +687,58 @@ void PipelineController::onRawFrame(std::shared_ptr<sensor::RawFrame> raw) {
 
   int fc = 0;
   float inst_fps = 0.0f;
+  int dropped = 0;
   {
+    // metrics_mutex_ is a leaf: taken after the queue lock is released, never
+    // nested inside it.
     std::lock_guard<std::mutex> lk(metrics_mutex_);
     metrics_.capture_fps = (dt > 0.0f) ? (1.0f / dt) : 0.0f;
     metrics_.frame_count = ++frame_count_;
+    if (displaced_a_frame) ++metrics_.dropped_frames;
     fc = metrics_.frame_count;
     inst_fps = metrics_.capture_fps;
+    dropped = metrics_.dropped_frames;
   }
   if (fc % 150 == 0) {
-    KFLOGF_DEBUG("Pipeline", "Sensor throughput: %d frames received @ %.2f FPS",
-                 fc, inst_fps);
+    KFLOGF_DEBUG("Pipeline",
+                 "Sensor throughput: %d frames received @ %.2f FPS "
+                 "(%d stale frames displaced)",
+                 fc, inst_fps, dropped);
+  }
+}
+
+void PipelineController::enqueueForIntegration(
+    std::shared_ptr<sensor::FrameData> frame) {
+  std::shared_ptr<sensor::FrameData> displaced;
+  bool displaced_a_frame = false;
+  {
+    std::lock_guard<std::mutex> lk(integration_queue_mutex_);
+    if (integration_queue_.size() >= kIntegrationQueueCapacity) {
+      displaced = std::move(integration_queue_.front());
+      integration_queue_.pop();
+      displaced_a_frame = true;
+    }
+    // Move, never copy: the queue must be the ONLY owner. A second shared_ptr
+    // here would run the pooled deleter when the local copy died and hand the
+    // same FrameData back to acquireFreeData() while the queue still pointed at
+    // it — two writers, one frame.
+    integration_queue_.push(std::move(frame));
+  }
+  integration_queue_cv_.notify_one();
+  // Displaced frame returns to the pool here, outside both the queue lock and
+  // the pool mutex its deleter takes.
+  displaced.reset();
+  if (displaced_a_frame) {
+    std::lock_guard<std::mutex> lk(metrics_mutex_);
+    ++metrics_.dropped_integration_frames;
   }
 }
 
 void PipelineController::trackingLoop() {
   while (running_.load()) {
+#ifdef AZU_PIPELINE_TEST_SEAM
+    waitForWorkerGate(tracking_gate_);
+#endif
     std::shared_ptr<sensor::RawFrame> raw;
     {
       std::unique_lock<std::mutex> lk(tracking_queue_mutex_);
@@ -649,7 +748,7 @@ void PipelineController::trackingLoop() {
         break;
       if (raw_queue_.empty())
         continue;
-      raw = raw_queue_.front();
+      raw = std::move(raw_queue_.front());
       raw_queue_.pop();
     }
 
@@ -662,7 +761,7 @@ void PipelineController::trackingLoop() {
     // preprocess/track/integrate call ever runs under it.
     const FusionHyperparams hp = hyperparamsSnapshot();
 #ifdef AZU_PIPELINE_TEST_SEAM
-    recordTrackingBandForTests(hp);
+    recordTrackingBandForTests(hp, raw->frame_id);
 #endif
 
     // Build processed frame here (using pool)
@@ -704,22 +803,18 @@ void PipelineController::trackingLoop() {
     if (first_frame_) {
         first_frame_ = false;
         frame->pose = Eigen::Matrix4f::Identity();
-        // Enqueue for integration
-        {
-            std::lock_guard<std::mutex> lk(integration_queue_mutex_);
-            if (integration_queue_.size() < 3)
-                integration_queue_.push(frame);
-            else
-                releaseData(std::move(frame));
-        }
-        integration_queue_cv_.notify_one();
+        const uint64_t origin_id = frame->frame_id;
+        // Sole ownership moves into the queue; the previous copy handed this
+        // FrameData back to the pool when the local died at the end of the
+        // iteration while the queue still referenced it.
+        enqueueForIntegration(std::move(frame));
 
         {
             std::lock_guard<std::mutex> lk(metrics_mutex_);
             metrics_.tracking_ok = true;
             metrics_.icp_error   = 0.0f;
         }
-        KFLOGF_INFO("Pipeline", "First frame accepted (ID: %lu). Initializing world origin.", frame->frame_id);
+        KFLOGF_INFO("Pipeline", "First frame accepted (ID: %lu). Initializing world origin.", origin_id);
         continue;
     }
 
@@ -727,8 +822,14 @@ void PipelineController::trackingLoop() {
     // Without this, frame 2 would ICP against an empty model and immediately declare
     // tracking lost, locking the pipeline out of ever recovering.
     if (!model_ready_.load()) {
-        // Re-enqueue frame as if it just arrived and spin-wait (effectively drops it)
+        // The frame is discarded, not deferred: holding it would only predict
+        // against a model that does not exist yet. That startup loss is real, so
+        // it is counted rather than silent.
         releaseData(std::move(frame));
+        {
+            std::lock_guard<std::mutex> lk(metrics_mutex_);
+            ++metrics_.dropped_pre_model_frames;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         continue;
     }
@@ -746,9 +847,13 @@ void PipelineController::trackingLoop() {
 
       // Motion Model: predicted = current * (last_delta)
       // last_delta = last_pose.inv * current_pose
-      Eigen::Matrix4f delta = last_pose_.inverse() * current_pose_;
+      const Eigen::Matrix4f motion_source = last_pose_;
+      Eigen::Matrix4f delta = motion_source.inverse() * current_pose_;
       predicted_pose = current_pose_ * delta;
       last_pose_ = current_pose_;
+#ifdef AZU_PIPELINE_TEST_SEAM
+      recordMotionModelForTests(prev_pose, predicted_pose, motion_source);
+#endif
     }
 
     tracking::ICPResult icp_result;
@@ -931,15 +1036,8 @@ void PipelineController::trackingLoop() {
             frame->pose = icp_result.pose; 
             state_.store(PipelineState::Running);
 
-            // Enqueue for integration
-            {
-                std::lock_guard<std::mutex> lk(integration_queue_mutex_);
-                if (integration_queue_.size() < 3)
-                    integration_queue_.push(frame);
-                else
-                    releaseData(std::move(frame)); 
-            }
-            integration_queue_cv_.notify_one();
+            // Enqueue for integration (retain-latest, sole owner moves in).
+            enqueueForIntegration(std::move(frame));
         } else {
             // RELOCALIZATION: If tracking lost, don't update state or pose, but don't stop.
             // We just don't integrate the frame. This keeps the model "clean".
@@ -962,11 +1060,10 @@ void PipelineController::trackingLoop() {
 }
 
 void PipelineController::integrationLoop() {
-  static constexpr int MESH_TRIGGER_FRAMES =
-      5; // trigger mesh update every N integrated frames
-  int frames_since_mesh = 0;
-
   while (running_.load()) {
+#ifdef AZU_PIPELINE_TEST_SEAM
+    waitForWorkerGate(integration_gate_);
+#endif
     std::shared_ptr<sensor::FrameData> frame;
     {
       std::unique_lock<std::mutex> lk(integration_queue_mutex_);
@@ -976,7 +1073,7 @@ void PipelineController::integrationLoop() {
         break;
       if (integration_queue_.empty())
         continue;
-      frame = integration_queue_.front();
+      frame = std::move(integration_queue_.front());
       integration_queue_.pop();
     }
 
@@ -1223,29 +1320,56 @@ void PipelineController::integrationLoop() {
     // Return frame to pool!
     releaseData(std::move(frame));
 
-    ++frames_since_mesh;
-    if (frames_since_mesh >= MESH_TRIGGER_FRAMES) {
-      frames_since_mesh = 0;
-      mesh_extraction_requested_.store(true);
-    }
+    // Mesh cadence: time-based, and a fire-and-forget version bump. The old rule
+    // (one request every 5 integrated frames) coupled mesh rate to capture rate,
+    // so a faster pipeline meshed more often against the same volume while a slow
+    // one starved the view. Timing belongs to the clock, not to the frame count,
+    // and the requester never waits for the result.
+    requestMeshIfCadenceDue();
   }
 }
 
 void PipelineController::meshingLoop() {
-  while (running_.load()) {
-    // Poll for mesh extraction request
-    if (!mesh_extraction_requested_.load()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      continue;
+  for (;;) {
+    // Claim a version under the request lock. A request can no longer be lost
+    // the way a boolean flag was: clearing the flag between reading it and
+    // storing false dropped every request that landed in that window, and
+    // nothing said which volume the published mesh described.
+    uint64_t serving = 0;
+    uint64_t generation_at_claim = 0;
+    {
+      std::unique_lock<std::mutex> lk(mesh_requests_.mtx);
+      mesh_requests_.cv.wait(lk, [&] {
+        return mesh_requests_.shutdown ||
+               mesh_requests_.requested > mesh_requests_.claimed;
+      });
+      if (mesh_requests_.shutdown)
+        return;
+      // Serve the NEWEST requested version. Requests that arrived while the
+      // previous extraction ran simply left requested > claimed, so they are
+      // served by this pass; an older "give me a mesh now" is satisfied by a
+      // strictly fresher extraction, which is subsumption, not a merge of two
+      // different results. Requests arriving from here on stay pending and are
+      // served by the next pass.
+      serving = mesh_requests_.requested;
+      generation_at_claim = mesh_requests_.generation;
+      mesh_requests_.claimed = serving;
     }
-    mesh_extraction_requested_.store(false);
-    is_meshing_.store(true);
+#ifdef AZU_PIPELINE_TEST_SEAM
+    engageMeshExtractionHookForTests(serving);
+#endif
 
     mesh_extract_progress_.store(0.0f);
-    KFLOG_INFO("Pipeline",
-               "Marching Cubes: Extracting mesh from TSDF volume...");
+    KFLOGF_INFO("Pipeline",
+                "Marching Cubes: Extracting mesh from TSDF volume "
+                "(request v%llu, generation %llu)...",
+                static_cast<unsigned long long>(serving),
+                static_cast<unsigned long long>(generation_at_claim));
     std::shared_ptr<meshing::MeshData> mesh;
     {
+#ifdef AZU_PIPELINE_TEST_SEAM
+      recordMeshExtractionForTests();
+#endif
       utils::ScopedTimer t("Mesh Extraction");
       // gpu_mutex_ first to match lock ordering in integrationLoop.
       // This is the heaviest GPU job (~400ms): holding gpu_mutex_ prevents
@@ -1284,6 +1408,32 @@ void PipelineController::meshingLoop() {
 #endif
     }
 
+    // A reset() bumps the generation. If that happened while this extraction ran,
+    // the mesh describes a volume that has been cleared, so it is dropped rather
+    // than published: publishing it would hand the UI a mesh of a scan the user
+    // already discarded, and report it as the result of a newer request.
+    bool stale_generation = false;
+    {
+      std::lock_guard<std::mutex> lk(mesh_requests_.mtx);
+      stale_generation = (mesh_requests_.generation != generation_at_claim);
+      if (!stale_generation) {
+        mesh_requests_.served = serving;
+        mesh_requests_.served_generation = generation_at_claim;
+        mesh_requests_.cv.notify_all();
+      }
+    }
+    if (stale_generation) {
+#ifdef AZU_PIPELINE_TEST_SEAM
+      recordMeshStaleDropForTests();
+#endif
+      KFLOGF_WARN("Pipeline",
+                  "Mesh Extraction DROPPED: request v%llu was extracted against "
+                  "generation %llu, which has since been reset.",
+                  static_cast<unsigned long long>(serving),
+                  static_cast<unsigned long long>(generation_at_claim));
+      continue;
+    }
+
     {
       std::lock_guard<std::mutex> lk(metrics_mutex_);
       metrics_.mesh_triangles = mesh ? mesh->triangleCount() : 0;
@@ -1308,22 +1458,64 @@ void PipelineController::meshingLoop() {
       if (on_mesh)
         on_mesh();
     }
-    is_meshing_.store(false);
+#ifdef AZU_PIPELINE_TEST_SEAM
+    recordMeshPublishForTests();
+#endif
   }
+}
+
+uint64_t PipelineController::requestMesh() {
+  uint64_t version = 0;
+  {
+    std::lock_guard<std::mutex> lk(mesh_requests_.mtx);
+    version = ++mesh_requests_.requested;
+    mesh_requests_.cv.notify_one();
+  }
+  return version;
+}
+
+void PipelineController::invalidateMeshState() {
+  std::lock_guard<std::mutex> lk(mesh_requests_.mtx);
+  ++mesh_requests_.generation;
+  // Drain every pending request: after reset() the volume it asked for does not
+  // exist any more. served / served_generation deliberately stay untouched —
+  // they describe the mesh that IS published, and inventing a served version
+  // would let a waiter wake on a mesh that was never produced. A waiter on a
+  // drained version therefore times out (bounded), exactly as the pre-Todo-25
+  // export loop did when its flag was cleared.
+  mesh_requests_.requested = mesh_requests_.claimed =
+      std::max(mesh_requests_.requested, mesh_requests_.claimed);
+  mesh_requests_.cv.notify_all();
+}
+
+void PipelineController::requestMeshIfCadenceDue() {
+  const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+      steady_clock::now().time_since_epoch());
+  const auto interval = std::chrono::microseconds(mesh_cadence_us_.load());
+  if (now - last_mesh_request_ < interval)
+    return;
+  last_mesh_request_ = now;
+  requestMesh();
+}
+
+bool PipelineController::awaitMeshVersion(uint64_t version,
+                                          std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lk(mesh_requests_.mtx);
+  return mesh_requests_.cv.wait_for(lk, timeout, [&] {
+    return mesh_requests_.served >= version || mesh_requests_.shutdown;
+  });
 }
 
 bool PipelineController::exportPLY(const std::string &path) {
   uint64_t ver;
   auto mesh = shared_mesh_.snapshot(ver);
   if (!mesh || mesh->empty()) {
-    std::cout << "[Pipeline] No mesh yet, extracting via meshingLoop...\n";
-    mesh_extraction_requested_.store(true);
-    int waits = 0;
-    while (waits < 100 &&
-           (mesh_extraction_requested_.load() || is_meshing_.load())) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      waits++;
-    }
+    std::cout << "[Pipeline] No mesh yet, requesting an extraction...\n";
+    // Request a version and wait for THAT version to be published, instead of
+    // polling a shared flag that another thread (or the cadence) could clear:
+    // the wait is now answered only by the mesh this request caused.
+    const uint64_t requested_version = requestMesh();
+    awaitMeshVersion(requested_version, std::chrono::milliseconds(5000));
     mesh = shared_mesh_.snapshot(ver);
   }
   if (!mesh || mesh->empty()) {
@@ -1346,14 +1538,12 @@ bool PipelineController::exportGLB(const std::string &path) {
   uint64_t ver;
   auto mesh = shared_mesh_.snapshot(ver);
   if (!mesh || mesh->empty()) {
-    std::cout << "[Pipeline] No mesh yet, extracting via meshingLoop...\n";
-    mesh_extraction_requested_.store(true);
-    int waits = 0;
-    while (waits < 100 &&
-           (mesh_extraction_requested_.load() || is_meshing_.load())) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      waits++;
-    }
+    std::cout << "[Pipeline] No mesh yet, requesting an extraction...\n";
+    // Request a version and wait for THAT version to be published, instead of
+    // polling a shared flag that another thread (or the cadence) could clear:
+    // the wait is now answered only by the mesh this request caused.
+    const uint64_t requested_version = requestMesh();
+    awaitMeshVersion(requested_version, std::chrono::milliseconds(5000));
     mesh = shared_mesh_.snapshot(ver);
   }
   if (!mesh || mesh->empty()) {
@@ -1396,7 +1586,8 @@ void PipelineController::releaseData(std::shared_ptr<sensor::FrameData>) {
 }
 
 #ifdef AZU_PIPELINE_TEST_SEAM
-void PipelineController::recordTrackingBandForTests(const FusionHyperparams& h) {
+void PipelineController::recordTrackingBandForTests(const FusionHyperparams& h,
+                                                    uint64_t frame_id) {
   // Leaf lock only: callers hold no controller lock here (the hyperparams_
   // snapshot was already copied out of hyper_mutex_).
   std::lock_guard<std::mutex> lk(seam_obs_.mtx);
@@ -1405,6 +1596,7 @@ void PipelineController::recordTrackingBandForTests(const FusionHyperparams& h) 
   band.min_depth    = h.min_depth;
   band.max_depth    = h.max_depth;
   band.valid        = true;
+  seam_obs_.last_popped_frame_id = frame_id;
 }
 
 void PipelineController::recordIntegrationBandForTests(float min_depth, float max_depth) {
@@ -1457,6 +1649,170 @@ bool PipelineController::tsdfMutexIsFreeForTests() const {
     return true;
   }
   return false;
+}
+
+bool PipelineController::metricsMutexIsFreeForTests() {
+  std::unique_lock<std::mutex> lk(metrics_mutex_, std::try_to_lock);
+  return lk.owns_lock();
+}
+
+void PipelineController::recordMotionModelForTests(
+    const Eigen::Matrix4f& prev_pose, const Eigen::Matrix4f& predicted,
+    const Eigen::Matrix4f& last_pose_before) {
+  // Called while pose_mutex_ is held, so seam_obs_.mtx is the innermost lock and
+  // nothing here reaches for pose_mutex_ again.
+  std::lock_guard<std::mutex> lk(seam_obs_.mtx);
+  auto& m           = seam_obs_.motion;
+  m.generation     += 1;
+  m.prev_pose       = prev_pose;
+  m.predicted_pose  = predicted;
+  m.last_pose_before = last_pose_before;
+  m.valid           = true;
+}
+
+PipelineController::MotionModelObservation
+PipelineController::lastMotionModelForTests() {
+  std::lock_guard<std::mutex> lk(seam_obs_.mtx);
+  return seam_obs_.motion;
+}
+
+uint64_t PipelineController::lastPoppedFrameIdForTests() {
+  std::lock_guard<std::mutex> lk(seam_obs_.mtx);
+  return seam_obs_.last_popped_frame_id;
+}
+
+Eigen::Matrix4f PipelineController::lastPoseForTests() {
+  std::lock_guard<std::mutex> lk(pose_mutex_);
+  return last_pose_;
+}
+
+size_t PipelineController::rawQueueDepthForTests() {
+  std::lock_guard<std::mutex> lk(tracking_queue_mutex_);
+  return raw_queue_.size();
+}
+
+size_t PipelineController::integrationQueueDepthForTests() {
+  std::lock_guard<std::mutex> lk(integration_queue_mutex_);
+  return integration_queue_.size();
+}
+
+void PipelineController::waitForWorkerGate(WorkerGate& gate) {
+  std::unique_lock<std::mutex> lk(gate.mtx);
+  if (!gate.paused)
+    return;
+  gate.parked = true;
+  gate.cv.notify_all();
+  // Shutdown releases the gate from stop(), so a parked worker can never block a
+  // join: the predicate is "resumed or released", never "some future test call".
+  gate.cv.wait(lk, [&gate] { return !gate.paused; });
+  gate.parked = false;
+}
+
+void PipelineController::releaseWorkerGate(WorkerGate& gate) {
+  std::lock_guard<std::mutex> lk(gate.mtx);
+  gate.paused = false;
+  gate.parked = false;
+  gate.cv.notify_all();
+}
+
+void PipelineController::pauseTrackingWorkerForTests() {
+  std::lock_guard<std::mutex> lk(tracking_gate_.mtx);
+  tracking_gate_.paused = true;
+}
+
+void PipelineController::pauseIntegrationWorkerForTests() {
+  std::lock_guard<std::mutex> lk(integration_gate_.mtx);
+  integration_gate_.paused = true;
+}
+
+void PipelineController::resumePipelineWorkersForTests() {
+  releaseWorkerGate(tracking_gate_);
+  releaseWorkerGate(integration_gate_);
+}
+
+bool PipelineController::trackingWorkerParkedForTests() {
+  std::lock_guard<std::mutex> lk(tracking_gate_.mtx);
+  return tracking_gate_.parked;
+}
+
+bool PipelineController::integrationWorkerParkedForTests() {
+  std::lock_guard<std::mutex> lk(integration_gate_.mtx);
+  return integration_gate_.parked;
+}
+
+void PipelineController::engageMeshExtractionHookForTests(uint64_t claimed_version) {
+  std::unique_lock<std::mutex> lk(mesh_hook_.mtx);
+  if (mesh_hook_.holds <= 0)
+    return;
+  --mesh_hook_.holds;
+  {
+    std::lock_guard<std::mutex> obs_lk(seam_obs_.mtx);
+    seam_obs_.mesh_hook_versions.push_back(claimed_version);
+  }
+  mesh_hook_.cv.notify_all();
+  // Parked until release (or stop(), which releases): the worker is inside
+  // meshingLoop() having already claimed its version, and holds no volume lock.
+  mesh_hook_.cv.wait(lk, [this] { return mesh_hook_.released; });
+  mesh_hook_.released = false;
+}
+
+void PipelineController::armMeshExtractionHoldForTests(int count) {
+  std::lock_guard<std::mutex> lk(mesh_hook_.mtx);
+  mesh_hook_.holds = count;
+  mesh_hook_.released = false;
+}
+
+void PipelineController::releaseMeshExtractionHoldForTests() {
+  std::lock_guard<std::mutex> lk(mesh_hook_.mtx);
+  mesh_hook_.released = true;
+  mesh_hook_.cv.notify_all();
+}
+
+std::vector<uint64_t> PipelineController::meshHookVersionsForTests() {
+  std::lock_guard<std::mutex> lk(seam_obs_.mtx);
+  return seam_obs_.mesh_hook_versions;
+}
+
+void PipelineController::recordMeshExtractionForTests() {
+  std::lock_guard<std::mutex> lk(seam_obs_.mtx);
+  ++seam_obs_.mesh_extractions;
+}
+
+void PipelineController::recordMeshPublishForTests() {
+  std::lock_guard<std::mutex> lk(seam_obs_.mtx);
+  ++seam_obs_.mesh_publishes;
+}
+
+void PipelineController::recordMeshStaleDropForTests() {
+  std::lock_guard<std::mutex> lk(seam_obs_.mtx);
+  ++seam_obs_.mesh_stale_drops;
+}
+
+PipelineController::MeshStateObservation
+PipelineController::meshStateForTests() {
+  MeshStateObservation s;
+  {
+    std::lock_guard<std::mutex> lk(mesh_requests_.mtx);
+    s.requested         = mesh_requests_.requested;
+    s.claimed           = mesh_requests_.claimed;
+    s.served            = mesh_requests_.served;
+    s.generation        = mesh_requests_.generation;
+    s.served_generation = mesh_requests_.served_generation;
+  }
+  std::lock_guard<std::mutex> obs_lk(seam_obs_.mtx);
+  s.extractions = seam_obs_.mesh_extractions;
+  s.publishes   = seam_obs_.mesh_publishes;
+  s.stale_drops = seam_obs_.mesh_stale_drops;
+  return s;
+}
+
+uint64_t PipelineController::requestMeshForTests() { return requestMesh(); }
+
+void PipelineController::invalidateMeshStateForTests() { invalidateMeshState(); }
+
+void PipelineController::setMeshCadenceIntervalForTests(
+    std::chrono::microseconds interval) {
+  mesh_cadence_us_.store(interval.count());
 }
 #endif
 
