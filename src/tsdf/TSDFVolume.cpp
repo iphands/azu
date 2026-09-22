@@ -26,6 +26,18 @@ TSDFStats g_tsdf_stats;
 bool g_tsdf_logging_enabled = false;
 std::ofstream g_tsdf_log_file;
 
+namespace {
+// Exact comparison over every field, so a change in any one of them is visible.
+// A NaN field compares unequal on purpose: the conservative outcome is to clear.
+bool sameParams(const TSDFParams& a, const TSDFParams& b) {
+    return a.resolution == b.resolution &&
+           a.voxel_size == b.voxel_size &&
+           a.truncation  == b.truncation &&
+           a.max_weight  == b.max_weight &&
+           (a.origin.array() == b.origin.array()).all();
+}
+} // namespace
+
 void initTSDFLogging() {
     const char* log_env = std::getenv("AZU_TSDF_LOG");
     if (log_env && std::string(log_env) == "1") {
@@ -73,15 +85,18 @@ void TSDFVolume::reset() {
 }
 
 void TSDFVolume::unlocked_reset() {
-    std::fill(voxels_.begin(), voxels_.end(), Voxel{0.0f, 0.0f, 128, 128, 128});
+    std::fill(voxels_.begin(), voxels_.end(),
+              Voxel{EMPTY_TSDF, EMPTY_WEIGHT, EMPTY_COLOR, EMPTY_COLOR, EMPTY_COLOR});
     integrated_frames_.store(0);
 }
 
 void TSDFVolume::setParams(const TSDFParams& p) {
     std::unique_lock<std::shared_mutex> lk(mutex_);
-    bool resized = (p.resolution != params_.resolution);
+    if (sameParams(p, params_)) return;
+
+    const bool resolution_changed = (p.resolution != params_.resolution);
     params_ = p;
-    if (resized) {
+    if (resolution_changed) {
         // KIN-FORK: extractGlobalPointCloud* allocates d_pc_* scratch lazily
         // (if(!ptr)) and never resizes -> stale small buffers become OOB once
         // the volume grows. Drop them so the next extract re-allocates at the
@@ -91,8 +106,12 @@ void TSDFVolume::setParams(const TSDFParams& p) {
 #endif
         size_t total = static_cast<size_t>(params_.resolution) * params_.resolution * params_.resolution;
         voxels_.resize(total);
-        unlocked_reset(); // already holding the lock — do NOT call reset() here
     }
+    // Every parameter difference invalidates existing voxels, not only a
+    // resolution change: tsdf/weight/color were fused under the old truncation
+    // and max_weight, and world<->voxel mapping was derived from the old
+    // voxel_size and origin. Do NOT call reset() here — the lock is held.
+    unlocked_reset();
 }
 
 void TSDFVolume::integrate(const float*           depth_meters,
@@ -322,14 +341,14 @@ void TSDFVolume::raycast(const Eigen::Matrix4f& pose,
             Eigen::Vector3f ray_world = (R_cw * ray_cam).normalized();
 
             float t = 0.3f; // min depth for Kinect v1
-            float prev_tsdf = 1.0f;
+            float prev_tsdf = EMPTY_TSDF;
             const float trunc = params_.truncation;
 
             while (t < 5.0f) {
                 Eigen::Vector3f p = cam_origin + ray_world * t;
                 float tsdf = getTSDF(p);
 
-                if (tsdf < 1.0f) { // Probable geometry region
+                if (tsdf < EMPTY_TSDF) { // Probable geometry region
                     if (prev_tsdf > 0.0f && tsdf <= 0.0f) {
                         // Surface zero-crossing found
                         float t_hit = t - vs * tsdf / (tsdf - prev_tsdf + 1e-6f);
@@ -354,7 +373,7 @@ void TSDFVolume::raycast(const Eigen::Matrix4f& pose,
                 } else {
                     // Unknown or empty space
                     t += vs; 
-                    prev_tsdf = 1.0f;
+                    prev_tsdf = EMPTY_TSDF;
                 }
             }
         }
@@ -385,9 +404,9 @@ float TSDFVolume::getTSDF(const Eigen::Vector3f& world_pos) const {
     
     if (x0 < 0 || x0 >= res - 1 || y0 < 0 || y0 >= res - 1 || z0 < 0 || z0 >= res - 1) {
         Eigen::Vector3i vi = worldToVoxel(world_pos);
-        if (!inBounds(vi.x(), vi.y(), vi.z())) return 1.0f;
+        if (!inBounds(vi.x(), vi.y(), vi.z())) return EMPTY_TSDF;
         const Voxel& vox = voxels_[idx(vi.x(), vi.y(), vi.z())];
-        return (vox.weight > 0.0f) ? vox.tsdf : 1.0f;
+        return (vox.weight > 0.0f) ? vox.tsdf : EMPTY_TSDF;
     }
 
     float tx = v.x() - x0;
@@ -396,7 +415,7 @@ float TSDFVolume::getTSDF(const Eigen::Vector3f& world_pos) const {
 
     auto getV = [&](int x, int y, int z) {
         const Voxel& vox = voxels_[idx(x, y, z)];
-        return (vox.weight > 0.0f) ? vox.tsdf : 1.0f;
+        return (vox.weight > 0.0f) ? vox.tsdf : EMPTY_TSDF;
     };
 
     float v000 = getV(x0, y0, z0);

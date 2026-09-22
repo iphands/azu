@@ -88,21 +88,40 @@ emptiness is decided by `weight`, never by the `tsdf` literal.
 Current CPU behavior:
 
 - `include/tsdf/TSDFVolume.h` `struct Voxel` defaults to
-  `tsdf = 1.0f`, `weight = 0.0f`, `r = g = b = 128` — canonical.
+  `tsdf = EMPTY_TSDF`, `weight = EMPTY_WEIGHT`, `r = g = b = EMPTY_COLOR`
+  (128) — canonical, and a `static_assert` in the same header makes
+  `Voxel{}` equal to the named constants at compile time.
 - `src/tsdf/TSDFVolume.cpp` `unlocked_reset()` fills
-  `Voxel{0.0f, 0.0f, 128, 128, 128}`, i.e. `tsdf = 0.0f`. **Known CPU defect**
-  (owned by the TSDF-lifecycle todo): a reset voxel sits exactly on the zero
-  isosurface, so an unobserved voxel can be meshed as surface. The canonical
-  fill is `tsdf = 1.0f`.
-- There is no `EMPTY_TSDF` / sentinel constant anywhere in `include/` or
-  `src/`; `1.0f` is written inline in six places per backend and five places on
-  CPU. Canonical: introduce one named constant so the reset fill, the
-  unobserved-sample value, and the host/device sync marker cannot drift apart.
+  `Voxel{EMPTY_TSDF, EMPTY_WEIGHT, EMPTY_COLOR, EMPTY_COLOR, EMPTY_COLOR}` and
+  zeroes `integrated_frames_`, so `reset()` restores the canonical empty state
+  exactly. Fixed by the TSDF-lifecycle todo: the fill used to be
+  `Voxel{0.0f, 0.0f, 128, 128, 128}`, which put every reset voxel on the zero
+  isosurface so an unobserved voxel could be meshed as surface. The CPU
+  contract is `tests/tsdf_reset_contract.cpp`.
+- `include/tsdf/TSDFVolume.h` now names the CPU sentinel pair
+  `EMPTY_TSDF = 1.0f` / `EMPTY_WEIGHT = 0.0f` (plus `EMPTY_COLOR = 128`), and
+  `unlocked_reset()`, `getTSDF()` and the `raycast()` empty-space markers use
+  them. Nine raw `1.0f` literals remain in `src/tsdf/TSDFVolume.cpp` and none of
+  them is an empty-voxel marker: two are the ray projection `z = 1`, two are the
+  `[-1,1]` truncation clamp, one is the per-frame weight increment `w_new`,
+  three are the color fusion denominators, one is the point-cloud
+  `weight > 1.0f` gate. The backends still carry no such constant, and CPU
+  meshing still gates a cube on `weight <= 0.001f` rather than on
+  `EMPTY_WEIGHT`: one named epsilon remains open (`tsdf:T2`, `tsdf:T5`,
+  `tsdf:T11`, `tsdf:T24`).
 - Emptiness thresholds are inconsistent across layers: `weight > 0.0f` in the
   CPU trilinear sampler, `weight <= 0.001f` in CPU meshing. Canonical: one
   named epsilon.
 - `src/tsdf/TSDFVolume.cpp` `getTSDF()` samples an unobserved voxel as
-  `+1.0f` — canonical, and it is the rule Marching Cubes relies on.
+  `EMPTY_TSDF` — canonical, and it is the rule Marching Cubes relies on.
+- `src/tsdf/TSDFVolume.cpp` `setParams()` compares every field of the incoming
+  `TSDFParams` against the current one and clears the host volume (and
+  `integrated_frames_`) on **any** difference, reallocating only when
+  `resolution` changed. Fixed by the same todo: it used to clear only when
+  `resolution` changed, so a `voxel_size`, `origin`, `truncation` or
+  `max_weight` change left voxels fused under the old parameters, and
+  `worldToVoxel()` / `voxelToWorld()` reinterpreted them through the new
+  geometry. An exactly-equal parameter set clears nothing.
 - `include/tsdf/TSDFVolume.h` `voxelAt()` is documented "bounds checked" while
   `src/tsdf/TSDFVolume.cpp` implements it as a bare `voxels_[idx(x, y, z)]`
   with no bounds test. **Known CPU defect**: either bounds-check it or fix the

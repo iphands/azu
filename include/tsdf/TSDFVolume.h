@@ -18,6 +18,17 @@
 namespace kfusion {
 namespace tsdf {
 
+// Canonical CPU empty-voxel state (docs/CANONICAL_SEMANTICS.md, "TSDF volume").
+// Emptiness is decided by weight, never by the tsdf literal: EMPTY_TSDF is what an
+// unobserved voxel carries ("free space, not yet truncated"), deliberately NOT the
+// zero isosurface. Named so the reset fill and the unobserved sampler value cannot
+// drift apart. CUDA/HIP adopt them only via the deferred backend migration.
+inline constexpr float EMPTY_TSDF   = 1.0f;
+inline constexpr float EMPTY_WEIGHT = 0.0f;
+
+// Color an unobserved voxel carries (no integration has written it yet).
+inline constexpr uint8_t EMPTY_COLOR = 128;
+
 struct TSDFParams {
     int   resolution     = 256;          // 256³ voxels
     float voxel_size     = 0.010f;       // meters per voxel (256 * 0.010 = 2.56m) — covers full Kinect range
@@ -27,10 +38,15 @@ struct TSDFParams {
 };
 
 struct Voxel {
-    float    tsdf   = 1.0f;  // normalized [-1,1]
-    float    weight = 0.0f;
-    uint8_t  r = 128, g = 128, b = 128;
+    float    tsdf   = EMPTY_TSDF;    // normalized [-1,1]
+    float    weight = EMPTY_WEIGHT;
+    uint8_t  r = EMPTY_COLOR, g = EMPTY_COLOR, b = EMPTY_COLOR;
 };
+
+static_assert(Voxel{}.tsdf == EMPTY_TSDF && Voxel{}.weight == EMPTY_WEIGHT &&
+                  Voxel{}.r == EMPTY_COLOR && Voxel{}.g == EMPTY_COLOR &&
+                  Voxel{}.b == EMPTY_COLOR,
+              "default-constructed Voxel must be the canonical empty state");
 
 class TSDFVolume {
 public:
@@ -43,7 +59,9 @@ public:
 
     const TSDFParams& params() const { return params_; }
 
-    /** Replace parameters. If resolution changes, voxel storage is reallocated and the volume is cleared. */
+    /** Replace parameters. A resolution change reallocates voxel storage; ANY
+        field difference clears the volume, so no voxel state derived from the
+        previous geometry or fusion parameters survives a parameter change. */
     void setParams(const TSDFParams& p);
 
     // Integrate a depth frame into the volume

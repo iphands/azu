@@ -124,6 +124,18 @@ set_tests_properties(marching_cubes_table_contract PROPERTIES LABELS cpu TIMEOUT
 add_test(NAME marching_cubes_sphere_contract COMMAND marching_cubes_sphere_contract)
 set_tests_properties(marching_cubes_sphere_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 8: CPU TSDF empty-sentinel + stale-host-state contract ----
+# Public TSDFVolume API only, small 8^3 volume, every voxel scanned (never
+# sampled): no device, display, GPU, sensor, thread timing or filesystem. RED at
+# todo 8 before the fix (reset() filled tsdf = 0.0f, i.e. the zero isosurface,
+# and setParams() cleared host voxels only on a resolution change), GREEN after.
+add_executable(tsdf_reset_contract tsdf_reset_contract.cpp)
+target_compile_definitions(tsdf_reset_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(tsdf_reset_contract PRIVATE azu_test_core)
+
+add_test(NAME tsdf_reset_contract COMMAND tsdf_reset_contract)
+set_tests_properties(tsdf_reset_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that
