@@ -605,6 +605,26 @@ target_link_libraries(fusion_ui_validation_contract PRIVATE azu_test_core)
 add_test(NAME fusion_ui_validation_contract COMMAND fusion_ui_validation_contract)
 set_tests_properties(fusion_ui_validation_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 30: CPU PLY writer schema / byte / failure contract ----
+# ply_writer_contract drives the REAL src/export/PLYExporter.cpp (carried by
+# azu_test_core through its src/export/*.cpp glob; gate 12 below) through BOTH
+# public entry points and PARSES the bytes on disk. It locks: byte-exact binary
+# output (magic, binary_little_endian, header counts, per-record stride, total
+# length, host-independent little-endian float/int bit patterns); one shared
+# element/property schema across binary and ASCII (only the "format" token may
+# differ) with ASCII values re-parsing to the same mesh (uint8 sRGB stays raw);
+# byte-identical repeats; and every failure creating no file -- empty / out-of-
+# range / non-multiple-of-3 / color-size-mismatch refused before open, an
+# unwritable target refused at open, and a REAL post-open RLIMIT_FSIZE write
+# fault removing the partial file. Files live in a process-unique temp dir. No
+# device, display, GPU, sensor, thread timing or network.
+add_executable(ply_writer_contract ply_writer_contract.cpp)
+target_compile_definitions(ply_writer_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(ply_writer_contract PRIVATE azu_test_core)
+
+add_test(NAME ply_writer_contract COMMAND ply_writer_contract)
+set_tests_properties(ply_writer_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that
@@ -1068,4 +1088,62 @@ if(NOT AZU_TEST_CORE_HAS_UI_TU)
         "replica instead of the product fusion UI model.")
 endif()
 
-message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract + pipeline_state_contract + pipeline_mesh_cadence_contract + pipeline_export_mesh_contract + camera_basis_contract + fusion_ui_validation_contract registered (label=cpu)")
+# 12) big-fix todo 30: ply_writer_contract must drive the REAL PLY writer, not a
+#     local schema/byte replica. Same discipline as gate 1/4/5/6/7/8/9/10/11:
+#     comments are stripped first, so only a genuine CALL SHAPE (receiver
+#     '.'/'>'/'::' + name + '(') satisfies it. Both PLY-07 halves must be exercised,
+#     so writeBinary AND writeASCII call shapes are demanded, the target must link
+#     azu_test_core, and azu_test_core must carry the real src/export/PLYExporter.cpp
+#     (through its src/export/*.cpp glob) -- a test that re-implemented its own
+#     PLY schema would link nothing and satisfy neither half.
+get_target_property(AZU_PLY_TEST_SOURCES ply_writer_contract SOURCES)
+if(NOT AZU_PLY_TEST_SOURCES)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: ply_writer_contract has no SOURCES.")
+endif()
+set(AZU_PLY_TEST_TEXT "")
+foreach(_azu_ply_src ${AZU_PLY_TEST_SOURCES})
+    get_filename_component(_azu_ply_abs "${_azu_ply_src}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(NOT EXISTS "${_azu_ply_abs}")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: registered ply_writer_contract source ${_azu_ply_abs} does not exist.")
+    endif()
+    file(READ "${_azu_ply_abs}" _azu_ply_txt)
+    azu_strip_c_comments(_azu_ply_txt_code _azu_ply_txt)
+    string(APPEND AZU_PLY_TEST_TEXT "${_azu_ply_txt_code}")
+endforeach()
+foreach(_azu_ply_call writeBinary writeASCII)
+    if(NOT AZU_PLY_TEST_TEXT MATCHES "[.>:]${_azu_ply_call}[ \t\r\n]*\\(")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: the ply_writer_contract source must call ${_azu_ply_call}() "
+            "on the real kfusion::export_io::PLYExporter (a comment or string literal naming it "
+            "is not a call). A local PLY schema/byte replica does not satisfy this todo.")
+    endif()
+endforeach()
+get_target_property(AZU_PLY_TEST_LINKS ply_writer_contract LINK_LIBRARIES)
+if(NOT "${AZU_PLY_TEST_LINKS}" MATCHES "azu_test_core")
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: ply_writer_contract must link azu_test_core, "
+        "got: ${AZU_PLY_TEST_LINKS}")
+endif()
+# Positive coupling: azu_test_core has to CARRY the real PLY writer TU.
+get_target_property(AZU_PLY_CORE_SOURCES azu_test_core SOURCES)
+if(NOT AZU_PLY_CORE_SOURCES)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: azu_test_core has no SOURCES.")
+endif()
+set(AZU_TEST_CORE_HAS_PLY_TU FALSE)
+foreach(_azu_core_src ${AZU_PLY_CORE_SOURCES})
+    file(TO_CMAKE_PATH "${_azu_core_src}" _azu_core_norm)
+    if(_azu_core_norm MATCHES "(^|/)src/export/PLYExporter\\.cpp$")
+        set(AZU_TEST_CORE_HAS_PLY_TU TRUE)
+    endif()
+endforeach()
+if(NOT AZU_TEST_CORE_HAS_PLY_TU)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: azu_test_core must compile the real src/export/PLYExporter.cpp "
+        "as one source-list element; ply_writer_contract would otherwise test a replica "
+        "instead of the product PLY writer.")
+endif()
+
+message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract + pipeline_state_contract + pipeline_mesh_cadence_contract + pipeline_export_mesh_contract + camera_basis_contract + fusion_ui_validation_contract + ply_writer_contract registered (label=cpu)")
