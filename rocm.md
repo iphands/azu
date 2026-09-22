@@ -1,7 +1,21 @@
 # rocm.md
 
-**⚠️ CUDA/NVIDIA Path Status: DEPRECATED**
-The CUDA (NVIDIA) code path is currently **untested and may not compile**. Due to lack of access to NVIDIA hardware for testing, the CUDA backend cannot be verified. The CUDA code remains in the codebase but is not actively maintained. Use the HIP (AMD) or CPU backend instead.
+**Status of this file: guidance for the DEFERRED HIP lane.**
+Nothing in this file has been exercised by this repository's QA. The five
+`src/**/*_hip.hip` translation units have never been compiled on this host, so there
+is no HIP build or HIP test result to cite — see
+[`docs/CUDA_HIP_DEFERRED_CHANGES.md`](docs/CUDA_HIP_DEFERRED_CHANGES.md)
+(audits `cross-backend:C1`, `cross-backend:C3`) for the compile gate a future HIP lane
+must establish first, and `README.md#backend-status` for what is actually built here
+(CPU/OpenMP only, `ctest --test-dir build-cpu-big-fix -L cpu --output-on-failure`).
+These porting rules are the input to that future lane, not evidence about the present.
+
+**⚠️ CUDA/NVIDIA Path Status: DEFERRED**
+The CUDA (NVIDIA) code path is **untested and may not compile**; there is no NVIDIA
+hardware here, and the code is not actively maintained. The CPU backend is the one
+that is built and tested. HIP is *not* a working alternative to fall back on — it is
+deferred for the same reason (never compiled), which is what the earlier "use HIP
+instead" wording in these docs got wrong.
 
 ## Goal
 

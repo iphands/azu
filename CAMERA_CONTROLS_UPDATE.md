@@ -27,6 +27,7 @@ This document details the newly introduced camera controls in the KinectFusionQt
   Added three `QSlider` widgets inside the `ControlPanel` corresponding to Pitch (X), Yaw (Y), and Roll (Z). These UI elements are bi-directionally bound to the `OpenGLWidget`.
 - **Rationality:**
   Providing dedicated visual sliders fulfills the requirement of discrete UI interaction for rotation. It makes exact alignments accessible for users preferring UI constraints over free-hand mouse drag, particularly useful for inspecting misalignments in the 3D scan on an explicit axis. Sliders are generally more intuitive and standard in 3D applications compared to dials.
+- **Status correction (2026-09-22, big-fix Todo 32 / audit `gui:GL-29`):** this is history, not the current UI. The three `QSlider` rotation widgets were dead weight (nothing drove them bidirectionally) and have since been **removed** from `ControlPanel`; the CPU gate now fails if the name reappears in `ControlPanel.*`. Rotation is still bi-directionally bound through `ControlPanel::setCameraRotation()` / `cameraRotationChanged()` and the on-canvas navigation gizmo — read the paragraph above as the design rationale that survived, not as a widget inventory.
 
 ### 5. Fly / Free Mode (WASD)
 - **What was changed:**

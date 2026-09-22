@@ -629,10 +629,11 @@ void SignalConditioner::fillDepthHoles(std::vector<uint16_t>& depth, float min_d
 }
 
 void SignalConditioner::guidedDepthFilter(std::vector<uint16_t>& depth, float min_depth_m, float max_depth_m) {
-    // PERFORMANCE NOTE: kGuidedRadius=9 produces a 19x19 kernel (~361 samples/pixel).
-    // At 640x480 this is ~110M multiply-adds per frame on the CPU path. If real-time
-    // performance is required, consider reducing kGuidedRadius to 4-5, or replacing
-    // with a separable bilateral approximation.
+    // PERFORMANCE NOTE: kGuidedRadius is 4, i.e. a 9x9 kernel (~81 samples/pixel,
+    // ~17M multiply-adds per 640x480 frame on the CPU path). It used to be 9 - a
+    // 19x19 kernel and ~110M multiply-adds per frame - which is why the constant
+    // carries that history at its definition. If more headroom is needed the next
+    // step is a separable bilateral approximation, not another radius cut.
     depth_scratch_ = depth;
 
     #pragma omp parallel for schedule(static) shared(depth, depth_scratch_, guidance_luma_, min_depth_m, max_depth_m)
