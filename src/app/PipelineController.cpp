@@ -72,7 +72,6 @@ bool PipelineController::startInternal(bool engage_sensor) {
     first_frame_          = true;
     model_ready_.store(false);
     frame_count_          = 0;
-    ui_skip_counter_      = 0;
     lost_log_counter_     = 0;
     success_log_counter_  = 0;
     hip_ui_skip_          = 0;
@@ -311,11 +310,6 @@ void PipelineController::setHyperparams(const FusionHyperparams &h) {
       hp.min_depth, hp.max_depth, hp.tsdf.voxel_size * 1000.0f, hp.sr_scale);
 }
 
-void PipelineController::setMetricsCallback(MetricsCallback cb) {
-  std::lock_guard<std::mutex> lk(callback_mutex_);
-  metrics_cb_ = std::move(cb);
-}
-
 void PipelineController::setFrameReadyCallback(FrameReadyCallback cb) {
   std::lock_guard<std::mutex> lk(callback_mutex_);
   frame_ready_cb_ = std::move(cb);
@@ -549,7 +543,6 @@ void PipelineController::reset() {
         last_pose_ = Eigen::Matrix4f::Identity();
     }
     first_frame_          = true;
-    ui_skip_counter_      = 0;
     lost_log_counter_     = 0;
     success_log_counter_  = 0;
     hip_ui_skip_          = 0;
@@ -825,7 +818,7 @@ void PipelineController::trackingLoop() {
         // The frame is discarded, not deferred: holding it would only predict
         // against a model that does not exist yet. That startup loss is real, so
         // it is counted rather than silent.
-        releaseData(std::move(frame));
+        frame.reset();
         {
             std::lock_guard<std::mutex> lk(metrics_mutex_);
             ++metrics_.dropped_pre_model_frames;
@@ -1054,7 +1047,7 @@ void PipelineController::trackingLoop() {
                  std::swap(integration_queue_, empty);
             }
             state_.store(PipelineState::TrackingLost);
-            releaseData(std::move(frame));
+            frame.reset();
         }
     }
 }
@@ -1138,7 +1131,7 @@ void PipelineController::integrationLoop() {
 
     // 2. Generate model frame for tracking (Ping-Pong back buffer)
     int integrated_count = tsdf_->integratedFrames();
-    if (integrated_count % 1 == 0) { // Raycast every frame for better tracking
+    { // Raycast on every integration; the block scopes the back-buffer bindings.
       int back = model_buffers_.back_idx.load();
       auto &model_back = *(model_buffers_.buffers[back]);
 
@@ -1317,8 +1310,9 @@ void PipelineController::integrationLoop() {
                   integrated_count);
     }
 
-    // Return frame to pool!
-    releaseData(std::move(frame));
+    // Drop the worker's reference; the frame's custom deleter recycles it into
+    // the pool once every other owner has dropped theirs.
+    frame.reset();
 
     // Mesh cadence: time-based, and a fire-and-forget version bump. The old rule
     // (one request every 5 integrated frames) coupled mesh rate to capture rate,
@@ -1575,10 +1569,6 @@ std::shared_ptr<sensor::FrameData> PipelineController::acquireFreeData() {
         std::lock_guard<std::mutex> lk_inner(state->mutex);
         state->free_data_queue.push(raw_ptr);
       });
-}
-
-void PipelineController::releaseData(std::shared_ptr<sensor::FrameData>) {
-  // Managed by custom deleter
 }
 
 #ifdef AZU_PIPELINE_TEST_SEAM

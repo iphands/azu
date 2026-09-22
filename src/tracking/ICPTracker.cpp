@@ -15,10 +15,10 @@
 namespace kfusion {
 namespace tracking {
 
-static float getFx(int level) { return static_cast<float>(sensor::FX) / (1 << level); }
-static float getFy(int level) { return static_cast<float>(sensor::FY) / (1 << level); }
-static float getCx(int level) { return static_cast<float>(sensor::CX) / (1 << level); }
-static float getCy(int level) { return static_cast<float>(sensor::CY) / (1 << level); }
+// tracking:CPU-8: the level-scaled intrinsic helpers that used to sit here had
+// zero call sites. Projection is intentionally full-resolution at every pyramid
+// level (the model frame is built at full res); both backends do the same.
+// Do not "restore" per-level intrinsics without first rescaling the model side.
 
 ICPParams ICPTracker::sanitizeParams(const ICPParams& params) {
     ICPParams out = params;

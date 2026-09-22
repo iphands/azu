@@ -9,7 +9,6 @@ class QComboBox;
 class QSpinBox;
 class QDoubleSpinBox;
 class QLabel;
-class QSlider;
 class QGroupBox;
 class QCheckBox;
 QT_END_NAMESPACE

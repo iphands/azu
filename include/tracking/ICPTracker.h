@@ -163,16 +163,12 @@ private:
                            int&   inlier_count,
                            int&   valid_live,
                            int&   valid_model,
-                           int&   projected,
-                           int&   dist_filtered,
-                           int&   angle_filtered);
-
-    // Project model into current frame space
-    void projectModel(const ModelFrame&      model,
-                      const Eigen::Matrix4f& pose,
-                      int                    level,
-                      std::vector<Eigen::Vector3f>& proj_vertices,
-                      std::vector<Eigen::Vector3f>& proj_normals);
+                            int&   projected,
+                            int&   dist_filtered,
+                            int&   angle_filtered);
+    // tracking:CPU-7: there is deliberately no separate model-projection member
+    // here — projection lives inline in `buildLinearSystem`, at
+    // full-resolution intrinsics on every path.
 };
 
 } // namespace tracking

@@ -10,12 +10,6 @@
 namespace kfusion {
 namespace meshing {
 
-struct Triangle {
-    Eigen::Vector3f v[3];
-    Eigen::Vector3f n[3];
-    uint8_t         c[3][3]; // RGB per vertex
-};
-
 struct MeshData {
     std::vector<Eigen::Vector3f> positions;
     std::vector<Eigen::Vector3f> normals;
@@ -44,25 +38,6 @@ struct MeshData {
     // that a non-empty color buffer holds precisely one RGB triple per vertex, so
     // this cannot report true for a half-filled color vector.
     bool hasColors() const { return !colors.empty(); }
-
-    void reserve(size_t tri_count) {
-        positions.reserve(tri_count * 3);
-        normals.reserve(tri_count * 3);
-        colors.reserve(tri_count * 3 * 3);
-        indices.reserve(tri_count * 3);
-    }
-
-    void addTriangle(const Triangle& tri) {
-        for (int i = 0; i < 3; ++i) {
-            uint32_t vidx = static_cast<uint32_t>(positions.size());
-            positions.push_back(tri.v[i]);
-            normals.push_back(tri.n[i]);
-            colors.push_back(tri.c[i][0]);
-            colors.push_back(tri.c[i][1]);
-            colors.push_back(tri.c[i][2]);
-            indices.push_back(vidx);
-        }
-    }
 
     // Contract every exporter must satisfy before it touches a file: this mesh can
     // be indexed and serialized without reading out of bounds or emitting

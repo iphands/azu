@@ -78,7 +78,6 @@ struct PipelineMetrics {
     PipelineState state         = PipelineState::Idle;
 };
 
-using MetricsCallback    = std::function<void(const PipelineMetrics&)>;
 using FrameReadyCallback = std::function<void(const sensor::FrameData&)>;
 using MeshReadyCallback  = std::function<void()>; // mesh updated in shared mesh
 
@@ -122,7 +121,6 @@ public:
      * releasing that lock, so a subscriber may re-enter the controller and a
      * replacement can never mutate a callback mid-invocation.
      */
-    void setMetricsCallback(MetricsCallback cb);
     void setFrameReadyCallback(FrameReadyCallback cb);
     void setMeshReadyCallback(MeshReadyCallback cb);
 
@@ -177,12 +175,12 @@ private:
     // Metrics
     PipelineMetrics            metrics_;
     mutable std::mutex         metrics_mutex_;
-    // Leaf lock guarding the three callback members. It is held ONLY to assign
+    // Leaf lock guarding the two callback members. It is held ONLY to assign
     // or copy a std::function; every invocation happens after it is released, so
     // no subscriber ever runs under it and it can never invert with a component
-    // lock.
+    // lock. Metrics have no callback member on purpose: the UI polls
+    // metricsSnapshot().
     mutable std::mutex         callback_mutex_;
-    MetricsCallback            metrics_cb_;
     FrameReadyCallback         frame_ready_cb_;
     MeshReadyCallback          mesh_ready_cb_;
 
@@ -246,7 +244,6 @@ private:
 
     // Per-instance log throttle counters — replaces static locals in worker threads
     // to avoid UB data races when threads are stopped and restarted.
-    int                                   ui_skip_counter_      = 0;
     int                                   lost_log_counter_     = 0;
     int                                   success_log_counter_  = 0;
     // HIP UI preview throttle — every N integrated frames to avoid starving
@@ -374,9 +371,11 @@ private:
     MeshReadyCallback  meshReadyCallbackCopy() const;
     bool               hasFrameReadyCallback() const;
 
-    // Pool helpers
+    // Pool helper. Recycling is owned by the shared_ptr custom deleter installed
+    // by acquireFreeData(): the frame returns to the pool when its last owner
+    // drops the reference. There is deliberately no manual release call — a
+    // caller that wants to recycle early drops its own reference.
     std::shared_ptr<sensor::FrameData> acquireFreeData();
-    void releaseData(std::shared_ptr<sensor::FrameData> data);
     
 public:
     /**

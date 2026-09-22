@@ -18,29 +18,6 @@ Eigen::Matrix4f kinectToOpenGL() {
     return F;
 }
 
-Eigen::Matrix4f sensorProjection(int viewport_w, int viewport_h,
-                                 float near_z = 0.05f,
-                                 float far_z = 10.0f) {
-    const float sx = static_cast<float>(viewport_w) / static_cast<float>(sensor::FRAME_W);
-    const float sy = static_cast<float>(viewport_h) / static_cast<float>(sensor::FRAME_H);
-    const float fx = static_cast<float>(sensor::FX) * sx;
-    const float fy = static_cast<float>(sensor::FY) * sy;
-    const float cx = (static_cast<float>(sensor::CX) + 0.5f) * sx;
-    const float cy = (static_cast<float>(sensor::CY) + 0.5f) * sy;
-    const float w  = static_cast<float>(viewport_w);
-    const float h  = static_cast<float>(viewport_h);
-
-    Eigen::Matrix4f P = Eigen::Matrix4f::Zero();
-    P(0, 0) = 2.0f * fx / w;
-    P(1, 1) = 2.0f * fy / h;
-    P(0, 2) = 1.0f - 2.0f * cx / w;
-    P(1, 2) = 2.0f * cy / h - 1.0f;
-    P(2, 2) = -(far_z + near_z) / (far_z - near_z);
-    P(2, 3) = -(2.0f * far_z * near_z) / (far_z - near_z);
-    P(3, 2) = -1.0f;
-    return P;
-}
-
 // Fixed light direction in world/GL space. It used to be a literal *inside* the
 // fragment shader, which is view space, so the highlight was welded to the
 // camera and never moved with the scene. It is now rotated into view space by

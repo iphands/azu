@@ -202,6 +202,64 @@ dossier_rows="$(grep -c '^| `' <<< "${dossier}" || true)"
 printf 'dossier gate: ok (%s deferred-change rows)\n' "${dossier_rows}"
 
 # ---------------------------------------------------------------------------
+# 3b. CPU dead-symbol grep gate: the absent-symbol checks below are a standing
+#     contract; any occurrence (code or comment) of a listed pattern anywhere
+#     in the CPU-owned scope fails the gate. Scope is CPU-owned source only: *.cpp / *.h / CMakeLists.txt under src/,
+#     include/, tests/ and the root CMakeLists.txt. Backend translation units
+#     (*.cu / *.hip / *.cuh) and include/tsdf/VoxelGPU.h are excluded twice
+#     over: the include globs never match them and a defensive filter drops
+#     them from any hit list. Deferred BACKEND dead code (dossier rows
+#     cross-backend:A34 syncFromGPU/getGPUDepthRaw, cross-backend:A35,
+#     cross-backend:B2 ICPParams::min_depth/max_depth, tsdf:T18 integrateGPU
+#     R_cw/t_cw, tsdf:T25 VoxelGPU.h ALIGN32) is deliberately NOT scanned: it
+#     lives in backend files or backend-guarded regions and only a future
+#     compiled backend lane may remove it. This section never invokes any
+#     backend; grep is its only tool.
+# ---------------------------------------------------------------------------
+dead_symbol_absent_check() {
+    local label="$1" pattern="$2"
+    shift 2
+    local -a globs=("$@")
+    [ "${#globs[@]}" -gt 0 ] || globs=('*.cpp' '*.h' 'CMakeLists.txt')
+    local -a includes=()
+    local g
+    for g in "${globs[@]}"; do includes+=(--include="${g}"); done
+    local hits
+    hits="$(grep -rnE "${includes[@]}" -e "${pattern}" \
+        "${REPO_ROOT}/src" "${REPO_ROOT}/include" "${REPO_ROOT}/tests" \
+        "${REPO_ROOT}/CMakeLists.txt" 2>/dev/null |
+        grep -vE '(^|/)VoxelGPU\.h:|_cuda\.cu:|_hip\.hip:|\.cuh:' || true)"
+    if [ -n "${hits}" ]; then
+        printf '%s\n' "${hits}" >&2
+        die "dead-symbol gate: ${label} reintroduced in CPU scope (pattern: ${pattern})"
+    fi
+    printf 'dead-symbol gate: absent in CPU scope: %s (%s)\n' "${label}" "${pattern}"
+}
+dead_symbol_absent_check 'tracking:CPU-7 model-projection member' 'projectModel'
+dead_symbol_absent_check 'tracking:CPU-8 level-scaled intrinsic helpers' '\bget(Fx|Fy|Cx|Cy)\b'
+dead_symbol_absent_check 'gui:GL-23 dead preview projection' 'sensorProjection'
+dead_symbol_absent_check 'gui:GL-29 unused slider widget' 'QSlider' 'ControlPanel.*'
+dead_symbol_absent_check 'pipeline:PC-26 metrics callback plumbing + UI skip counter' \
+    'MetricsCallback|metrics_cb_|setMetricsCallback|ui_skip_counter_'
+dead_symbol_absent_check 'pipeline:PC-20 no-op frame release helper' 'releaseData'
+dead_symbol_absent_check 'pipeline:PC-16 always-true modulo' '% 1 == 0' 'PipelineController.cpp'
+dead_symbol_absent_check 'app:JS-01/RB-01..03 unused JobSystem + RingBuffer' 'RingBuffer|JobSystem'
+dead_symbol_absent_check 'app:JS-04 removed std::result_of usage' 'std::result_of'
+dead_symbol_absent_check 'meshing:D6 dead triangle struct + adder' 'struct Triangle|addTriangle'
+dead_symbol_absent_check 'meshing:D4 dead final-mesh member' 'mesh_final'
+dead_symbol_absent_check 'meshing duplicate hashers (todo 17 lineage)' 'VectorHash|VertexHasher'
+dead_symbol_absent_check 'tsdf:T24 false bounds-checked doc claim' 'bounds checked' 'TSDFVolume.*'
+
+# Backend-file tripwire: this plan is CPU-only, so the working tree (staged or
+# unstaged, relative to HEAD) must never touch a backend TU or the GPU voxel
+# header. Vacuously true after a clean commit; its teeth are during development.
+backend_touches="$(git -C "${REPO_ROOT}" diff --name-only HEAD 2>/dev/null |
+    grep -E '\.(cu|hip|cuh)$|VoxelGPU\.h$' || true)"
+[ -z "${backend_touches}" ] ||
+    die "CPU-only plan constraint violated: backend files modified: $(tr '\n' ' ' <<< "${backend_touches}")"
+printf 'backend-file tripwire: 0 backend files touched vs HEAD\n'
+
+# ---------------------------------------------------------------------------
 # 4. Fresh CPU-only gate build (never Release-mutating, never backend)
 # ---------------------------------------------------------------------------
 cd "${REPO_ROOT}"

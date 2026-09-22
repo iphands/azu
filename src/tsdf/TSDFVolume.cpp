@@ -1,6 +1,7 @@
 #include "tsdf/TSDFVolume.h"
 #include "utils/ColorMath.h"
 #include "utils/CoordinateMath.h"
+#include <cassert>
 #include <climits>
 #include <cstdint>
 #include <iostream>
@@ -539,10 +540,12 @@ float TSDFVolume::getTSDF(const Eigen::Vector3f& world_pos) const {
 }
 
 const Voxel& TSDFVolume::voxelAt(int x, int y, int z) const {
+    assert(inBounds(x, y, z));
     return voxels_[idx(x, y, z)];
 }
 
 Voxel& TSDFVolume::voxelAt(int x, int y, int z) {
+    assert(inBounds(x, y, z));
     return voxels_[idx(x, y, z)];
 }
 

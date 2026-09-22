@@ -110,7 +110,10 @@ public:
     // Reset all voxels to initial state
     void reset();
 
-    // Get voxel at integer coordinates (bounds checked)
+    // Get voxel at integer coordinates. PRECONDITION: x, y, z are all inside
+    // [0, resolution) — callers consult inBounds()/their own loop bounds first.
+    // The precondition is assert-checked in debug builds; release builds do the
+    // bare indexed read on purpose (this sits in the meshing hot path).
     const Voxel& voxelAt(int x, int y, int z) const;
     Voxel&       voxelAt(int x, int y, int z);
 

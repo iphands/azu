@@ -13,7 +13,6 @@
 #include <QGridLayout>
 #include <QFrame>
 #include <QScrollArea>
-#include <QSlider>
 #include "gui/NavigationGizmo.h"
 #include "gui/FusionUiModel.h"
 #include "utils/Logger.h"
