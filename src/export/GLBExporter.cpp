@@ -27,8 +27,12 @@ static Eigen::Vector3f toGLTF(const Eigen::Vector3f& v) {
 }
 
 bool GLBExporter::write(const meshing::MeshData& input_mesh, const std::string& filepath) {
-    if (input_mesh.empty()) {
-        KFLOG_WARN("GLBExport", "Mesh is empty, nothing to export.");
+    // Runs before the weld loop, which indexes positions/normals/colors with
+    // these raw indices: an out-of-range index is UB before any file is opened.
+    std::string reason;
+    if (!input_mesh.validate(&reason)) {
+        KFLOGF_ERROR("GLBExport", "Invalid mesh, nothing written to %s: %s",
+                     filepath.c_str(), reason.c_str());
         return false;
     }
 
@@ -79,6 +83,16 @@ bool GLBExporter::write(const meshing::MeshData& input_mesh, const std::string& 
 
     KFLOGF_INFO("GLBExport", "Welded mesh: %zu vertices, %zu indices (has_normals=%d, has_colors=%d)", 
                 nvert, nidx, has_normals, has_colors);
+
+    // Defense-in-depth before any accessor/binary payload is derived from the
+    // weld, and semantics-preserving: the weld only copies already-validated
+    // positions/normals/colors and rebuilds indices from new_idx, so a valid
+    // input always welds to a valid mesh. Firing means the weld itself broke.
+    if (!mesh.validate(&reason)) {
+        KFLOGF_ERROR("GLBExport", "Welded mesh is invalid, nothing written to %s: %s",
+                     filepath.c_str(), reason.c_str());
+        return false;
+    }
 
     // ---------------------------------------------------------
     // Build binary buffer

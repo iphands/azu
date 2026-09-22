@@ -154,6 +154,23 @@ target_link_libraries(tsdf_reset_contract PRIVATE azu_test_core)
 add_test(NAME tsdf_reset_contract COMMAND tsdf_reset_contract)
 set_tests_properties(tsdf_reset_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 10: CPU-only mesh validation + export reject contract ----
+# MeshData::validate() invariants and the three public export entry points
+# (PLYExporter::writeBinary / writeASCII, GLBExporter::write). Every defect case
+# must be rejected BEFORE the exporter writes: the contract asserts the target
+# path stays absent, so an export that opens the file first cannot pass. Valid
+# meshes must still produce a PLY/GLB whose format magic (and, for GLB, the
+# header total length) matches what was written. Files live only in a
+# process-unique subdirectory of std::filesystem::temp_directory_path(), removed
+# at exit; nothing is written inside the repository and there is no GPU, sensor,
+# display, thread-timing or network access.
+add_executable(mesh_validation_contract mesh_validation_contract.cpp)
+target_compile_definitions(mesh_validation_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(mesh_validation_contract PRIVATE azu_test_core)
+
+add_test(NAME mesh_validation_contract COMMAND mesh_validation_contract)
+set_tests_properties(mesh_validation_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that

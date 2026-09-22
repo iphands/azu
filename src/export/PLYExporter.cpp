@@ -9,8 +9,10 @@ namespace export_io {
 bool PLYExporter::writeBinary(const meshing::MeshData& mesh,
                                const std::string& filepath)
 {
-    if (mesh.empty()) {
-        std::cerr << "[PLY] Mesh is empty, nothing to export.\n";
+    std::string reason;
+    if (!mesh.validate(&reason)) {
+        std::cerr << "[PLY] Invalid mesh, nothing written to " << filepath << ": "
+                  << reason << "\n";
         return false;
     }
 
@@ -95,8 +97,10 @@ bool PLYExporter::writeBinary(const meshing::MeshData& mesh,
 bool PLYExporter::writeASCII(const meshing::MeshData& mesh,
                               const std::string& filepath)
 {
-    if (mesh.empty()) {
-        std::cerr << "[PLY] Mesh is empty.\n";
+    std::string reason;
+    if (!mesh.validate(&reason)) {
+        std::cerr << "[PLY] Invalid mesh, nothing written to " << filepath << ": "
+                  << reason << "\n";
         return false;
     }
 
