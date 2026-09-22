@@ -36,6 +36,12 @@ MainWindow::MainWindow(sensor::PreprocessBackend preferred_backend, QWidget* par
 }
 
 MainWindow::~MainWindow() {
+    // The join order here is load-bearing (Todo 26): worker threads call
+    // controller methods through a captured raw PipelineController pointer,
+    // and joining every worker while *this is still a live QObject is what
+    // makes both that pointer and the workers' queued completion posts safe.
+    // Only after the join may the controller be stopped/freed.
+    joinBackgroundWorkers();
     if (pipeline_) pipeline_->stop();
 }
 
@@ -136,62 +142,145 @@ void MainWindow::onStopClicked() {
     statusBar()->showMessage("Stopped.");
 }
 
+void MainWindow::joinBackgroundWorkers() {
+    for (auto& t : background_workers_) {
+        if (t.joinable()) t.join();
+    }
+    background_workers_.clear();
+}
+
+void MainWindow::startBackgroundOp(BackgroundOp op, std::function<bool()> work) {
+    if (busy_op_ != BackgroundOp::None) return;
+    // Any previously finished worker is reaped here: its completion was
+    // already delivered on this thread (busy_op_ is None), so its thread is
+    // at most one postEvent call from exit and the join cannot stall.
+    joinBackgroundWorkers();
+    busy_op_ = op;
+    background_workers_.emplace_back([this, op, work = std::move(work)]() mutable {
+        bool ok = false;
+        try {
+            ok = work();
+        } catch (...) {
+            // A throwing controller call is a FAILED operation — never a
+            // silent success and never a crash on a background thread.
+            ok = false;
+        }
+        // Truthful completion, marshalled onto the GUI thread. `this` is
+        // alive at this call because ~MainWindow joins every worker before
+        // returning; and because the functor's context is `this`, Qt drops
+        // it unexecuted if the window finishes destruction before the event
+        // is processed. finishBackgroundOp therefore never runs on a dead
+        // object and never fabricates a completion for an abandoned op.
+        QMetaObject::invokeMethod(this, [this, op, ok]() {
+            finishBackgroundOp(op, ok);
+        }, Qt::QueuedConnection);
+    });
+}
+
 void MainWindow::onResetClicked() {
+    if (busy_op_ != BackgroundOp::None) return;
     const bool was_capturing = pipeline_->isRunning();
 
-    pipeline_->reset();
-
+    // Truthful immediate state: the user asked to clear the volume, so the
+    // viewport and export affordances go empty/disabled NOW; lifecycle
+    // buttons latch off so nothing can overlap the reset while it runs.
     if (gl_widget_) gl_widget_->clearGeometry();
+    mesh_available_ = false;
     control_panel_->setExportEnabled(false);
+    control_panel_->setBusy(true);
+    reset_restart_capture_ = was_capturing;
+    statusBar()->showMessage("Resetting scan... (this runs in the background)");
 
-    if (was_capturing) {
-        if (!pipeline_->start()) {
-            QMessageBox::critical(this, "Error",
-                "Scan was reset but failed to restart capture.\n"
-                "Check the Kinect connection and press Start again.");
-            control_panel_->onPipelineStopped();
-            statusBar()->showMessage("Reset failed to restart — press Start.");
-        } else {
-            control_panel_->onPipelineStarted();
-            statusBar()->showMessage("Scan reset — capturing again.");
-        }
-    } else {
-        control_panel_->onPipelineStopped();
-        statusBar()->showMessage("Volume cleared. Press Start to capture.");
-    }
+    // reset() joins the pipeline workers and clears the volume; start()
+    // reopens the sensor. Both are controller-thread-safe and touch no Qt —
+    // exactly the work that must NOT run on the GUI thread.
+    app::PipelineController* pipeline = pipeline_.get();
+    startBackgroundOp(BackgroundOp::Reset, [pipeline, was_capturing]() {
+        pipeline->reset();
+        return !was_capturing || pipeline->start();
+    });
+}
 
-    if (metrics_panel_) metrics_panel_->update(pipeline_->metricsSnapshot());
+void MainWindow::startExport(BackgroundOp op, const QString& path) {
+    if (busy_op_ != BackgroundOp::None) return;
+    const QString label = (op == BackgroundOp::ExportPly) ? "PLY" : "GLB";
+    control_panel_->setExportEnabled(false);
+    control_panel_->setBusy(true);
+    statusBar()->showMessage("Exporting " + label + "... (this runs in the background)");
+
+    app::PipelineController* pipeline = pipeline_.get();
+    const std::string native_path = path.toStdString();
+    const bool to_ply = (op == BackgroundOp::ExportPly);
+    startBackgroundOp(op, [pipeline, to_ply, native_path]() {
+        // exportPLY()/exportGLB() are thin wrappers over the shared
+        // PipelineController::exportMesh(path, writer_fn) helper: mesh
+        // acquisition (possibly one bounded extraction request) plus the
+        // actual file write, all off the GUI thread.
+        return to_ply ? pipeline->exportPLY(native_path)
+                      : pipeline->exportGLB(native_path);
+    });
 }
 
 void MainWindow::onExportPLY() {
     QString path = QFileDialog::getSaveFileName(
         this, "Export PLY", "scan.ply", "PLY Files (*.ply)");
     if (path.isEmpty()) return;
-
-    statusBar()->showMessage("Exporting PLY...");
-    bool ok = pipeline_->exportPLY(path.toStdString());
-    statusBar()->showMessage(ok ? ("PLY exported: " + path) : "PLY export FAILED.");
-    if (!ok) {
-        QMessageBox::warning(
-            this,
-            "Export Error",
-            "PLY export failed.\nScan a little more so a mesh can be extracted, then try again.");
-    }
+    startExport(BackgroundOp::ExportPly, path);
 }
 
 void MainWindow::onExportGLB() {
     QString path = QFileDialog::getSaveFileName(
         this, "Export GLB", "scan.glb", "GLB Files (*.glb)");
     if (path.isEmpty()) return;
+    startExport(BackgroundOp::ExportGlb, path);
+}
 
-    statusBar()->showMessage("Exporting GLB...");
-    bool ok = pipeline_->exportGLB(path.toStdString());
-    statusBar()->showMessage(ok ? ("GLB exported: " + path) : "GLB export FAILED.");
-    if (!ok) {
-        QMessageBox::warning(
-            this,
-            "Export Error",
-            "GLB export failed.\nScan a little more so a mesh can be extracted, then try again.");
+void MainWindow::finishBackgroundOp(BackgroundOp op, bool ok) {
+    // Runs on the GUI thread (queued from the worker), after the controller
+    // work is truly done. Restore every latched control from the REAL state,
+    // not from an assumption: pipeline_->isRunning() and mesh_available_ are
+    // re-read here so success and failure paths both land truthfully.
+    busy_op_ = BackgroundOp::None;
+
+    switch (op) {
+    case BackgroundOp::ExportPly:
+    case BackgroundOp::ExportGlb: {
+        const QString label = (op == BackgroundOp::ExportPly) ? "PLY" : "GLB";
+        control_panel_->setBusy(false);
+        if (pipeline_->isRunning()) control_panel_->onPipelineStarted();
+        else                        control_panel_->onPipelineStopped();
+        control_panel_->setExportEnabled(mesh_available_);
+        if (ok) {
+            statusBar()->showMessage(label + " export complete.");
+        } else {
+            statusBar()->showMessage(label + " export FAILED.");
+            QMessageBox::warning(
+                this, "Export Error",
+                label + " export failed.\nScan a little more so a mesh can be extracted, then try again.");
+        }
+        break;
+    }
+    case BackgroundOp::Reset: {
+        const bool was_capturing = reset_restart_capture_;
+        control_panel_->setBusy(false);
+        if (pipeline_->isRunning()) control_panel_->onPipelineStarted();
+        else                        control_panel_->onPipelineStopped();
+        control_panel_->setExportEnabled(mesh_available_);
+        if (was_capturing && !ok) {
+            QMessageBox::critical(this, "Error",
+                "Scan was reset but failed to restart capture.\n"
+                "Check the Kinect connection and press Start again.");
+            statusBar()->showMessage("Reset failed to restart — press Start.");
+        } else if (was_capturing) {
+            statusBar()->showMessage("Scan reset — capturing again.");
+        } else {
+            statusBar()->showMessage("Volume cleared. Press Start to capture.");
+        }
+        if (metrics_panel_) metrics_panel_->update(pipeline_->metricsSnapshot());
+        break;
+    }
+    case BackgroundOp::None:
+        break;
     }
 }
 
@@ -213,7 +302,11 @@ void MainWindow::onMeshReady() {
 
     if (gl_widget_ && mesh) {
         gl_widget_->updateMesh(*mesh);
-        control_panel_->setExportEnabled(true);
+        mesh_available_ = true;
+        // A mesh can land WHILE a background export/reset owns the buttons;
+        // re-enabling mid-op would lie about the latched state, so the
+        // availability is recorded and finishBackgroundOp() replays it.
+        if (busy_op_ == BackgroundOp::None) control_panel_->setExportEnabled(true);
     }
 
 }

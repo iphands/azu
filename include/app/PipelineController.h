@@ -94,6 +94,25 @@ public:
     /** True while capture + pipeline worker threads are active. */
     bool isRunning() const { return running_.load(); }
 
+    /**
+     * Writer callback for exportMesh(). It is invoked on the CALLER's thread
+     * with a stable mesh snapshot and the target path, and must return true
+     * only when a complete file was written. It must not touch Qt objects.
+     */
+    using MeshWriterFn =
+        std::function<bool(const meshing::MeshData&, const std::string&)>;
+
+    /**
+     * Shared export core behind exportPLY() / exportGLB(): obtain a non-empty
+     * mesh snapshot (requesting exactly one extraction and waiting a bounded
+     * time for THAT version if the shared mesh is empty), then write it
+     * through writer_fn. Thread-safe: no Qt object is touched and no Qt
+     * thread affinity is required, which is what lets the GUI run exports on
+     * a background worker thread (big-fix Todo 26). A writer_fn that throws
+     * counts as a failed export, never as a crash and never as success.
+     */
+    bool exportMesh(const std::string& path, const MeshWriterFn& writer_fn);
+
     bool exportPLY(const std::string& path);
     bool exportGLB(const std::string& path);
 

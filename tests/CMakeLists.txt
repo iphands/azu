@@ -172,6 +172,26 @@ set_tests_properties(pipeline_mesh_cadence_contract PROPERTIES
     # hang detector for a mesh worker that never wakes.
 )
 
+# ---- big-fix todo 26: CPU-only shared export helper (exportMesh) contract ----
+# Drives the REAL controller (never started, so no worker thread and no
+# extraction can race a write) through exportMesh(path, writer_fn) and proves:
+# an empty shared mesh refuses without ever invoking the writer; a published
+# mesh reaches writer_fn as the same object with the exact path; false and
+# throwing writers are failed exports; and exportPLY/exportGLB are byte-for-
+# byte identical to direct PLYExporter/GLBExporter calls (both route through
+# the one helper). The only wait is the documented bounded 5 s mesh-request
+# timeout on the empty-mesh path; no device, display, GPU or thread timing.
+add_executable(pipeline_export_mesh_contract pipeline_export_mesh_contract.cpp)
+target_compile_definitions(pipeline_export_mesh_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(pipeline_export_mesh_contract PRIVATE azu_test_pipeline)
+
+add_test(NAME pipeline_export_mesh_contract COMMAND pipeline_export_mesh_contract)
+set_tests_properties(pipeline_export_mesh_contract PROPERTIES
+    LABELS cpu TIMEOUT 120
+    # 5 s request timeout + four small file writes; the cap protects against a
+    # request wait that never becomes bounded.
+)
+
 # ---- big-fix todo 6: Marching Cubes fail-before-fix contracts ----
 # marching_cubes_table_contract is CPU-only (header + integer math, no volume)
 # and validates all 256 rows against an independent crossing-edge oracle: it
@@ -842,4 +862,40 @@ if(NOT "${AZU_MESH_TEST_LINKS}" MATCHES "azu_test_pipeline")
         "got: ${AZU_MESH_TEST_LINKS}")
 endif()
 
-message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract + pipeline_state_contract + pipeline_mesh_cadence_contract registered (label=cpu)")
+# 9) big-fix todo 26: pipeline_export_mesh_contract must drive the REAL
+#    controller's shared export helper and BOTH public export wrappers. Same
+#    discipline as gate 1/4/5/6/7/8: comments are stripped, so only a genuine
+#    call shape (receiver '.'/'>'/'::' + name + '(') configures, and the
+#    target must link azu_test_pipeline (the real controller TU).
+get_target_property(AZU_EXPORT_TEST_SOURCES pipeline_export_mesh_contract SOURCES)
+if(NOT AZU_EXPORT_TEST_SOURCES)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: pipeline_export_mesh_contract has no SOURCES.")
+endif()
+set(AZU_EXPORT_TEST_TEXT "")
+foreach(_azu_export_src ${AZU_EXPORT_TEST_SOURCES})
+    get_filename_component(_azu_export_abs "${_azu_export_src}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(NOT EXISTS "${_azu_export_abs}")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: registered pipeline_export_mesh_contract source ${_azu_export_abs} does not exist.")
+    endif()
+    file(READ "${_azu_export_abs}" _azu_export_txt)
+    azu_strip_c_comments(_azu_export_txt_code _azu_export_txt)
+    string(APPEND AZU_EXPORT_TEST_TEXT "${_azu_export_txt_code}")
+endforeach()
+foreach(_azu_export_call exportMesh exportPLY exportGLB sharedMesh metricsSnapshot)
+    if(NOT AZU_EXPORT_TEST_TEXT MATCHES "[.>:]${_azu_export_call}[ \t\r\n]*\\(")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: the pipeline_export_mesh_contract source must call ${_azu_export_call}() "
+            "on the real PipelineController (a comment or string literal naming it is not a call). "
+            "An exporter-only replica does not satisfy this todo.")
+    endif()
+endforeach()
+get_target_property(AZU_EXPORT_TEST_LINKS pipeline_export_mesh_contract LINK_LIBRARIES)
+if(NOT "${AZU_EXPORT_TEST_LINKS}" MATCHES "azu_test_pipeline")
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: pipeline_export_mesh_contract must link azu_test_pipeline, "
+        "got: ${AZU_EXPORT_TEST_LINKS}")
+endif()
+
+message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract + pipeline_state_contract + pipeline_mesh_cadence_contract + pipeline_export_mesh_contract registered (label=cpu)")

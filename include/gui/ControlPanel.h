@@ -43,6 +43,7 @@ public slots:
     void onPipelineStarted();
     void onPipelineStopped();
     void setExportEnabled(bool enabled);
+    void setBusy(bool busy);
     void setCameraRotation(int pitch, int yaw, int roll);
     void onPresetChanged(int index);
 

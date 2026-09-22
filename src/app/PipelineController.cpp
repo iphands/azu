@@ -1506,7 +1506,8 @@ bool PipelineController::awaitMeshVersion(uint64_t version,
   });
 }
 
-bool PipelineController::exportPLY(const std::string &path) {
+bool PipelineController::exportMesh(const std::string &path,
+                                    const MeshWriterFn &writer_fn) {
   uint64_t ver;
   auto mesh = shared_mesh_.snapshot(ver);
   if (!mesh || mesh->empty()) {
@@ -1526,7 +1527,16 @@ bool PipelineController::exportPLY(const std::string &path) {
     std::lock_guard<std::mutex> lk(metrics_mutex_);
     metrics_.export_pct = 50.0f;
   }
-  bool ok = export_io::PLYExporter::writeBinary(*mesh, path);
+  bool ok = false;
+  try {
+    ok = writer_fn(*mesh, path);
+  } catch (const std::exception &e) {
+    std::cerr << "[Pipeline] Export writer threw: " << e.what() << "\n";
+    ok = false;
+  } catch (...) {
+    std::cerr << "[Pipeline] Export writer threw an unknown error.\n";
+    ok = false;
+  }
   {
     std::lock_guard<std::mutex> lk(metrics_mutex_);
     metrics_.export_pct = ok ? 100.0f : 0.0f;
@@ -1534,32 +1544,18 @@ bool PipelineController::exportPLY(const std::string &path) {
   return ok;
 }
 
+bool PipelineController::exportPLY(const std::string &path) {
+  return exportMesh(path,
+                    [](const meshing::MeshData &mesh, const std::string &p) {
+                      return export_io::PLYExporter::writeBinary(mesh, p);
+                    });
+}
+
 bool PipelineController::exportGLB(const std::string &path) {
-  uint64_t ver;
-  auto mesh = shared_mesh_.snapshot(ver);
-  if (!mesh || mesh->empty()) {
-    std::cout << "[Pipeline] No mesh yet, requesting an extraction...\n";
-    // Request a version and wait for THAT version to be published, instead of
-    // polling a shared flag that another thread (or the cadence) could clear:
-    // the wait is now answered only by the mesh this request caused.
-    const uint64_t requested_version = requestMesh();
-    awaitMeshVersion(requested_version, std::chrono::milliseconds(5000));
-    mesh = shared_mesh_.snapshot(ver);
-  }
-  if (!mesh || mesh->empty()) {
-    std::cerr << "[Pipeline] No mesh to export — scan more frames first.\n";
-    return false;
-  }
-  {
-    std::lock_guard<std::mutex> lk(metrics_mutex_);
-    metrics_.export_pct = 50.0f;
-  }
-  bool ok = export_io::GLBExporter::write(*mesh, path);
-  {
-    std::lock_guard<std::mutex> lk(metrics_mutex_);
-    metrics_.export_pct = ok ? 100.0f : 0.0f;
-  }
-  return ok;
+  return exportMesh(path,
+                    [](const meshing::MeshData &mesh, const std::string &p) {
+                      return export_io::GLBExporter::write(mesh, p);
+                    });
 }
 
 std::shared_ptr<sensor::FrameData> PipelineController::acquireFreeData() {

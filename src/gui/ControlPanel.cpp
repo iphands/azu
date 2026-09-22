@@ -323,6 +323,16 @@ void ControlPanel::setExportEnabled(bool enabled) {
     btn_glb_->setEnabled(enabled);
 }
 
+void ControlPanel::setBusy(bool busy) {
+    // Latch lifecycle controls while a background pipeline operation (export
+    // or reset) owns the controller. This never claims a pipeline state: the
+    // caller restores the start/stop pair through onPipelineStarted()/
+    // onPipelineStopped(), which re-derives it from the real controller.
+    btn_start_->setEnabled(!busy);
+    btn_stop_->setEnabled(false);
+    btn_reset_->setEnabled(!busy);
+}
+
 void ControlPanel::setCameraRotation(int pitch, int yaw, int roll) {
     // Block signals to avoid infinite loop between mouse updates and slider updates
     nav_gizmo_->blockSignals(true);
