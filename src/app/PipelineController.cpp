@@ -179,6 +179,24 @@ bool PipelineController::startInternal(bool engage_sensor) {
         preprocessor_->reset();
     }
 
+    // Clear residual work and reset each queue's guarded shutdown predicate
+    // before launching workers, so start/stop is idempotent: a previous stop()
+    // may have left frames queued and left *_shutdown_ latched true. A worker
+    // must observe a clean (false) predicate at startup or it would exit on its
+    // first wait. Lock order: control_mutex_ (held) -> tracking_queue_mutex_
+    // (released) -> integration_queue_mutex_ (released); never both queue
+    // mutexes at once, so this cannot invert the order stop() uses.
+    {
+        std::lock_guard<std::mutex> lk(tracking_queue_mutex_);
+        tracking_shutdown_ = false;
+        while (!raw_queue_.empty()) raw_queue_.pop();
+    }
+    {
+        std::lock_guard<std::mutex> lk(integration_queue_mutex_);
+        integration_shutdown_ = false;
+        while (!integration_queue_.empty()) integration_queue_.pop();
+    }
+
     // Launch pipeline threads
     tracking_thread_    = std::thread(&PipelineController::trackingLoop, this);
     integration_thread_ = std::thread(&PipelineController::integrationLoop, this);
@@ -239,9 +257,29 @@ void PipelineController::stop() {
   sensor_->stop();
   sensor_->setFrameCallback(nullptr); // Unset to avoid late callbacks
 
-  // Wake up threads blocked on condition variables
-  tracking_queue_cv_.notify_all();
-  integration_queue_cv_.notify_all();
+  // Wake workers with NO lost wakeup: flip each queue's guarded shutdown
+  // predicate and notify while STILL HOLDING that queue's mutex. A worker
+  // evaluates its predicate and registers on the cv under the same mutex, so
+  // stop() cannot slip a state change into the "checked-but-not-yet-waiting"
+  // window: either stop() takes the mutex first (the worker then observes
+  // shutdown=true and never blocks) or the worker registers first (this
+  // notify_all wakes it). running_ alone cannot do this because it is stored
+  // outside the queue mutex.
+  //
+  // Lock order: control_mutex_ (held) -> tracking_queue_mutex_ (released) ->
+  // integration_queue_mutex_ (released). The two queue mutexes are never held
+  // at once, and no worker path acquires control_mutex_ while holding a queue
+  // mutex, so there is no ABBA inversion in either direction.
+  {
+      std::lock_guard<std::mutex> lk(tracking_queue_mutex_);
+      tracking_shutdown_ = true;
+      tracking_queue_cv_.notify_all();
+  }
+  {
+      std::lock_guard<std::mutex> lk(integration_queue_mutex_);
+      integration_shutdown_ = true;
+      integration_queue_cv_.notify_all();
+  }
 
   if (tracking_thread_.joinable())
     tracking_thread_.join();
@@ -472,8 +510,8 @@ void PipelineController::trackingLoop() {
     {
       std::unique_lock<std::mutex> lk(tracking_queue_mutex_);
       tracking_queue_cv_.wait(
-          lk, [&] { return !running_.load() || !raw_queue_.empty(); });
-      if (!running_.load())
+          lk, [&] { return tracking_shutdown_ || !raw_queue_.empty(); });
+      if (tracking_shutdown_)
         break;
       if (raw_queue_.empty())
         continue;
@@ -787,8 +825,8 @@ void PipelineController::integrationLoop() {
     {
       std::unique_lock<std::mutex> lk(integration_queue_mutex_);
       integration_queue_cv_.wait(
-          lk, [&] { return !running_.load() || !integration_queue_.empty(); });
-      if (!running_.load())
+          lk, [&] { return integration_shutdown_ || !integration_queue_.empty(); });
+      if (integration_shutdown_)
         break;
       if (integration_queue_.empty())
         continue;

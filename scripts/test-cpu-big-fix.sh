@@ -24,11 +24,16 @@ PROBE="${REPO_ROOT}/scripts/big-fix-env-probe.sh"
 CPU_LABEL="cpu"
 # Required CPU tests registered by tests/CMakeLists.txt. CTest 4.3 exits 0 with
 # "No tests were found!!!", so a green run without these names is NOT a pass.
-REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke")
-NM_TARGET="tests/pipeline_test_seam_smoke"
+REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_contract")
 # Real controller coupling, proven post-build: a source-only replica that
-# re-declares its own look-alike seam methods has none of these symbols.
+# re-declares its own look-alike seam methods has none of these symbols. Both
+# real-controller seam binaries must carry them...
+NM_POSITIVE_TARGETS=("tests/pipeline_test_seam_smoke" "tests/pipeline_stop_contract")
+# ...while a Qt-free control target (cpu_smoke_harness links only azu_test_core,
+# never the controller TU) must NOT carry the controller's internal symbol.
+NM_NEGATIVE_TARGET="tests/cpu_smoke_harness"
 NM_REQUIRED_PATTERNS=("kfusion::app::PipelineController" "PipelineController::startInternal")
+NM_ABSENT_PATTERN="PipelineController::startInternal"
 
 # All scratch lives outside the repository root; nothing is written under it
 # except the single validated gate build directory.
@@ -155,17 +160,31 @@ run_step 420 "cmake build (CPU)" cmake --build "${GATE_BUILD_DIR}"
 # 5. Post-build coupling guard: the seam binary must link the real controller
 # ---------------------------------------------------------------------------
 command -v nm >/dev/null 2>&1 || die "nm is unavailable; the post-build coupling guard cannot run"
-[ -x "${GATE_BUILD_DIR}/${NM_TARGET}" ] ||
-    die "expected CPU test binary ${GATE_BUILD_DIR}/${NM_TARGET} was not produced"
-NM_OUT="${WORKDIR}/nm-demangled.txt"
-timeout 60 nm -C "${GATE_BUILD_DIR}/${NM_TARGET}" >"${NM_OUT}" 2>&1 ||
-    die "nm -C failed on ${NM_TARGET}"
-for pattern in "${NM_REQUIRED_PATTERNS[@]}"; do
-    hits="$(grep -c -- "$pattern" "${NM_OUT}" || true)"
-    [ "${hits}" -ge 1 ] ||
-        die "coupling guard: ${NM_TARGET} contains no '${pattern}' symbol; the seam test is not linked against the real PipelineController"
-    printf 'coupling guard: %s hits for %s\n' "${hits}" "${pattern}"
+for nm_target in "${NM_POSITIVE_TARGETS[@]}"; do
+    [ -x "${GATE_BUILD_DIR}/${nm_target}" ] ||
+        die "expected CPU test binary ${GATE_BUILD_DIR}/${nm_target} was not produced"
+    NM_OUT="${WORKDIR}/nm-demangled-$(basename "${nm_target}").txt"
+    timeout 60 nm -C "${GATE_BUILD_DIR}/${nm_target}" >"${NM_OUT}" 2>&1 ||
+        die "nm -C failed on ${nm_target}"
+    for pattern in "${NM_REQUIRED_PATTERNS[@]}"; do
+        hits="$(grep -c -- "$pattern" "${NM_OUT}" || true)"
+        [ "${hits}" -ge 1 ] ||
+            die "coupling guard: ${nm_target} contains no '${pattern}' symbol; the seam test is not linked against the real PipelineController"
+        printf 'coupling guard: %s hits for %s in %s\n' "${hits}" "${pattern}" "${nm_target}"
+    done
 done
+# Negative control: the Qt-free cpu_smoke_harness links only azu_test_core, so
+# the real controller's internal symbol must be absent there. Its presence would
+# mean the controller TU leaked into the Qt-free lane (or the guard lost teeth).
+[ -x "${GATE_BUILD_DIR}/${NM_NEGATIVE_TARGET}" ] ||
+    die "expected CPU control binary ${GATE_BUILD_DIR}/${NM_NEGATIVE_TARGET} was not produced"
+NM_NEG_OUT="${WORKDIR}/nm-demangled-control.txt"
+timeout 60 nm -C "${GATE_BUILD_DIR}/${NM_NEGATIVE_TARGET}" >"${NM_NEG_OUT}" 2>&1 ||
+    die "nm -C failed on ${NM_NEGATIVE_TARGET}"
+neg_hits="$(grep -c -- "${NM_ABSENT_PATTERN}" "${NM_NEG_OUT}" || true)"
+[ "${neg_hits}" -eq 0 ] ||
+    die "negative control ${NM_NEGATIVE_TARGET} unexpectedly contains '${NM_ABSENT_PATTERN}'; Qt-free lane must not link the controller"
+printf 'negative control: 0 hits for %s in %s (Qt-free lane stays controller-free)\n' "${NM_ABSENT_PATTERN}" "${NM_NEGATIVE_TARGET}"
 
 # ---------------------------------------------------------------------------
 # 6. Required CPU tests only (label cpu), then prove the label actually ran

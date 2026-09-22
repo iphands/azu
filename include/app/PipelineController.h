@@ -146,10 +146,21 @@ private:
     std::queue<std::shared_ptr<sensor::RawFrame>>  raw_queue_;
     std::mutex                                     tracking_queue_mutex_;
     std::condition_variable                        tracking_queue_cv_;
+    // Shutdown predicate state for the tracking worker, guarded by
+    // tracking_queue_mutex_ (NOT by running_). stop() flips it under that
+    // mutex and notifies while still holding it; the worker reads it under
+    // the same mutex across predicate-evaluation and wait() registration, so
+    // shutdown can never be missed. running_ is stored OUTSIDE the queue
+    // mutex and therefore cannot serve as the wait predicate — an unguarded
+    // running_ check reopens the exact lost-wakeup window this closes.
+    bool                                           tracking_shutdown_ = false;
 
     std::queue<std::shared_ptr<sensor::FrameData>> integration_queue_;
     std::mutex                                     integration_queue_mutex_;
     std::condition_variable                        integration_queue_cv_;
+    // Shutdown predicate state for the integration worker; same contract as
+    // tracking_shutdown_, guarded by integration_queue_mutex_.
+    bool                                           integration_shutdown_ = false;
 
     // Timing
     std::chrono::steady_clock::time_point last_capture_time_;

@@ -100,6 +100,24 @@ set_tests_properties(pipeline_test_seam_smoke PROPERTIES
     # process even if a worker thread misbehaves.
 )
 
+# ---- big-fix todo 9: CPU-only pipeline stop/start contract ----
+# Repeated start -> (optionally inject one frame) -> stop cycles against the
+# real controller. Empty-queue and non-empty-queue shutdown paths are both
+# exercised; a lost shutdown notification deadlocks stop() and the TIMEOUT
+# (never an in-test sleep) is what fails the run. Links azu_test_pipeline so
+# the real PipelineController is what actually runs (gate 4 below enforces it).
+add_executable(pipeline_stop_contract pipeline_stop_contract.cpp)
+target_compile_definitions(pipeline_stop_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(pipeline_stop_contract PRIVATE azu_test_pipeline)
+
+add_test(NAME pipeline_stop_contract COMMAND pipeline_stop_contract)
+set_tests_properties(pipeline_stop_contract PROPERTIES
+    LABELS cpu TIMEOUT 120
+    # 50 cycles; TIMEOUT caps the process if stop() ever regresses to a
+    # lost-wakeup deadlock. Measured total wall time is a small fraction of
+    # this (see .omo/evidence/big-fix/pipeline-stop-loop.txt).
+)
+
 # ---- big-fix todo 6: Marching Cubes fail-before-fix contracts ----
 # marching_cubes_table_contract is CPU-only (header + integer math, no volume)
 # and validates all 256 rows against an independent crossing-edge oracle: it
@@ -225,4 +243,40 @@ if(NOT "${AZU_PIPELINE_LIB_LINKS}" MATCHES "Qt6::Core")
         "(PipelineController.cpp uses QMetaObject::invokeMethod/qApp), got: ${AZU_PIPELINE_LIB_LINKS}")
 endif()
 
-message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke registered (label=cpu)")
+# 4) big-fix todo 9: pipeline_stop_contract must be the REAL controller seam
+#    start/stop test, not a synthetic queue/worker replica. Same hardened
+#    discipline as gate 1: comments are stripped, so only a genuine call shape
+#    (receiver '.'/'>'/'::' + name + '(') on the stripped source configures, and
+#    the target must link azu_test_pipeline.
+get_target_property(AZU_STOP_TEST_SOURCES pipeline_stop_contract SOURCES)
+if(NOT AZU_STOP_TEST_SOURCES)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: pipeline_stop_contract has no SOURCES.")
+endif()
+set(AZU_STOP_TEST_TEXT "")
+foreach(_azu_stop_src ${AZU_STOP_TEST_SOURCES})
+    get_filename_component(_azu_stop_abs "${_azu_stop_src}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(NOT EXISTS "${_azu_stop_abs}")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: registered pipeline_stop_contract source ${_azu_stop_abs} does not exist.")
+    endif()
+    file(READ "${_azu_stop_abs}" _azu_stop_txt)
+    azu_strip_c_comments(_azu_stop_txt_code _azu_stop_txt)
+    string(APPEND AZU_STOP_TEST_TEXT "${_azu_stop_txt_code}")
+endforeach()
+foreach(_azu_stop_call startWithoutSensorForTests stop injectRawFrameForTests)
+    if(NOT AZU_STOP_TEST_TEXT MATCHES "[.>:]${_azu_stop_call}[ \t\r\n]*\\(")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: the pipeline_stop_contract source must call ${_azu_stop_call}() "
+            "on the real PipelineController (a comment or string literal naming it is not a call). "
+            "A replacement queue/worker replica does not satisfy this todo.")
+    endif()
+endforeach()
+get_target_property(AZU_STOP_TEST_LINKS pipeline_stop_contract LINK_LIBRARIES)
+if(NOT "${AZU_STOP_TEST_LINKS}" MATCHES "azu_test_pipeline")
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: pipeline_stop_contract must link azu_test_pipeline, "
+        "got: ${AZU_STOP_TEST_LINKS}")
+endif()
+
+message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract registered (label=cpu)")
