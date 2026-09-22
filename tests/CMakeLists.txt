@@ -458,6 +458,25 @@ target_link_libraries(sr_upscaled_contract PRIVATE azu_test_core)
 add_test(NAME sr_upscaled_contract COMMAND sr_upscaled_contract)
 set_tests_properties(sr_upscaled_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 23: CPU depth/RGB pairing staleness + latest-frame semantics ----
+# kinect_pairing_contract drives a REAL kfusion::sensor::KinectSensor through the
+# AZU_PIPELINE_TEST_SEAM injectors only: default-constructed, so there is no
+# device, no libfreenect call, no capture thread, no display, no GPU and no
+# sleep. It locks the 50 ms sync window (strict `<`, so exactly 50 ms is stale),
+# the stale-side-drop / newer-side-retain recovery on both ledgers, the fact that
+# a rejected pair consumes no frame id, that the product callback observes
+# sync_mutex_ as free, that a published frame carries the bytes and millisecond
+# timestamps of the samples it actually paired with, and that the ready slot holds
+# ONE frame: three accepted pairs leave id 8 and recycle ids 6/7, and the second
+# getLatestFrame() returns nullptr instead of an older queued frame. Expected
+# values are the fixture's own injected payloads, never product snapshots.
+add_executable(kinect_pairing_contract kinect_pairing_contract.cpp)
+target_compile_definitions(kinect_pairing_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(kinect_pairing_contract PRIVATE azu_test_core)
+
+add_test(NAME kinect_pairing_contract COMMAND kinect_pairing_contract)
+set_tests_properties(kinect_pairing_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 add_test(NAME glb_linear_color_contract COMMAND glb_linear_color_contract)
 set_tests_properties(glb_linear_color_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
@@ -584,6 +603,61 @@ if(NOT "${AZU_STOP_TEST_LINKS}" MATCHES "azu_test_pipeline")
     message(FATAL_ERROR
         "ANTI-SYNTHETIC GATE: pipeline_stop_contract must link azu_test_pipeline, "
         "got: ${AZU_STOP_TEST_LINKS}")
+endif()
+
+# 5) big-fix todo 23: kinect_pairing_contract must drive the REAL KinectSensor
+#    pairing path. Same discipline as gate 1/4: comments are stripped first, so
+#    only a code shape configures the gate.
+get_target_property(AZU_KINECT_TEST_SOURCES kinect_pairing_contract SOURCES)
+if(NOT AZU_KINECT_TEST_SOURCES)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: kinect_pairing_contract has no SOURCES.")
+endif()
+set(AZU_KINECT_TEST_TEXT "")
+foreach(_azu_kp_src ${AZU_KINECT_TEST_SOURCES})
+    get_filename_component(_azu_kp_abs "${_azu_kp_src}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(NOT EXISTS "${_azu_kp_abs}")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: registered kinect_pairing_contract source ${_azu_kp_abs} does not exist.")
+    endif()
+    file(READ "${_azu_kp_abs}" _azu_kp_txt)
+    azu_strip_c_comments(_azu_kp_txt_code _azu_kp_txt)
+    string(APPEND AZU_KINECT_TEST_TEXT "${_azu_kp_txt_code}")
+endforeach()
+
+# The fixture must be the product sensor object. A default-constructed member
+# declaration has no call parentheses, so the accepted shapes are a call to
+# KinectSensor() OR a member/object declared with the fully qualified product
+# type name. The qualification is what carries the weight: a look-alike replica
+# would have to re-declare kfusion::sensor::KinectSensor, which collides with the
+# azu_test_core header the target is required to link (gate below).
+set(_azu_kp_type_ok FALSE)
+if(AZU_KINECT_TEST_TEXT MATCHES "[.>:]KinectSensor[ \t\r\n]*\\(")
+    set(_azu_kp_type_ok TRUE)
+endif()
+if(AZU_KINECT_TEST_TEXT MATCHES "kfusion::sensor::[ \t\r\n]*KinectSensor[ \t\r\n]+[A-Za-z_][A-Za-z0-9_]*[ \t\r\n]*;")
+    set(_azu_kp_type_ok TRUE)
+endif()
+if(NOT _azu_kp_type_ok)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: the kinect_pairing_contract source must construct the real "
+        "kfusion::sensor::KinectSensor (call shape, or a fully qualified product-type declaration). "
+        "A local queue/pairing replica does not satisfy this todo.")
+endif()
+foreach(_azu_kp_call injectDepthForTests injectRgbForTests syncMutexIsFreeForTests
+                     readyFrameCountForTests freeFrameCountForTests getLatestFrame)
+    if(NOT AZU_KINECT_TEST_TEXT MATCHES "[.>:]${_azu_kp_call}[ \t\r\n]*\\(")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: the kinect_pairing_contract source must call ${_azu_kp_call}() "
+            "on the real KinectSensor (a comment or string literal naming it is not a call). "
+            "A replacement pairing/queue replica does not satisfy this todo.")
+    endif()
+endforeach()
+get_target_property(AZU_KINECT_TEST_LINKS kinect_pairing_contract LINK_LIBRARIES)
+if(NOT "${AZU_KINECT_TEST_LINKS}" MATCHES "azu_test_core")
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: kinect_pairing_contract must link azu_test_core (the real sensor TU), "
+        "got: ${AZU_KINECT_TEST_LINKS}")
 endif()
 
 message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract registered (label=cpu)")

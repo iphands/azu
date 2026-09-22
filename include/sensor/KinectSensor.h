@@ -53,6 +53,19 @@ using FrameCallback = std::function<void(std::shared_ptr<RawFrame>)>;
 
 class KinectSensor {
 public:
+    // Canonical depth/RGB sync window, in the SAME milliseconds that
+    // RawFrame::timestamp_depth / timestamp_rgb carry (libfreenect reports
+    // uint32 microseconds; onDepth()/onRgb() convert with timestamp / 1000.0 and
+    // nothing else changes the unit). A pair is accepted iff both timestamps are
+    // finite AND |timestamp_depth - timestamp_rgb| is STRICTLY below this value:
+    // an exactly-50 ms delta is stale and is rejected. See
+    // docs/CANONICAL_SEMANTICS.md ("Sensor pairing and latest-frame semantics").
+    // uint32 microsecond wraparound (every ~71.6 minutes of device uptime) is
+    // outside this policy: the delta is computed on raw converted values, so a
+    // wrapped sample looks stale and is dropped rather than mispaired. big-fix
+    // Todo 23.
+    static constexpr double kMaxFrameSyncDeltaMs = 50.0;
+
     KinectSensor();
     ~KinectSensor();
 
@@ -86,7 +99,10 @@ private:
     struct PoolState {
         std::vector<std::shared_ptr<RawFrame>> pool;
         std::mutex                             mutex;
-        std::queue<std::shared_ptr<RawFrame>>  ready_queue;
+        // Single latest ready slot (not a queue): getLatestFrame() is a
+        // newest-wins consumer, so a queue could only ever hand out stale
+        // frames. Destructed/recycled OUTSIDE `mutex` — see publishLatest().
+        std::shared_ptr<RawFrame>              ready_frame;
         std::queue<std::shared_ptr<RawFrame>>  free_queue;
     };
     std::shared_ptr<PoolState> pool_state_;
@@ -110,11 +126,40 @@ private:
     static void depthCallback(freenect_device* dev, void* depth, uint32_t timestamp);
     static void rgbCallback(freenect_device* dev, void* rgb, uint32_t timestamp);
 
-    void onDepth(void* data, uint32_t timestamp);
-    void onRgb(void* data, uint32_t timestamp);
+    void onDepth(const void* data, uint32_t timestamp);
+    void onRgb(const void* data, uint32_t timestamp);
+
+    // Pair depth_pending_ with rgb_pending_ under sync_mutex_. Returns the
+    // combined depth-owned frame (both pendings consumed, id assigned) when the
+    // pair is inside kMaxFrameSyncDeltaMs, else nullptr with the stale side
+    // dropped and the newer side retained. Caller publishes outside the lock.
+    std::shared_ptr<RawFrame> pairPendingLocked();
+
+    // Install `frame` as the single ready frame, dropping whatever it replaces.
+    // The displaced frame is destructed outside pool_state_->mutex: its pooled
+    // deleter locks that same mutex, so destroying it inside would deadlock.
+    void publishLatest(std::shared_ptr<RawFrame> frame);
     
     // Internal helper to get/release frames from pool
     std::shared_ptr<RawFrame> acquireFreeFrame();
+
+#ifdef AZU_PIPELINE_TEST_SEAM
+public:
+    // ---- Device-free pairing test seam (big-fix Todo 23) ----
+    // Same compile-time discipline as the PipelineController / SignalConditioner
+    // seams: AZU_PIPELINE_TEST_SEAM is defined only for the azu_test_core
+    // targets, so production never sees these member functions. They add no
+    // layout change and no libfreenect or device call — a default-constructed
+    // KinectSensor is the whole fixture. inject*ForTests() feed the REAL private
+    // onDepth()/onRgb() pairing path, the counts read the real queues, and
+    // syncMutexIsFreeForTests() is the mechanical witness that product
+    // publication happens outside sync_mutex_.
+    void injectDepthForTests(const void* data, uint32_t timestamp);
+    void injectRgbForTests(const void* data, uint32_t timestamp);
+    size_t readyFrameCountForTests() const;
+    size_t freeFrameCountForTests() const;
+    bool syncMutexIsFreeForTests();
+#endif
 };
 
 } // namespace sensor

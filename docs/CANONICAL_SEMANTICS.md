@@ -693,6 +693,71 @@ Canonical super-resolution scale: `setSrScale()` must have an effect.
 `sr_scale_` is never read in either GPU conditioner, so the GUI slider is a
 silent no-op on GPU. Deferred as `cross-backend:B2`.
 
+## Sensor pairing and latest-frame semantics
+
+Canonical timestamp unit: libfreenect delivers `uint32_t` microseconds, and the
+sensor converts once — `timestamp / 1000.0` — so `RawFrame::timestamp_depth` and
+`RawFrame::timestamp_rgb` are milliseconds and nothing downstream re-scales them.
+
+Canonical temporal pairing, **fixed by big-fix Todo 23** (`sensor:S-08`): a depth
+packet and an RGB packet are paired iff both timestamps are finite AND
+
+```cpp
+std::fabs(timestamp_depth - timestamp_rgb) < kMaxFrameSyncDeltaMs   // 50.0 ms
+```
+
+The comparison is strict, so an **exactly-50 ms delta is stale** and is rejected.
+`kMaxFrameSyncDeltaMs` lives in `include/sensor/KinectSensor.h`; the threshold is
+not a magic number at the call site. uint32 microsecond wraparound (about every
+71.6 minutes of device uptime) is outside this policy: the delta is taken on the
+raw converted values, so a wrapped sample reads as stale and is dropped rather
+than mispaired.
+
+Canonical stale-pair policy (`src/sensor/KinectSensor.cpp:218-254`): a rejected
+pair publishes nothing, **consumes no frame id**, and copies no RGB. The
+older-timestamped side is recycled to the pool and the newer side is retained for
+the next sample on the stale stream, so one lagging stream degrades to a delay
+instead of a permanent stall. Depth-led and RGB-led arrival orders run through
+the same helper — the policy is symmetric, not two hand-written copies.
+
+Canonical latest-frame semantics, **fixed by Todo 23** (`sensor:S-09`):
+`getLatestFrame()` is a newest-wins consumer, so the ready side is a single slot
+(`PoolState::ready_frame`), not a queue. `publishLatest()` installs the new frame
+and lets the frame it displaced recycle **outside** `pool_state_->mutex` — the
+pooled deleter (`:274-291`) locks that same mutex, so destroying a ready or
+pending frame while holding it self-deadlocks. Three accepted pairs consumed with
+no reader leave exactly one frame, the newest; `getLatestFrame()` moves the slot
+out, so the next call returns `nullptr` rather than a queued older frame. The old
+`ready_queue` handed out `front()`, i.e. the oldest frame ever queued — a
+backpressured pipeline was reconstructing a frame it had already superseded.
+
+Canonical lock discipline, **fixed by Todo 23** (`sensor:S-15`,
+`src/sensor/KinectSensor.cpp:141-216`): the pairing lock covers the pending
+slots, the staleness decision, the RGB copy, the frame-id assignment and the copy
+of `frame_callback_`. The product callback itself is invoked **after**
+`sync_mutex_` is released, and so is the throttled synchronization log. A callback
+that observes `sync_mutex_` held can block the sibling capture stream.
+`tests/kinect_pairing_contract.cpp` asserts `syncMutexIsFreeForTests()` from
+inside every callback, which is the mechanical form of this rule.
+
+Temporal pairing is **not** spatial registration. Meeting the 50 ms window makes
+the two packets contemporaneous in time; it does not put a depth pixel and an RGB
+pixel on the same ray. The combined frame is depth-owned with the RGB blitted in
+full-frame (`sensor:S-07`), and this run records the depth-to-color registration
+status as
+
+```text
+depth_to_color_registration: SKIP: no depth registration source
+```
+
+The host does have libfreenect and `<libfreenect/libfreenect_registration.h>`, and
+that header does export `freenect_camera_to_world`, `freenect_copy_registration`
+and `freenect_destroy_registration` — but those go **camera → world**, i.e. depth
+intrinsics plus a mechanical baseline. Nothing in the installed package supplies a
+depth-to-**color** image transform or a registration source to build one, so no
+warp is claimed and none is applied. Evidence:
+`.omo/evidence/big-fix/kinect-depth-color-alignment.txt`.
+
 ## Pipeline publication
 
 Canonical rule: a published model frame implies a raycast-written buffer.

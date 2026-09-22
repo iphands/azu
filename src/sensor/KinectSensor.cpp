@@ -1,6 +1,7 @@
 #include "sensor/KinectSensor.h"
 #include "utils/Logger.h"
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -137,80 +138,137 @@ void KinectSensor::depthCallback(freenect_device*, void*, uint32_t) {}
 void KinectSensor::rgbCallback(freenect_device*, void*, uint32_t) {}
 #endif
 
-void KinectSensor::onDepth(void* data, uint32_t timestamp) {
-    std::lock_guard<std::mutex> lk(sync_mutex_);
-    
-    if (!depth_pending_) {
-        depth_pending_ = acquireFreeFrame();
-        if (!depth_pending_) return; // Pool exhausted
-    }
+void KinectSensor::onDepth(const void* data, uint32_t timestamp) {
+    FrameCallback callback;
+    std::shared_ptr<RawFrame> publish;
+    bool log_pair = false;
 
-    std::memcpy(depth_pending_->depth.data(), data, DEPTH_WIDTH * DEPTH_HEIGHT * 2);
-    depth_pending_->timestamp_depth = timestamp / 1000.0;
-    depth_pending_->depth_valid = true;
+    {
+        std::lock_guard<std::mutex> lk(sync_mutex_);
 
-    if (rgb_pending_ && rgb_pending_->rgb_valid) {
-        std::memcpy(depth_pending_->rgb.data(), rgb_pending_->rgb.data(), RGB_WIDTH * RGB_HEIGHT * 3);
-        depth_pending_->timestamp_rgb = rgb_pending_->timestamp_rgb;
-        depth_pending_->rgb_valid = true;
-        depth_pending_->frame_id = ++frame_counter_;
-
-        if (frame_callback_) {
-            if (++pair_log_ % 150 == 0) {
-                KFLOGF_DEBUG("Sensor", "Frames synchronized (depth-led): ID=%lu", depth_pending_->frame_id);
-            }
-            frame_callback_(depth_pending_);
-        } else {
-            std::lock_guard<std::mutex> qlk(pool_state_->mutex);
-            pool_state_->ready_queue.push(depth_pending_);
+        if (!depth_pending_) {
+            depth_pending_ = acquireFreeFrame();
+            if (!depth_pending_) return; // Pool exhausted
         }
 
-        rgb_pending_ = nullptr;
-        depth_pending_ = nullptr;
+        std::memcpy(depth_pending_->depth.data(), data, DEPTH_WIDTH * DEPTH_HEIGHT * 2);
+        depth_pending_->timestamp_depth = timestamp / 1000.0;
+        depth_pending_->depth_valid = true;
+
+        publish = pairPendingLocked();
+        if (publish) {
+            callback = frame_callback_;
+            log_pair = (++pair_log_ % 150 == 0);
+        }
+    }
+
+    if (!publish) return;
+
+    // Throttled synchronization telemetry and product publication both run with
+    // sync_mutex_ released: the callback is pipeline code, and calling it under
+    // the pairing lock lets a slow consumer block the capture thread's sibling.
+    if (log_pair) {
+        KFLOGF_DEBUG("Sensor", "Frames synchronized (depth-led): ID=%lu", publish->frame_id);
+    }
+
+    if (callback) {
+        callback(std::move(publish));
+    } else {
+        publishLatest(std::move(publish));
     }
 }
 
-void KinectSensor::onRgb(void *data, uint32_t timestamp) {
-    std::lock_guard<std::mutex> lk(sync_mutex_);
+void KinectSensor::onRgb(const void* data, uint32_t timestamp) {
+    FrameCallback callback;
+    std::shared_ptr<RawFrame> publish;
+    bool log_pair = false;
 
-    if (!rgb_pending_) {
-        rgb_pending_ = acquireFreeFrame();
-        if (!rgb_pending_) return;
-    }
+    {
+        std::lock_guard<std::mutex> lk(sync_mutex_);
 
-    std::memcpy(rgb_pending_->rgb.data(), data, RGB_WIDTH * RGB_HEIGHT * 3);
-    rgb_pending_->timestamp_rgb = timestamp / 1000.0;
-    rgb_pending_->rgb_valid = true;
-
-    if (depth_pending_ && depth_pending_->depth_valid) {
-        std::memcpy(depth_pending_->rgb.data(), rgb_pending_->rgb.data(), RGB_WIDTH * RGB_HEIGHT * 3);
-        depth_pending_->timestamp_rgb = rgb_pending_->timestamp_rgb;
-        depth_pending_->rgb_valid = true;
-        depth_pending_->frame_id = ++frame_counter_;
-
-        if (frame_callback_) {
-            if (++pair_log_ % 150 == 0) {
-                KFLOGF_DEBUG("Sensor", "Frames synchronized (rgb-led): ID=%lu", depth_pending_->frame_id);
-            }
-            frame_callback_(depth_pending_);
-        } else {
-            std::lock_guard<std::mutex> qlk(pool_state_->mutex);
-            pool_state_->ready_queue.push(depth_pending_);
+        if (!rgb_pending_) {
+            rgb_pending_ = acquireFreeFrame();
+            if (!rgb_pending_) return;
         }
 
-        rgb_pending_ = nullptr;
-        depth_pending_ = nullptr;
+        std::memcpy(rgb_pending_->rgb.data(), data, RGB_WIDTH * RGB_HEIGHT * 3);
+        rgb_pending_->timestamp_rgb = timestamp / 1000.0;
+        rgb_pending_->rgb_valid = true;
+
+        publish = pairPendingLocked();
+        if (publish) {
+            callback = frame_callback_;
+            log_pair = (++pair_log_ % 150 == 0);
+        }
     }
+
+    if (!publish) return;
+
+    if (log_pair) {
+        KFLOGF_DEBUG("Sensor", "Frames synchronized (rgb-led): ID=%lu", publish->frame_id);
+    }
+
+    if (callback) {
+        callback(std::move(publish));
+    } else {
+        publishLatest(std::move(publish));
+    }
+}
+
+std::shared_ptr<RawFrame> KinectSensor::pairPendingLocked() {
+    if (!depth_pending_ || !depth_pending_->depth_valid ||
+        !rgb_pending_ || !rgb_pending_->rgb_valid) {
+        return nullptr;
+    }
+
+    const double depth_ms = depth_pending_->timestamp_depth;
+    const double rgb_ms   = rgb_pending_->timestamp_rgb;
+
+    // A non-finite timestamp can only come from a corrupt conversion, and it
+    // compares false everywhere, so it lands in the stale branch and the
+    // non-finite side is the one dropped.
+    const bool fresh = std::isfinite(depth_ms) && std::isfinite(rgb_ms) &&
+                       std::fabs(depth_ms - rgb_ms) < kMaxFrameSyncDeltaMs;
+
+    if (!fresh) {
+        // Stale pair: nothing is published, no frame id is consumed and no RGB
+        // is copied. The older-timestamped side is recycled; the newer side is
+        // retained so the next sample on the stale stream can pair with it.
+        const bool depth_is_stale = !(depth_ms > rgb_ms);
+        if (depth_is_stale) {
+            depth_pending_.reset();
+        } else {
+            rgb_pending_.reset();
+        }
+        return nullptr;
+    }
+
+    std::memcpy(depth_pending_->rgb.data(), rgb_pending_->rgb.data(), RGB_WIDTH * RGB_HEIGHT * 3);
+    depth_pending_->timestamp_rgb = rgb_ms;
+    depth_pending_->rgb_valid = true;
+    depth_pending_->frame_id = ++frame_counter_;
+
+    std::shared_ptr<RawFrame> combined = std::move(depth_pending_);
+    rgb_pending_.reset();
+    return combined;
+}
+
+void KinectSensor::publishLatest(std::shared_ptr<RawFrame> frame) {
+    std::shared_ptr<RawFrame> displaced;
+    {
+        std::lock_guard<std::mutex> lk(pool_state_->mutex);
+        displaced = std::move(pool_state_->ready_frame);
+        pool_state_->ready_frame = std::move(frame);
+    }
+    // `displaced` (the older frame getLatestFrame() would otherwise have handed
+    // out) recycles here, past the lock: its pooled deleter locks the mutex
+    // this scope just released.
 }
 
 std::shared_ptr<RawFrame> KinectSensor::getLatestFrame() {
     std::lock_guard<std::mutex> lk(pool_state_->mutex);
-    if (pool_state_->ready_queue.empty())
-        return nullptr;
-
-    auto frame = pool_state_->ready_queue.front();
-    pool_state_->ready_queue.pop();
-    return frame;
+    // Move-out leaves the slot empty: one consumer, newest frame only.
+    return std::move(pool_state_->ready_frame);
 }
 
 std::shared_ptr<RawFrame> KinectSensor::acquireFreeFrame() {
@@ -235,6 +293,34 @@ std::shared_ptr<RawFrame> KinectSensor::acquireFreeFrame() {
 void KinectSensor::releaseFrame(std::shared_ptr<RawFrame>) {
     // No-op manually; handled by custom deleter now
 }
+
+#ifdef AZU_PIPELINE_TEST_SEAM
+void KinectSensor::injectDepthForTests(const void* data, uint32_t timestamp) {
+    onDepth(data, timestamp);
+}
+
+void KinectSensor::injectRgbForTests(const void* data, uint32_t timestamp) {
+    onRgb(data, timestamp);
+}
+
+size_t KinectSensor::readyFrameCountForTests() const {
+    std::lock_guard<std::mutex> lk(pool_state_->mutex);
+    return pool_state_->ready_frame ? 1u : 0u;
+}
+
+size_t KinectSensor::freeFrameCountForTests() const {
+    std::lock_guard<std::mutex> lk(pool_state_->mutex);
+    return pool_state_->free_queue.size();
+}
+
+bool KinectSensor::syncMutexIsFreeForTests() {
+    if (sync_mutex_.try_lock()) {
+        sync_mutex_.unlock();
+        return true;
+    }
+    return false;
+}
+#endif
 
 } // namespace sensor
 } // namespace kfusion
