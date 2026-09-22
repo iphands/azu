@@ -1,5 +1,7 @@
 #include "sensor/SuperResolution.h"
 
+#include "sensor/BorderMode.h"  // cpuReflectCoord: the one CPU border-mode owner
+
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -21,17 +23,11 @@ namespace sr {
 // Algorithm: Bicubic interpolation with edge-adaptive sampling
 // ---------------------------------------------------------------------------
 
-inline int reflectCoord(int x, int max_val) {
-    if (x < 0) return -x - 1;
-    if (x >= max_val) return 2 * max_val - x - 1;
-    return x;
-}
-
 inline void getPixelF(const std::vector<uint8_t>& img,
                       int x, int y, int w, int h,
                       float out[3]) {
-    x = reflectCoord(x, w);
-    y = reflectCoord(y, h);
+    x = cpuReflectCoord(x, w);
+    y = cpuReflectCoord(y, h);
     int idx = (y * w + x) * 3;
     out[0] = img[idx + 0] / 255.0f;
     out[1] = img[idx + 1] / 255.0f;

@@ -1,5 +1,6 @@
 #include "sensor/SignalConditioner.h"
 
+#include "sensor/BorderMode.h"  // cpuReflectCoord: the one CPU border-mode owner
 #include "sensor/DepthValidity.h"
 #include "sensor/FrameData.h"
 #include "sensor/KinectSensor.h"
@@ -87,13 +88,6 @@ void logFrameStats(int frame_id) {
     g_stats = FilterStats{};
 }
 
-// Reflect boundary handling to eliminate vertical banding
-inline int reflectCoord(int x, int max_val) {
-    if (x < 0) return -x - 1;
-    if (x >= max_val) return 2 * max_val - x - 1;
-    return x;
-}
-
 inline uint8_t clampToByte(float v) {
     return static_cast<uint8_t>(std::clamp(v, 0.0f, 255.0f));
 }
@@ -156,9 +150,9 @@ void medianBlur3x3(std::vector<uint8_t>& rgb) {
                 uint8_t window[9];
                 int count = 0;
                 for (int dy = -1; dy <= 1; ++dy) {
-                    const int sy = reflectCoord(y + dy, FRAME_H);
+                    const int sy = cpuReflectCoord(y + dy, FRAME_H);
                     for (int dx = -1; dx <= 1; ++dx) {
-                        const int sx = reflectCoord(x + dx, FRAME_W);
+                        const int sx = cpuReflectCoord(x + dx, FRAME_W);
                         window[count++] = rgb[(sy * FRAME_W + sx) * 3 + c];
                     }
                 }
@@ -190,9 +184,9 @@ void bilateralDenoiseRgb(const std::vector<uint8_t>& src, std::vector<uint8_t>& 
             float weight_sum = 0.0f;
 
             for (int dy = -kRgbBilateralRadius; dy <= kRgbBilateralRadius; ++dy) {
-                const int sy = reflectCoord(y + dy, FRAME_H);
+                const int sy = cpuReflectCoord(y + dy, FRAME_H);
                 for (int dx = -kRgbBilateralRadius; dx <= kRgbBilateralRadius; ++dx) {
-                    const int sx = reflectCoord(x + dx, FRAME_W);
+                    const int sx = cpuReflectCoord(x + dx, FRAME_W);
                     const int sample_idx = (sy * FRAME_W + sx) * 3;
                     const float spatial_dist_sq = static_cast<float>(dx * dx + dy * dy);
 
@@ -382,9 +376,9 @@ void SignalConditioner::denoiseDepthSpatial(std::vector<uint16_t>& depth, float 
             float window[9];
             int count = 0;
             for (int dy = -kDepthMedianRadius; dy <= kDepthMedianRadius; ++dy) {
-                const int sy = reflectCoord(y + dy, FRAME_H);
+                const int sy = cpuReflectCoord(y + dy, FRAME_H);
                 for (int dx = -kDepthMedianRadius; dx <= kDepthMedianRadius; ++dx) {
-                    const int sx = reflectCoord(x + dx, FRAME_W);
+                    const int sx = cpuReflectCoord(x + dx, FRAME_W);
                     const float sample_depth_m = cpuDepthMeters(depth[sy * FRAME_W + sx], min_depth_m, max_depth_m);
                     if (sample_depth_m == 0.0f) {
                         continue;
@@ -456,8 +450,8 @@ void SignalConditioner::applyDepthEma(std::vector<uint16_t>& depth, float min_de
             for (int dy = -1; dy <= 1; ++dy) {
                 for (int dx = -1; dx <= 1; ++dx) {
                     if (dx == 0 && dy == 0) continue;
-                    const int nx = reflectCoord(x + dx, FRAME_W);
-                    const int ny = reflectCoord(y + dy, FRAME_H);
+                    const int nx = cpuReflectCoord(x + dx, FRAME_W);
+                    const int ny = cpuReflectCoord(y + dy, FRAME_H);
                     const int ni = ny * FRAME_W + nx;
                     const float nd = cpuDepthMeters(src[ni], min_depth_m, max_depth_m);
                     if (nd != 0.0f) {
@@ -531,10 +525,10 @@ void SignalConditioner::fillDepthHoles(std::vector<uint16_t>& depth, float min_d
             int valid_neighbors = 0;
 
             for (int dy = -kHoleFillRadius; dy <= kHoleFillRadius; ++dy) {
-                const int sy = reflectCoord(y + dy, FRAME_H);
+                const int sy = cpuReflectCoord(y + dy, FRAME_H);
                 for (int dx = -kHoleFillRadius; dx <= kHoleFillRadius; ++dx) {
                     if (dx == 0 && dy == 0) continue;
-                    const int sx = reflectCoord(x + dx, FRAME_W);
+                    const int sx = cpuReflectCoord(x + dx, FRAME_W);
 
                     // cpuDepthMeters() is both the raw predicate and the band
                     // gate, so a neighbour that measured something out of band
@@ -601,9 +595,9 @@ void SignalConditioner::guidedDepthFilter(std::vector<uint16_t>& depth, float mi
             float sum_depth = 0.0f;
 
             for (int dy = -kGuidedRadius; dy <= kGuidedRadius; ++dy) {
-                const int sy = reflectCoord(y + dy, FRAME_H);
+                const int sy = cpuReflectCoord(y + dy, FRAME_H);
                 for (int dx = -kGuidedRadius; dx <= kGuidedRadius; ++dx) {
-                    const int sx = reflectCoord(x + dx, FRAME_W);
+                    const int sx = cpuReflectCoord(x + dx, FRAME_W);
 
                     const int nidx = sy * FRAME_W + sx;
                     const float neighbor_depth = cpuDepthMeters(depth[nidx], min_depth_m, max_depth_m);

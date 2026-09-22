@@ -32,7 +32,7 @@ CPU_LABEL="cpu"
 # mesh_truncation_progress_contract); todo 18 appended
 # marching_cubes_winding_contract; todo 19 appended color_convergence_contract and
 # glb_linear_color_contract; todo 20 appended depth_domain_contract and
-# depth_ema_determinism_contract; every
+# depth_ema_determinism_contract; todo 21 appended cas_border_contract; every
 # name is enforced as registered (the list only ever grows, so the guard never
 # weakens).
 REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_contract"
@@ -44,7 +44,7 @@ REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_co
     "mesh_welding_contract" "mesh_color_invariant_contract"
     "mesh_truncation_progress_contract" "marching_cubes_winding_contract"
     "color_convergence_contract" "glb_linear_color_contract"
-    "depth_domain_contract" "depth_ema_determinism_contract")
+    "depth_domain_contract" "depth_ema_determinism_contract" "cas_border_contract")
 # Real controller coupling, proven post-build: a source-only replica that
 # re-declares its own look-alike seam methods has none of these symbols. Both
 # real-controller seam binaries must carry them...

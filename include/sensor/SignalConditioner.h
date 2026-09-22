@@ -115,6 +115,21 @@ public:
     }
     // Read-only view of the per-pixel temporal state (0.0f == no history).
     const std::vector<float>& emaStateForTests() const { return ema_buf_m_; }
+
+    // ---- CPU CAS guidance test seam (big-fix Todo 21) ----
+    // Same discipline as the depth seam above: member FUNCTIONS only, no layout
+    // change, production never sees them. They drive the REAL
+    // buildSuperResolutionGuidance() (RCAS sharpening of sr_rgb_ and the luma
+    // reduction) with an injected RGB buffer, so the contract tests pin the
+    // product's CAS + guidance-luma arithmetic instead of a reimplementation of
+    // it. `rgb` must be exactly FRAME_W * FRAME_H * 3 bytes, which is what
+    // processCpu() hands the real stage.
+    void buildGuidanceForTests(const std::vector<uint8_t>& rgb) {
+        buildSuperResolutionGuidance(rgb);
+    }
+    // Post-CAS guidance image (original resolution) and the luma derived from it.
+    const std::vector<uint8_t>& guidanceRgbForTests() const { return sr_rgb_; }
+    const std::vector<float>& guidanceLumaForTests() const { return guidance_luma_; }
 #endif
 };
 

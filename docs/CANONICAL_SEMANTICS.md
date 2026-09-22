@@ -569,15 +569,42 @@ Current CPU behavior (`src/tracking/ICPTracker.cpp`):
 
 ## Super-resolution and conditioning
 
-Canonical border mode: reflect. Current CPU behavior is reflect everywhere
-(`SuperResolution.cpp` `reflectCoord()`, `SignalConditioner_omp.cpp`
-`reflectCoord()`), and CUDA/HIP `SuperResolution_{cuda.cu,hip.hip}` also
-reflect — except `applyCASKernel`'s `rcasGetPixelCUDA` / `rcasGetPixelHIP`,
-which clamp (`max(0, min(x, w - 1))`). The clamp is the isolated outlier and it
-doubles the edge value into the RCAS cross-stencil, over-sharpening a visible
-1-pixel frame at exactly the border that feeds the UI preview. Deferred as
-`sensor:S-05` / `cross-backend:A20`. The comment claiming the two kernels are
-"the same algorithm" is false: identical math, different boundary extension.
+Canonical border mode: reflect, from one helper. The CPU carried two byte-identical
+copies of `reflectCoord()` — one in `SuperResolution.cpp`, one in
+`SignalConditioner_omp.cpp` — and both now call
+`kfusion::sensor::cpuReflectCoord()` (`include/sensor/BorderMode.h`), defined on
+`-extent <= coord <= 2 * extent - 1` and mapping into `[0, extent - 1]`. The two backends
+do not reflect identically. `SuperResolution_cuda.cu` reflects only through its
+radius-1 RCAS helper (`reflectCoordCAS`, used by `rcasGetPixel`) and has no EASU
+resample at all; `SuperResolution_hip.hip` reflects on both its EASU resample
+(`reflectCoordEASU`) and its radius-1 CAS (`reflectCoordCAS`). The only clamping
+sites are the SignalConditioner helpers `rcasGetPixelCUDA` / `rcasGetPixelHIP`
+(`max(0, min(x, w - 1))`), reached solely from `applyCASKernel`. Every offset
+passed to those two is ±1, and at radius 1 the modes are the same function —
+`reflect(-1) = 0 = clamp(-1)` and `reflect(extent) = extent - 1 = clamp(extent)`,
+checked over extents 1..1024 by `tests/cas_border_contract.cpp`. So the claim that
+the clamp "doubles the edge value into the RCAS cross-stencil, over-sharpening a
+visible 1-pixel frame" does not hold: only a stencil reaching ±2 separates the
+modes, and that is the 4×4 Catmull-Rom resample, whose destination column 0 reads
+source taps `{-2, -1, 0, 1}` with non-zero weight on the `-2` tap — and that
+resample exists only as the CPU `applyEASU_CPU` and the HIP `easuKernel`, both of
+which already reflect; CUDA has no EASU pass, so no backend clamps a ±2 stencil.
+What survives of `sensor:S-05` /
+`cross-backend:A20` is a latent text difference, not an observed pixel delta; it
+stays open until a backend is compiled, and the comment calling those two kernels
+"the same algorithm" is accurate rather than false.
+
+Canonical guidance luma: the ICP guidance image is the luma of the *sharpened*
+frame. `buildSuperResolutionGuidance()` copies the input into `sr_rgb_`, runs
+`sr::applyCAS(sr_rgb_, FRAME_W, FRAME_H, 0.5f)` in place, then maps each post-CAS
+pixel with Rec.601 weights and a `/255`:
+`guidance_luma_[i] = (0.299*R + 0.587*G + 0.114*B) / 255`, in float32, which puts
+the buffer in `[0, 1]` — a bound that is actually attained, since an exhaustive
+float32 scan over all 2^24 byte triples gives exactly `0.0f` for flat black and
+exactly `1.0f` for flat white. Reading the unsharpened input instead of
+`sr_rgb_`, Rec.709 weights, swapped R/B weights, and a dropped `/255` are four
+different wrong images; all four are pinned by
+`tests/cas_border_contract.cpp`.
 
 Canonical sharpness clamp: NaN must not produce NaN. GPU
 `std::max(0.0f, std::min(sharpness, 1.0f))` maps `NaN → 0.0` (a valid mild

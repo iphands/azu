@@ -406,6 +406,30 @@ set_tests_properties(depth_ema_determinism_contract PROPERTIES LABELS cpu TIMEOU
 add_test(NAME color_convergence_contract COMMAND color_convergence_contract)
 set_tests_properties(color_convergence_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 21: CPU CAS border mode + guidance luma contract ----
+# cas_border_contract is CPU-only: the shared border helper
+# (include/sensor/BorderMode.h), the public sr::applyEASU_CPU product pass and the
+# AZU_PIPELINE_TEST_SEAM guidance accessors. Section A pins the reflection rule
+# over extents 1..1024 and proves the +-1 stencil is border-BLIND (reflect and
+# clamp agree at -1 and at extent), so only the 4x4 Catmull-Rom resample, whose
+# taps reach -2 and extent+1, can tell the two modes apart. Section B compares
+# REAL applyEASU_CPU output against an independent double oracle per border mode
+# and requires every divergent destination byte (mode gap >= 3, the floor that the
+# 1-byte float-vs-double oracle gap allows) to sit on the reflect side. Sections
+# C/D/E drive the real buildSuperResolutionGuidance() over seven synthetic 640x480
+# patterns against an independent double CAS + luma oracle, pin
+# (0.299R+0.587G+0.114B)/255 over the POST-CAS bytes, prove the derived [0,1]
+# range (bit-exact 0.0f/1.0f on flat black/white), exclude R/B-swap, Rec.709,
+# missing-/255 and unsharpened-source expectations, and lock the luma digest
+# across repeats and OpenMP threads 1/2/4. No device, display, GPU, sensor, thread
+# timing or filesystem.
+add_executable(cas_border_contract cas_border_contract.cpp)
+target_compile_definitions(cas_border_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(cas_border_contract PRIVATE azu_test_core)
+
+add_test(NAME cas_border_contract COMMAND cas_border_contract)
+set_tests_properties(cas_border_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 add_test(NAME glb_linear_color_contract COMMAND glb_linear_color_contract)
 set_tests_properties(glb_linear_color_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
