@@ -27,5 +27,11 @@ inline void syncIcpDepthFromRange(FusionHyperparams& h) {
     h.icp.max_depth = h.max_depth;
 }
 
+/** Copy top-level depth clip range into TSDF params (volume gate + raycast bound); call before passing hp.tsdf to the volume. */
+inline void syncTsdfDepthFromRange(FusionHyperparams& h) {
+    h.tsdf.min_depth = h.min_depth;
+    h.tsdf.max_depth = h.max_depth;
+}
+
 } // namespace app
 } // namespace kfusion

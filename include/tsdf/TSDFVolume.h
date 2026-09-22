@@ -35,6 +35,14 @@ struct TSDFParams {
     float truncation     = 0.030f;       // meters (3 voxels at 0.010m)
     float max_weight     = 128.0f;
     Eigen::Vector3f origin = {-1.28f, -1.28f, 0.0f}; // Z: [0, 2.56m], XY: [-1.28, +1.28m]
+    // Active depth band, camera-plane Z-depth in meters. raycast() bounds its march from
+    // these two fields. integrate()/integrateCPU() do NOT read them: they gate on the
+    // min_depth/max_depth arguments given at that public entry point. So this pair is the
+    // raycast bound plus part of the parameter identity, mirrored from the
+    // FusionHyperparams owner by syncTsdfDepthFromRange(). Neither kernel carries a
+    // hard-coded literal. A band change differs under sameParams(), so it clears the volume.
+    float min_depth      = 0.30f;        // nearest measured surface the raycast trusts
+    float max_depth      = 5.00f;        // farthest measured surface the raycast trusts
 };
 
 struct Voxel {

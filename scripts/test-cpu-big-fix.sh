@@ -25,13 +25,16 @@ CPU_LABEL="cpu"
 # Required CPU tests registered by tests/CMakeLists.txt. CTest 4.3 exits 0 with
 # "No tests were found!!!", so a green run without these names is NOT a pass.
 # big-fix todo 12 appended icp_weighting_contract and todo 13 appended
-# icp_numeric_policy_contract; todo 14 appended tsdf_integration_race_contract; every
+# icp_numeric_policy_contract; todo 14 appended tsdf_integration_race_contract; todo 15
+# appended the three TSDF raycast/depth-band contracts; every
 # name is enforced as registered (the list only ever grows, so the guard never
 # weakens).
 REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_contract"
     "marching_cubes_table_contract" "marching_cubes_sphere_contract" "tsdf_reset_contract"
     "mesh_validation_contract" "coordinate_rounding_contract" "icp_weighting_contract"
-    "icp_numeric_policy_contract" "tsdf_integration_race_contract")
+    "icp_numeric_policy_contract" "tsdf_integration_race_contract"
+    "tsdf_raycast_contract" "tsdf_integration_min_depth_contract"
+    "tsdf_subvoxel_thin_feature_contract")
 # Real controller coupling, proven post-build: a source-only replica that
 # re-declares its own look-alike seam methods has none of these symbols. Both
 # real-controller seam binaries must carry them...

@@ -58,19 +58,40 @@ produce a geometrically impossible negative distance. The invalid predicate
 alone is not a sufficient validity gate; a downstream band check is mandatory.
 
 Canonical band source: `include/app/FusionHyperparams.h`
-`min_depth = 0.30f`, `max_depth = 2.50f`, and
-`FusionHyperparams::syncIcpDepthFromRange()` propagates that same pair to ICP.
-`include/tsdf/TSDFVolume.h` `TSDFParams` does **not** carry `min_depth` /
-`max_depth` fields at all: the struct holds only `resolution`, `voxel_size`,
-`truncation`, `max_weight` and `origin`. The configured band therefore reaches
-ICP but not the volume, and no TSDF entry point can consult it.
+`min_depth = 0.30f`, `max_depth = 2.50f`. That pair is the single owner, and the two
+consumers reach it differently:
 
-Known CPU defect (owned by the later CPU depth-domain todo, not a backend
-divergence): propagate the configured `0.30f` / `2.50f` band into `TSDFParams`
-as explicit `min_depth` / `max_depth` fields and honor it in integration and
-raycast. Today the TSDF stage ignores the configured band entirely, which is why
-the integration and raycast rules below are canonical rules the CPU does not yet
-satisfy. See `tsdf:T8` and `tsdf:T19` in the dossier.
+- `raycast()` bounds its march from `include/tsdf/TSDFVolume.h` `TSDFParams`
+  `min_depth` / `max_depth` (defaults `0.30f` / `5.00f`, the historical raycast
+  bounds). `FusionHyperparams` is mirrored into those fields by
+  `syncTsdfDepthFromRange()` — the same role `syncIcpDepthFromRange()` plays for
+  ICP — and `PipelineController` calls both syncs in its constructor and in
+  `setHyperparams()`, before handing `hp.tsdf` / `hp.icp` to the volume and the
+  tracker. `TSDFParams` is therefore the raycast's volume configuration plus part
+  of the volume's parameter identity, not a second user-facing store.
+- `integrate()` / `integrateCPU()` do **not** consult `TSDFParams`: they gate on
+  the `min_depth` / `max_depth` arguments the caller passes at that public entry
+  point, which `PipelineController` supplies from the same owner.
+
+Because the band is part of the parameter identity that `sameParams()` compares
+exactly, changing it in `TSDFParams` clears the volume like any other field (the
+Todo 8 rule). Locked by `tests/tsdf_integration_min_depth_contract.cpp`.
+
+Half-live handoff (**known, owned by Todo 24**): after `setHyperparams()` the GUI
+depth sliders take effect immediately for the CPU raycast, because the mirror
+reaches `params_` through `setParams()`. Integration is not live until restart:
+`integrationLoop()` snapshots `d_min` / `d_max` **once** before its worker loop
+(`src/app/PipelineController.cpp:818-823`) and passes those locals to every
+`integrate()` call, so a band change only reaches integration when the loop is
+restarted. Do not describe the integration gate as live mid-session.
+
+The band is a camera-plane **Z-depth** bound in meters, on both the integration
+and the raycast side. A ray-cam direction `(u, v, 1)` reaches camera depth `z` at
+Euclidean ray parameter `t = z * ||(u, v, 1)||`, so every march that counts `t`
+must scale the band by that norm: the integration near clamp is
+`max(min_depth * ray_dist_scale, t_meas - truncation)` and the raycast marches
+`[min_depth, max_depth] * ||ray_cam||`. Applying the band as a raw ray parameter
+instead mislocates every off-axis hit by that ratio.
 
 Known CPU defect (owned by the depth-domain todo): the raw band and the
 min/max band are enforced at different layers, and the CPU hole fill in
@@ -131,25 +152,43 @@ Current CPU behavior:
   host `Voxel` is 12 bytes with `uint8_t` color. The layout translation happens
   in exactly one place per backend. Deferred as `cross-backend:B3`.
 
-Canonical integration gate: integration honors the configured `min_depth`. The
-hard-coded `0.1f` in `src/tsdf/TSDFVolume.cpp`
-(`d_meas < 0.1f` and `t_min = std::max(0.1f, ...)`) must not override the
-configured value. Deferred backend instance: `tsdf:T8`.
+Canonical integration gate: `integrate()` honors the band **passed to it** — both as
+the per-pixel validity gate and as the near clamp of the truncation march. The CPU
+hard-coded `0.1f` floor (`d_meas < 0.1f`, `t_min = std::max(0.1f, ...)`) that silently
+overrode the caller's near bound is gone; both sites now use the `min_depth` argument,
+with the march clamp scaled to the ray parameter as described above. `integrateCPU()`
+never reads `TSDFParams::min_depth` / `max_depth`; those fields bound the raycast, and
+the band reaches integration only through the public entry point's arguments.
+**Fixed by big-fix Todo 15**, locked by `tests/tsdf_integration_min_depth_contract.cpp`
+(which drives the band through `integrate()`'s parameters). Deferred backend instance:
+`tsdf:T8`. The snapshot lifecycle that keeps the GUI slider stale for integration until
+restart is Todo 24, not a Todo 15 defect.
 
-Canonical raycast: the configured near/far bounds are used, not literals. CPU
-currently hard-codes `t = 0.3f` and `t < 5.0f`
-(`src/tsdf/TSDFVolume.cpp` `raycast()`), identical to both backends
-(`tsdf:T19`). Note the volume's own extent is `256 × 0.010 m = 2.56 m`, so the
-`5.0f` far bound is never the limiting factor. Both bounds are hard-coded
-literals: the near bound is a Kinect-v1 constant, and neither one is a
-`TSDFParams` field today (see the band-source note and the known CPU defect
-recorded with it).
+Canonical raycast: the march is bounded by `params_.min_depth` / `params_.max_depth`
+scaled to the ray parameter (`t = depth * norm(ray_cam)`), never by the literals `0.3f`
+/ `5.0f` that CPU, CUDA and HIP all used to hard-code. CPU now samples the trilinear field
+at a uniform `0.5 * voxel_size` step — the crossing is interpolated between two adjacent
+samples, so a coarser step skips features thinner than the step — and resolves the hit
+with `t_prev + (t - t_prev) * f_prev / (f_prev - f_cur)`, where the divisor is the step
+actually taken (the legacy `t - vs * tsdf / (tsdf - prev)` assumed a full-voxel step
+while the refinement stepped half a voxel, biasing every hit by ~half a voxel). A
+non-finite sample aborts that ray to the canonical no-surface state, and vertex,
+normal and color are written together only for a resolved finite hit, so a rejected ray
+can never leave a stale vertex behind a fresh color. Color is read from the voxel the
+resolved hit actually falls in, and only when that voxel is fused (`weight > 0`).
+**Fixed by big-fix Todo 15**, locked by `tests/tsdf_raycast_contract.cpp` and
+`tests/tsdf_subvoxel_thin_feature_contract.cpp`. Both backends still hard-code the
+bounds and the legacy interpolation (`tsdf:T7`, `tsdf:T16`, `tsdf:T19`, `cross-backend:A11`
+/ `A12` / `A27`). Note the volume's own extent is `256 × 0.010 m = 2.56 m`, so under the
+default `max_depth = 2.50f` the configured far bound, not the extent, is the limit.
 
-Canonical ray crossing: a TSDF exit crossing (`prev < 0 && cur >= 0`) must be
-detected, not only the entry crossing. CPU, CUDA and HIP all detect only
-`prev_tsdf > 0.0f && tsdf <= 0.0f`. **Known CPU defect** plus deferred backend
-parity (`tsdf:T26`): a ray that starts inside material never resolves an exit,
-and a single empty sample resets the pending crossing.
+Canonical ray crossing: a TSDF exit crossing (`prev < 0 && cur >= 0`) must be detected,
+not only the entry crossing. CPU detects both directions, so a ray that starts inside
+material reports the back face (with the flipped normal) instead of nothing, and one
+empty sample no longer resets a pending crossing — the old `prev_tsdf = EMPTY_TSDF`
+reset could also *fabricate* a crossing for an interior start. CUDA and HIP still detect
+only `prev_tsdf > 0.0f && tsdf <= 0.0f`: **known CPU defect fixed by big-fix Todo 15**,
+deferred backend parity as `tsdf:T26`.
 
 Canonical `worldToVoxel` / projection rounding: floor semantics. Every CPU
 coordinate conversion now floors through the shared helper

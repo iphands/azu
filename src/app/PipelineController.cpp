@@ -27,6 +27,7 @@ PipelineController::PipelineController(sensor::PreprocessBackend preferred_backe
       current_pose_(Eigen::Matrix4f::Identity())
 {
     syncIcpDepthFromRange(hyperparams_);
+    syncTsdfDepthFromRange(hyperparams_);
     sensor_  = std::make_unique<sensor::KinectSensor>();
     tracker_ = std::make_unique<tracking::ICPTracker>(hyperparams_.icp);
     tsdf_    = std::make_unique<tsdf::TSDFVolume>(hyperparams_.tsdf);
@@ -230,6 +231,7 @@ FusionHyperparams PipelineController::hyperparamsSnapshot() const {
 void PipelineController::setHyperparams(const FusionHyperparams &h) {
   FusionHyperparams hp = h;
   syncIcpDepthFromRange(hp);
+  syncTsdfDepthFromRange(hp);
   {
     std::lock_guard<std::mutex> lk(hyper_mutex_);
     hyperparams_ = hp;

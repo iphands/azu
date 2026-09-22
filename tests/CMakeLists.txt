@@ -243,6 +243,40 @@ target_link_libraries(tsdf_integration_race_contract PRIVATE azu_test_core)
 add_test(NAME tsdf_integration_race_contract COMMAND tsdf_integration_race_contract)
 set_tests_properties(tsdf_integration_race_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 15: CPU TSDF raycast + configured depth-band contracts ----
+# Public TSDFVolume / FusionHyperparams API only. tsdf_raycast_contract locks the
+# raycast march against hand-derived crossings on a synthetic lattice (Z-depth band
+# derivation for off-axis rays, entry AND exit crossings, non-finite samples resolving
+# to the canonical empty state, vertex/normal/color written in lockstep).
+# tsdf_integration_min_depth_contract locks the CONFIGURED near/far depth gates through
+# integrate() (a hand-derived single-candidate fold moves when min_depth moves; the
+# historical hard-coded 0.1f floor makes two volumes identical), the non-finite pixel
+# gate, TSDFParams' documented defaults and the single-owner sync helper.
+# tsdf_subvoxel_thin_feature_contract sweeps sub-voxel plate phases: representable
+# phases resolve at the piecewise-linear reconstruction zero, unrepresentable phases
+# report nothing, and the configured band truncates both ends of the march.
+# No device, display, GPU, sensor, thread timing or filesystem.
+add_executable(tsdf_raycast_contract tsdf_raycast_contract.cpp)
+target_compile_definitions(tsdf_raycast_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(tsdf_raycast_contract PRIVATE azu_test_core)
+
+add_executable(tsdf_integration_min_depth_contract tsdf_integration_min_depth_contract.cpp)
+target_compile_definitions(tsdf_integration_min_depth_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(tsdf_integration_min_depth_contract PRIVATE azu_test_core)
+
+add_executable(tsdf_subvoxel_thin_feature_contract tsdf_subvoxel_thin_feature_contract.cpp)
+target_compile_definitions(tsdf_subvoxel_thin_feature_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(tsdf_subvoxel_thin_feature_contract PRIVATE azu_test_core)
+
+add_test(NAME tsdf_raycast_contract COMMAND tsdf_raycast_contract)
+set_tests_properties(tsdf_raycast_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
+add_test(NAME tsdf_integration_min_depth_contract COMMAND tsdf_integration_min_depth_contract)
+set_tests_properties(tsdf_integration_min_depth_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
+add_test(NAME tsdf_subvoxel_thin_feature_contract COMMAND tsdf_subvoxel_thin_feature_contract)
+set_tests_properties(tsdf_subvoxel_thin_feature_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that

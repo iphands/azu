@@ -38,6 +38,8 @@ bool sameParams(const TSDFParams& a, const TSDFParams& b) {
            a.voxel_size == b.voxel_size &&
            a.truncation  == b.truncation &&
            a.max_weight  == b.max_weight &&
+           a.min_depth == b.min_depth &&
+           a.max_depth == b.max_depth &&
            (a.origin.array() == b.origin.array()).all();
 }
 } // namespace
@@ -253,10 +255,9 @@ void TSDFVolume::integrateCPU(const float*           depth_meters,
         for (int y = 0; y < height; ++y) {
             for (int x = 0; x < width; ++x) {
                 float d_meas = depth_meters[y * width + x];
-                // Filter invalid depths: too close, too far, or NaN/inf.
-                // Use 0.1f as minimum threshold (original behavior) to avoid
-                // regression; the configured min_depth is owned by Todo 15, not here.
-                if (d_meas < 0.1f || d_meas > max_depth ||
+                // Filter invalid depths: outside the configured band (FusionHyperparams
+                // owns it; the old hard-coded 0.1f floor silently overrode it), or NaN/inf.
+                if (d_meas < min_depth || d_meas > max_depth ||
                     std::isnan(d_meas) || std::isinf(d_meas)) {
                     if (logging) ++local_depth_filtered;
                     continue;
@@ -269,7 +270,10 @@ void TSDFVolume::integrateCPU(const float*           depth_meters,
 
                 // Convert Z-depth to Euclidean distance along the ray
                 float t_meas = d_meas * ray_dist_scale;
-                float t_min  = std::max(0.1f, t_meas - trunc);
+                // t is a Euclidean ray parameter while the band is a Z-depth bound, so
+                // the near clamp is scaled by the same ratio; the other end is the
+                // truncation segment itself.
+                float t_min  = std::max(min_depth * ray_dist_scale, t_meas - trunc);
                 float t_max  = t_meas + trunc;
 
                 // Convert to world space
@@ -394,42 +398,54 @@ void TSDFVolume::raycast(const Eigen::Matrix4f& pose,
             }
 
             Eigen::Vector3f ray_cam((x - cx) / fx, (y - cy) / fy, 1.0f);
+            // The band is a camera-plane Z-depth bound; a point at ray parameter t sits
+            // at camera depth t / |ray_cam|, so the band maps to t by that scale.
+            const float t_near = params_.min_depth * ray_cam.norm();
+            const float t_far  = params_.max_depth * ray_cam.norm();
             Eigen::Vector3f ray_world = (R_cw * ray_cam).normalized();
 
-            float t = 0.3f; // min depth for Kinect v1
-            float prev_tsdf = EMPTY_TSDF;
-            const float trunc = params_.truncation;
+            // Uniform half-voxel march: the crossing is interpolated between two
+            // adjacent samples, so a coarser step would miss features thinner than the
+            // step, and the interpolation divisor must be the step actually taken.
+            const float h = 0.5f * vs;
 
-            while (t < 5.0f) {
-                Eigen::Vector3f p = cam_origin + ray_world * t;
-                float tsdf = getTSDF(p);
+            float t_prev = t_near;
+            float f_prev = getTSDF(cam_origin + ray_world * t_prev);
+            if (!std::isfinite(f_prev)) continue;
 
-                if (tsdf < EMPTY_TSDF) { // Probable geometry region
-                    if (prev_tsdf > 0.0f && tsdf <= 0.0f) {
-                        // Surface zero-crossing found
-                        float t_hit = t - vs * tsdf / (tsdf - prev_tsdf + 1e-6f);
-                        Eigen::Vector3f hit_world = cam_origin + ray_world * t_hit;
-                        
-                        vertices_out[out_idx] = hit_world;
-                        normals_out[out_idx]  = computeNormal(hit_world);
-                        
-                        if (colors_out) {
-                            Eigen::Vector3i vi = worldToVoxel(hit_world);
-                            if (inBounds(vi.x(), vi.y(), vi.z())) {
-                                const Voxel& vox = voxels_[idx(vi.x(), vi.y(), vi.z())];
-                                colors_out[out_idx*3+0] = vox.r;
-                                colors_out[out_idx*3+1] = vox.g;
-                                colors_out[out_idx*3+2] = vox.b;
-                            }
-                        }
-                        break;
+            float t_hit = t_near;
+            bool  found = (f_prev == 0.0f);
+            for (float t = t_near + h; !found && t <= t_far; t += h) {
+                const float f_cur = getTSDF(cam_origin + ray_world * t);
+                if (!std::isfinite(f_cur)) { found = false; break; }
+                if ((f_prev > 0.0f && f_cur <= 0.0f) || (f_prev < 0.0f && f_cur >= 0.0f)) {
+                    t_hit = t_prev + (t - t_prev) * (f_prev / (f_prev - f_cur));
+                    found = true;
+                    break;
+                }
+                t_prev = t;
+                f_prev = f_cur;
+            }
+            if (!found) continue;
+
+            const Eigen::Vector3f hit_world = cam_origin + ray_world * t_hit;
+            const Eigen::Vector3f normal    = computeNormal(hit_world);
+            if (!std::isfinite(t_hit) || !hit_world.allFinite() || !normal.allFinite()) continue;
+
+            vertices_out[out_idx] = hit_world;
+            normals_out[out_idx]  = normal;
+            if (colors_out) {
+                // Color comes from the voxel the resolved hit actually falls in, and
+                // only from a fused (weighted) one, so it cannot be sampled from a
+                // neighbour the surface never reached.
+                const Eigen::Vector3i vi = worldToVoxel(hit_world);
+                if (inBounds(vi.x(), vi.y(), vi.z())) {
+                    const Voxel& vox = voxels_[idx(vi.x(), vi.y(), vi.z())];
+                    if (vox.weight > EMPTY_WEIGHT) {
+                        colors_out[out_idx*3+0] = vox.r;
+                        colors_out[out_idx*3+1] = vox.g;
+                        colors_out[out_idx*3+2] = vox.b;
                     }
-                    prev_tsdf = tsdf;
-                    t += vs * 0.5f; // Small steps near surface
-                } else {
-                    // Unknown or empty space
-                    t += vs; 
-                    prev_tsdf = EMPTY_TSDF;
                 }
             }
         }
