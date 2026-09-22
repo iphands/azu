@@ -190,6 +190,27 @@ target_link_libraries(coordinate_rounding_contract PRIVATE azu_test_core)
 add_test(NAME coordinate_rounding_contract COMMAND coordinate_rounding_contract)
 set_tests_properties(coordinate_rounding_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 12: CPU ICP Huber weighting + finite-rejection contract ----
+# Public ICPTracker::track + buildFramePyramid seams only. The fixture is 10
+# inliers (err 0.01, w 1) + 1 outlier (err 0.08, w 0.25) at identity poses with
+# exactly one level-0 iteration, so t_z decouples and locks the canonical Huber
+# triple: A += w*JJt, b -= J*(w*e), objective = sum psi(|e|). It discriminates
+# against unweighted curvature (-0.12/11.1), w^2 curvature + w^2 e
+# (-0.105/10.1625) and the (w*e)^2 objective (0.0014/11). A +Inf model normal
+# and a NaN model depth (NaN residual with all six Jacobian entries finite)
+# must be rejected so the 11 valid correspondences reproduce the clean result
+# bit-for-bit; the pyramid section locks the 2x downsample depth-jump guard
+# (nearest sample kept across a > max(0.03, 0.05*d_min) span, smoothing and
+# sentinel handling unchanged). Single-threaded via setNumThreads(1); every
+# scenario runs twice and compares bit-for-bit. No device, display, GPU,
+# sensor, thread timing or filesystem.
+add_executable(icp_weighting_contract icp_weighting_contract.cpp)
+target_compile_definitions(icp_weighting_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(icp_weighting_contract PRIVATE azu_test_core)
+
+add_test(NAME icp_weighting_contract COMMAND icp_weighting_contract)
+set_tests_properties(icp_weighting_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that

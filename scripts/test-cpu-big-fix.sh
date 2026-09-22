@@ -24,7 +24,10 @@ PROBE="${REPO_ROOT}/scripts/big-fix-env-probe.sh"
 CPU_LABEL="cpu"
 # Required CPU tests registered by tests/CMakeLists.txt. CTest 4.3 exits 0 with
 # "No tests were found!!!", so a green run without these names is NOT a pass.
-REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_contract")
+# big-fix todo 12 appended icp_weighting_contract; every name is enforced as
+# registered (the list only ever grows, so the guard never weakens).
+REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_contract"
+    "icp_weighting_contract")
 # Real controller coupling, proven post-build: a source-only replica that
 # re-declares its own look-alike seam methods has none of these symbols. Both
 # real-controller seam binaries must carry them...

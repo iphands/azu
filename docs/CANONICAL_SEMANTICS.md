@@ -288,8 +288,17 @@ Canonical CPU ICP policy:
   when the Hessian is ill-conditioned, with a condition-number test.
 - Non-finite rejection on the assembled system and on the update.
 - Translation cap `0.2 m` and rotation cap `0.5 rad` per iteration.
-- A Huber-weighted objective reported consistently: if the gradient uses
-  `w·e`, the curvature must use `w²·JᵀJ`.
+- A Huber-weighted objective reported consistently: with
+  `w = min(1, k / abs_err)` (`k = 0.02f`), the IRLS/MM surrogate
+  `0.5*sum(w_i * e_i^2)` makes the canonical triple — curvature
+  `A += w*J*Jᵀ`, gradient `b -= J*(w*e)`, and the reported per-correspondence
+  objective the **true Huber loss** `psi(abs_err)` (`t^2` for `t <= k`,
+  `2*k*t - k^2` beyond). The pre-Todo-12 rule "if the gradient uses `w·e`, the
+  curvature must use `w²·JᵀJ`" is **false and withdrawn**: `w²*JᵀJ` pairs with
+  a `w²*e*J` gradient, not the `w*e` gradient every file computes, and
+  `0.5*(w*e)^2` is bounded by `2*k^2` so it cannot majorize the unbounded
+  Huber loss it claims to report. The weight is `w` everywhere; see
+  `include/tracking/ICPShared.h`.
 - A rotation matrix re-orthonormalization that cannot return a reflection.
 
 Current CPU behavior (`src/tracking/ICPTracker.cpp`):
@@ -305,12 +314,26 @@ Current CPU behavior (`src/tracking/ICPTracker.cpp`):
   unbounded per-iteration rotation is accepted. GPU caps it at `0.5f`.
   **Known CPU defect** (`cross-backend:A10`). The only backstop is
   `PipelineController.cpp`'s post-hoc `angle > 0.52f` whole-pose rejection.
-- Huber weight `k = 0.02` is applied to the gradient
-  (`acc.add(J, err * w)`) but **not** to the curvature
-  (`A_data[k++] += J[i] * J[j]`). A Huber-IRLS Gauss-Newton step requires
-  `w²·JᵀJ`. This is a shared CPU/GPU correctness bug, not a divergence; the
-  canonical rule is the weighted curvature.
-- NaN guard covers `J[0]` and `J[3]` only, not all six components.
+- Huber weight `k = 0.02` **fixed by big-fix Todo 12**: it now applies
+  consistently to the curvature (`A += w*J*Jᵀ`) and the gradient
+  (`b -= J*(w*e)`), and the reported objective is the true Huber loss
+  `psi(abs_err)`. The pre-Todo-12 code accumulated an unweighted curvature
+  (`A_data[k++] += J[i]*J[j]`), a `w*e` gradient, and a `(w*e)²` objective —
+  three mutually inconsistent quantities. `k` and `psi` now live in one shared
+  header `include/tracking/ICPShared.h` (`kHuberK`, `huberLossFromAbs`), the
+  single source of truth for CPU. This is a shared CPU/GPU correctness item,
+  not a divergence; the backend port is deferred as `tracking:A13`. The CPU
+  triple is locked by `tests/icp_weighting_contract.cpp`.
+- Non-finite rejection **fixed by big-fix Todo 12**: the residual is checked
+  finite *before* the weight is computed, and all six Jacobian components are
+  guarded (the pre-Todo-12 guard sampled only `J[0]` and `J[3]`). A NaN model
+  depth yields a NaN residual with all six Jacobian entries finite, so the
+  residual guard is mandatory and cannot be replaced by a Jacobian-only guard;
+  the two guards are independent and both are required. Locked by
+  `tests/icp_weighting_contract.cpp` (an `+Inf` model normal and a NaN model
+  depth each leave the 11 clean correspondences' pose and objective
+  bit-identical). Backend parity is deferred as `tracking:ALL-3` (both backends
+  still sample only `J[0]`/`J[3]` and never test the residual).
 - SVD re-orthonormalization is `svd.matrixU() * svd.matrixV().transpose()` with
   **no determinant correction**, identically on CPU and both backends. `U·Vᵀ`
   can have `det = -1`, which is a reflection and not a rotation; the correct
@@ -338,12 +361,19 @@ Current CPU behavior (`src/tracking/ICPTracker.cpp`):
   definition per counter, CPU-defined, and the distance/angle gates must be
   evaluated in one named space (CPU measures in world space, GPU in
   reference-camera space).
-- CPU pyramid downsampling (`src/sensor/FrameData.cpp` `downsample()`) has no
-  depth-jump guard, so a 2×2 block straddling a discontinuity averages both
-  surfaces into a ghost vertex at every level. The level-0 normal kernel *does*
-  guard with `max(0.03, d·0.05)`, so the guard exists and is simply absent where
-  coarse-to-fine ICP is most sensitive. Canonical: the depth-jump guard applies
-  at every level. Deferred backend instance: `tracking:GPU-1`.
+- CPU pyramid downsampling (`src/sensor/FrameData.cpp` `downsample()`) **has
+  the depth-jump guard as of big-fix Todo 12**. A 2×2 block whose valid depths
+  span more than the shared `depthJumpThreshold(d_min) = max(0.03, 0.05·d_min)`
+  is **not** averaged (averaging blended both surfaces into a ghost vertex at
+  every coarse level); the whole nearest (smallest-depth) valid sample is kept
+  instead, deterministic by first-minimum scan order. Blocks within the
+  threshold average exactly as before, sentinel `0` samples are still excluded,
+  and fully-invalid blocks stay zero. The threshold constant moved into the
+  shared `include/tracking/ICPShared.h` and the level-0 normal kernel now reads
+  the same value, so the two cannot drift. Canonical: the depth-jump guard
+  applies at every level. The level-0 normal kernel is unchanged. Locked by
+  `tests/icp_weighting_contract.cpp`. Deferred backend instance:
+  `tracking:GPU-1` / `tracking:A34`.
 
 ## Super-resolution and conditioning
 

@@ -1,5 +1,6 @@
 #include "sensor/FrameData.h"
 #include "sensor/KinectSensor.h"
+#include "tracking/ICPShared.h"
 #include <Eigen/Geometry>
 #include <cstring>
 #include <cmath>
@@ -55,8 +56,14 @@ void logFrameDataStats(int frame_id) {
 
 namespace {
 
+// The depth-discontinuity threshold is the SHARED one from
+// include/tracking/ICPShared.h (big-fix Todo 12): the level-0 normal kernel and
+// the pyramid downsample below consume one constant pair
+// (kDepthJumpBaseMeters / kDepthJumpRelFrac) and cannot drift apart. The
+// numeric values equal the literals this file used before Todo 12; only the
+// definition site moved.
 inline float depthJumpThreshold(float depth_m) {
-    return std::max(0.03f, depth_m * 0.05f);
+    return kfusion::tracking::depthJumpThreshold(depth_m);
 }
 
 void updateVerticesFromDepth(FrameData& frame) {
@@ -201,7 +208,15 @@ void computeNormals(FrameData& frame) {
     }
 }
 
-// Simple 2x box filter for downsampling depth + vertex + normal
+// 2x box filter for downsampling depth + vertex + normal, with a depth-jump
+// guard: a 2x2 block whose valid depths straddle a discontinuity larger than
+// the shared max(0.03 m, 5% * d_min) threshold is NOT averaged (that blends
+// both surfaces into a ghost vertex at every coarse pyramid level, the
+// coarse-to-fine ICP's worst input). The nearest (smallest-depth) valid sample
+// is kept whole instead — deterministic by first-minimum scan order. Blocks
+// within the threshold average exactly as before, invalid/sentinel (0) samples
+// are still excluded, and fully invalid blocks stay zero (big-fix Todo 12;
+// docs/CANONICAL_SEMANTICS.md, dossier tracking:A34).
 static FrameData downsample(const FrameData& src) {
     FrameData dst;
     dst.width  = src.width  / 2;
@@ -227,6 +242,8 @@ static FrameData downsample(const FrameData& src) {
             Eigen::Vector3f sum_n = Eigen::Vector3f::Zero();
             float sum_d = 0.0f;
             int count = 0;
+            float d_min = 0.0f, d_max = 0.0f;  // valid-depth span
+            int min_dx = 0, min_dy = 0;         // first-minimum sample position
 
             for (int dy = 0; dy < 2; ++dy) {
                 for (int dx = 0; dx < 2; ++dx) {
@@ -236,17 +253,31 @@ static FrameData downsample(const FrameData& src) {
                         sum_v += src.vertices[idx_src];
                         sum_n += src.normals[idx_src];
                         sum_d += d;
+                        if (count == 0 || d < d_min) { d_min = d; min_dx = dx; min_dy = dy; }
+                        if (count == 0 || d > d_max) { d_max = d; }
                         ++count;
                     }
                 }
             }
 
             if (count > 0) {
-                float inv = 1.0f / static_cast<float>(count);
-                dst.vertices[idx_dst]     = sum_v * inv;
-                dst.depth_meters[idx_dst] = sum_d * inv;
-                float nlen = sum_n.norm();
-                dst.normals[idx_dst] = (nlen > 1e-6f) ? Eigen::Vector3f(sum_n / nlen) : Eigen::Vector3f::Zero();
+                if (d_max - d_min > depthJumpThreshold(d_min)) {
+                    // Discontinuity inside the block: keep the whole nearest
+                    // sample rather than blending surfaces.
+                    int idx_min = (sy + min_dy) * SW + (sx + min_dx);
+                    dst.vertices[idx_dst]     = src.vertices[idx_min];
+                    dst.depth_meters[idx_dst] = src.depth_meters[idx_min];
+                    float nlen = src.normals[idx_min].norm();
+                    dst.normals[idx_dst] = (nlen > 1e-6f)
+                        ? Eigen::Vector3f(src.normals[idx_min] / nlen)
+                        : Eigen::Vector3f::Zero();
+                } else {
+                    float inv = 1.0f / static_cast<float>(count);
+                    dst.vertices[idx_dst]     = sum_v * inv;
+                    dst.depth_meters[idx_dst] = sum_d * inv;
+                    float nlen = sum_n.norm();
+                    dst.normals[idx_dst] = (nlen > 1e-6f) ? Eigen::Vector3f(sum_n / nlen) : Eigen::Vector3f::Zero();
+                }
             }
 
             // Nearest neighbor for RGB

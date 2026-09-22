@@ -1,5 +1,6 @@
 #include "tracking/ICPTracker.h"
 #include "sensor/KinectSensor.h"
+#include "tracking/ICPShared.h"
 #include "utils/CoordinateMath.h"
 #include <Eigen/Dense>
 #include <cmath>
@@ -168,15 +169,22 @@ bool ICPTracker::buildLinearSystem(const sensor::FrameData& live,
             for (int i = 0; i < 6; ++i) b_data[i] = 0.0f;
         }
 
-        inline void add(const float* J, float err) {
+        // Canonical Huber IRLS/MM accumulation (big-fix Todo 12, locked by
+        // tests/icp_weighting_contract.cpp): with w = min(1, kHuberK/|e|),
+        // curvature A += w*J*J^T, gradient b -= J*(w*e), and the reported
+        // objective is the true Huber loss psi(|e|), all from one weight. The
+        // pre-Todo-12 code paired an unweighted curvature and a (w*e)^2
+        // "objective" with the w*e gradient - three inconsistent objectives;
+        // docs/CANONICAL_SEMANTICS.md records why w^2 curvature is also wrong.
+        inline void add(const float* J, float w, float weighted_err, float loss) {
             int k = 0;
             for (int i = 0; i < 6; ++i) {
                 for (int j = i; j < 6; ++j) {
-                    A_data[k++] += J[i] * J[j];
+                    A_data[k++] += w * J[i] * J[j];
                 }
-                b_data[i] -= J[i] * err;
+                b_data[i] -= J[i] * weighted_err;
             }
-            residual += err * err;
+            residual += loss;
             count++;
         }
     };
@@ -253,7 +261,15 @@ bool ICPTracker::buildLinearSystem(const sensor::FrameData& live,
 
             // Point-to-plane error in world space
             float err = model_n_world.dot(v_live_world - model_v_world);
-            
+
+            // Reject a non-finite residual BEFORE the weight is evaluated: a
+            // NaN/Inf err otherwise flows w = k/|err| into (err*w) and poisons
+            // b and the objective. The Jacobian guard below cannot catch it:
+            // J depends only on the model normal and the (finite-guarded) live
+            // vertex, so a NaN model depth yields a NaN err with all six J
+            // entries finite.
+            if (!std::isfinite(err)) continue;
+
             // Jacobian J = [n_live_cam; cross(live_v, n_live_cam)]
             // where n_live_cam = R_cw^T * model_n_world
             Eigen::Vector3f n_live_cam = R_cw.transpose() * model_n_world;
@@ -261,16 +277,20 @@ bool ICPTracker::buildLinearSystem(const sensor::FrameData& live,
 
             float J[6] = { n_live_cam.x(), n_live_cam.y(), n_live_cam.z(), cross.x(), cross.y(), cross.z() };
 
-            if (std::isnan(J[0]) || std::isinf(J[0]) || std::isnan(J[3]) || std::isinf(J[3])) {
+            // Reject a non-finite Jacobian entry on ALL six components (the
+            // pre-Todo-12 guard sampled only J[0] and J[3]), so one corrupted
+            // correspondence can never enter A, b or the objective.
+            if (!std::isfinite(J[0]) || !std::isfinite(J[1]) || !std::isfinite(J[2]) ||
+                !std::isfinite(J[3]) || !std::isfinite(J[4]) || !std::isfinite(J[5])) {
                 continue;
             }
 
-            // Huber weight for robustness
+            // Huber weight for robustness; kHuberK and psi come from
+            // tracking/ICPShared.h (single source of truth).
             float abs_err = std::abs(err);
-            float huber_k = 0.02f; // Reduced from 0.05m to fix ghosting/drift
-            float w = (abs_err <= huber_k) ? 1.0f : huber_k / abs_err;
+            float w = (abs_err <= kHuberK) ? 1.0f : kHuberK / abs_err;
 
-            acc.add(J, err * w);
+            acc.add(J, w, err * w, huberLossFromAbs(abs_err));
         }
     }
 
