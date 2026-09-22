@@ -28,9 +28,8 @@ public:
     // GPU extraction path
     std::shared_ptr<MeshData> extractGPU(const tsdf::TSDFVolume& volume);
 
-    // Look-up tables for Marching Cubes
-    static const int edge_table[256];
-    static const int tri_table[256][16];
+    // Look-up tables for Marching Cubes moved to the shared CPU source of
+    // truth: include/meshing/MarchingCubesTables.h (kfusion::meshing::tables).
 
 private:
 #ifdef CUDA_ENABLED
