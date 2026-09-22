@@ -22,15 +22,28 @@ struct MeshData {
     std::vector<uint8_t>         colors;    // RGB per vertex (positions.size() * 3)
     std::vector<uint32_t>        indices;   // triangle list
 
+    // Set true by an extractor that stopped early because its triangle budget was
+    // exhausted; a full extraction leaves it false, and an empty/no-geometry result
+    // must NOT claim truncation. It is a plain data field (no hidden state): clear()
+    // resets it, so a reused container cannot carry a stale flag.
+    bool truncated = false;
+
     void clear() {
         positions.clear();
         normals.clear();
         colors.clear();
         indices.clear();
+        truncated = false;
     }
 
     bool empty() const { return positions.empty(); }
     size_t triangleCount() const { return indices.size() / 3; }
+
+    // Derived from the buffer itself, never from a parallel boolean: a mesh "has
+    // colors" exactly when the color buffer is non-empty. validate() then guarantees
+    // that a non-empty color buffer holds precisely one RGB triple per vertex, so
+    // this cannot report true for a half-filled color vector.
+    bool hasColors() const { return !colors.empty(); }
 
     void reserve(size_t tri_count) {
         positions.reserve(tri_count * 3);

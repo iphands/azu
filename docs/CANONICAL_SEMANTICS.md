@@ -279,15 +279,38 @@ equivalents stay deferred and are itemised in
 `meshing:B4`, `meshing:C2`, `meshing:C3`, `meshing:C7`, `meshing:D8`,
 `cross-backend:A14`).
 
-Canonical welding: exact edge identity where practical. The CPU weld in
-`src/meshing/MarchingCubes.cpp` keys a hash map on a quantized float position
-(`QuantizedHash`, divisor `voxel_size * 0.01f`), which is not exact edge
-identity and silently merges distinct vertices that quantize together.
-**Known CPU defect.** The HIP weld adds a distance-validated escape branch
-(`merge_threshold = voxel_size * 0.5f`) that is unreachable for finite input —
-two positions that collide under a `0.01·vs` quantizer differ by less than
-`0.0087·vs`, always under the threshold — and if it ever did fire it would
-overwrite the map entry instead of chaining (`meshing:D3` / `cross-backend:A29`).
+Canonical welding: exact edge identity. The CPU weld in
+`src/meshing/MarchingCubes.cpp` keys a hash map on the canonical identity of a
+physical crossing edge - the LOWER endpoint voxel coordinate plus the single axis
+the endpoints differ on - so every cube (and every OpenMP slice boundary) that
+reaches the same edge resolves it to exactly one global vertex. This replaces the
+pre-Todo-17 map keyed on a quantized float position (`QuantizedHash`, divisor
+`voxel_size * 0.01f`), which was not exact edge identity: it silently merged
+distinct vertices that quantized together and split FP-variant shared edges.
+**Fixed by big-fix Todo 17.** The HIP weld still keys a quantized position and
+adds a distance-validated escape branch (`merge_threshold = voxel_size * 0.5f`)
+that is unreachable for finite input - two positions that collide under a
+`0.01·vs` quantizer differ by less than `0.0087·vs`, always under the threshold -
+and if it ever did fire it would overwrite the map entry instead of chaining;
+CUDA/HIP welding stays deferred (`meshing:D3` / `cross-backend:A29`).
+
+Current CPU behavior: **fixed** in `src/meshing/MarchingCubes.cpp`
+(`MarchingCubes::crossingFromLower` is the one interpolation primitive). For each
+canonical edge the crossing is parameterised once from the LOWER endpoint, and a
+single parameter `t` drives position, blended normal and RGB color together, so
+adjacent cubes agree byte-for-byte and the weld never disagrees about a shared
+vertex's payload. The merge runs serially in ascending-slice, local-triangle order
+and welds by `EdgeKey` (first insertion wins - byte-identical because every cube
+derives the same payload for a key). A CPU triangle budget
+(`MarchingCubes::setMaxTriangles`) stops at a full-triangle boundary, sets
+`MeshData::truncated` and never emits a partial row. The progress callback fires
+only during this serial merge, from the calling thread, so it can never overlap and
+its sequence is a pure function of the resolution; a resolution below 2 returns an
+empty mesh instead of dividing a `(resolution - 2)` progress span. Locked by
+`tests/mesh_welding_contract.cpp`, `tests/mesh_color_invariant_contract.cpp` and
+`tests/mesh_truncation_progress_contract.cpp`. The CPU reverse-winding emission
+(`2, 1, 0`) is unchanged and still owed to the winding todo; the unclamped
+float→uint8 color cast (below) is unchanged and still owed to the color todo.
 
 ## Color pipeline and export
 

@@ -2,8 +2,10 @@
 #include "meshing/MarchingCubesTables.h"
 #include <cmath>
 #include <array>
+#include <cstdint>
 #include <iostream>
 #include <limits>
+#include <vector>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -81,20 +83,53 @@ CornerSample sampleCorner(const tsdf::Voxel& v) {
     return {v.tsdf, true};
 }
 
+// Canonical identity of a physical crossing edge: the LOWER endpoint voxel plus the
+// single axis the two endpoints differ on. Two cubes (or a cube across an OpenMP
+// slice boundary) that share a physical edge derive the identical key, so the
+// global weld merges them exactly once. This replaces the pre-Todo-17 spatial
+// quantization, which merged vertices only when their interpolated positions
+// rounded into the same bucket - falsely splitting FP-variant shared edges and
+// falsely merging distinct edges that happened to collide (meshing:D8).
+struct EdgeKey {
+    int     x, y, z;
+    uint8_t axis;
+    bool operator==(const EdgeKey& o) const {
+        return x == o.x && y == o.y && z == o.z && axis == o.axis;
+    }
+};
+
+struct EdgeKeyHash {
+    size_t operator()(const EdgeKey& k) const {
+        // mix distinct primes over the four small fields
+        size_t h = static_cast<size_t>(k.x) * 0x9E3779B97F4A7C15ull;
+        h ^= (static_cast<size_t>(static_cast<uint32_t>(k.y)) + 0x9E3779B9u + (h << 6) + (h >> 2));
+        h ^= (static_cast<size_t>(static_cast<uint32_t>(k.z)) + 0x9E3779B9u + (h << 6) + (h >> 2));
+        h ^= (static_cast<size_t>(k.axis) + 0x9E3779B9u + (h << 6) + (h >> 2));
+        return h;
+    }
+};
+
 } // namespace
 
-Eigen::Vector3f MarchingCubes::interpolateEdge(
-    const Eigen::Vector3f& p1, float v1,
-    const Eigen::Vector3f& p2, float v2)
+MarchingCubes::EdgeCrossing MarchingCubes::crossingFromLower(
+    const Eigen::Vector3f& p_low, float v_low,
+    const Eigen::Vector3f& p_up,  float v_up)
 {
-    if (!std::isfinite(v1) || !std::isfinite(v2) || !isFiniteVec(p1) || !isFiniteVec(p2))
-        return invalidNormal();
-    if (std::abs(v1) < kInterpEpsilon) return p1;
-    if (std::abs(v2) < kInterpEpsilon) return p2;
-    float diff = v1 - v2;
-    if (!std::isfinite(diff) || std::abs(diff) < kInterpEpsilon) return p1;
-    float t = std::max(0.0f, std::min(1.0f, v1 / diff));
-    return p1 + t * (p2 - p1);
+    if (!std::isfinite(v_low) || !std::isfinite(v_up) ||
+        !isFiniteVec(p_low) || !isFiniteVec(p_up))
+        return {invalidNormal(), 0.0f, false};
+    // A zero endpoint IS the crossing, so return that endpoint exactly. `t` is
+    // measured from the lower endpoint (0 at low, 1 at up), so every cube that
+    // reaches this physical edge from any orientation obtains the identical `t`,
+    // position, normal and color - the shared-parameter guarantee that the old
+    // position-only interpolateEdge could not carry (meshing:D8).
+    if (std::abs(v_low) < kInterpEpsilon) return {p_low, 0.0f, true};
+    if (std::abs(v_up)  < kInterpEpsilon) return {p_up,  1.0f, true};
+    const float diff = v_low - v_up;
+    if (!std::isfinite(diff) || std::abs(diff) < kInterpEpsilon)
+        return {p_low, 0.0f, true};   // collapsed blend: deterministic lower endpoint
+    const float t = std::max(0.0f, std::min(1.0f, v_low / diff));
+    return {p_low + t * (p_up - p_low), t, true};
 }
 
 Eigen::Vector3f MarchingCubes::voxelNormal(const tsdf::TSDFVolume& vol, int x, int y, int z) {
@@ -138,26 +173,37 @@ Eigen::Vector3f MarchingCubes::voxelNormal(const tsdf::TSDFVolume& vol, int x, i
 std::shared_ptr<MeshData> MarchingCubes::extract(const tsdf::TSDFVolume& volume,
                                             ProgressCallback progress_cb)
 {
-    const auto& p     = volume.params();
-    const int   RES_X = p.resolution;
-    const int   RES_Y = p.resolution;
-    const int   RES_Z = p.resolution;
+    const auto& p = volume.params();
+    const int   RES = p.resolution;
 
-    std::shared_ptr<MeshData> mesh_final = std::make_shared<MeshData>();
+    auto out = std::make_shared<MeshData>();
 
-    // Parallelize over slices (Z direction)
-    std::vector<MeshData> slice_meshes(RES_Z - 1);
+    // Fewer than two voxels per axis contains no cube; return an empty mesh rather
+    // than sizing slice arrays to (RES - 1) == 0 or dividing a progress span by
+    // (RES - 2) == 0. The final progress call is still emitted, exactly 1.0.
+    if (RES < 2) {
+        if (progress_cb) progress_cb(1.0f);
+        return out;
+    }
+
+    // Per-slice local output. Every emitted local vertex carries the canonical
+    // EdgeKey of the physical edge it came from, so the serial merge can weld by
+    // exact edge identity instead of a quantized world position.
+    struct SliceOut {
+        std::vector<Eigen::Vector3f> pos;
+        std::vector<Eigen::Vector3f> nrm;
+        std::vector<uint8_t>         col;
+        std::vector<EdgeKey>         key;
+        std::vector<uint32_t>        idx;
+    };
+    std::vector<SliceOut> slices(RES - 1);
 
     #pragma omp parallel for schedule(dynamic, 4)
-    for (int z = 0; z < RES_Z - 1; ++z) {
+    for (int z = 0; z < RES - 1; ++z) {
+        auto& sl = slices[z];
 
-        if (progress_cb && (z % 10 == 0)) 
-            progress_cb(static_cast<float>(z) / (RES_Z - 2));
-
-        auto& local_mesh = slice_meshes[z];
-        
-        for (int y = 0; y < RES_Y - 1; ++y) {
-            for (int x = 0; x < RES_X - 1; ++x) {
+        for (int y = 0; y < RES - 1; ++y) {
+            for (int x = 0; x < RES - 1; ++x) {
                 tsdf::Voxel corner_vox[8];
                 CornerSample corner[8];
                 for (int c = 0; c < 8; ++c) {
@@ -182,9 +228,6 @@ std::shared_ptr<MeshData> MarchingCubes::extract(const tsdf::TSDFVolume& volume,
                         z + CORNER_OFFSETS[c][2]);
                 }
 
-                // One gradient evaluation per cube corner, shared by every crossing
-                // edge that touches it. The old path recomputed it per edge endpoint,
-                // up to 24 evaluations for the same 8 corners.
                 Eigen::Vector3f corner_norm[8];
                 bool corner_norm_done[8] = {false, false, false, false,
                                             false, false, false, false};
@@ -199,9 +242,10 @@ std::shared_ptr<MeshData> MarchingCubes::extract(const tsdf::TSDFVolume& volume,
                     return corner_norm[c];
                 };
 
-                Eigen::Vector3f edge_verts[12];
+                Eigen::Vector3f edge_pos[12];
                 Eigen::Vector3f edge_norms[12];
                 uint8_t         edge_colors[12][3];
+                EdgeKey         edge_key[12];
                 bool            edge_ok[12] = {false, false, false, false,
                                                false, false, false, false,
                                                false, false, false, false};
@@ -210,37 +254,45 @@ std::shared_ptr<MeshData> MarchingCubes::extract(const tsdf::TSDFVolume& volume,
                     if (!(edge_mask & (1 << e))) continue;
                     const int c0 = EDGE_CORNERS[e][0];
                     const int c1 = EDGE_CORNERS[e][1];
-
-                    // A crossing edge is emitted only when both of its endpoints
-                    // carry measured, finite data. An unobserved corner elsewhere in
-                    // the cube no longer deletes the cube.
                     if (!corner[c0].supported || !corner[c1].supported) continue;
 
-                    const Eigen::Vector3f vtx = interpolateEdge(
-                        corner_pos[c0], corner[c0].value,
-                        corner_pos[c1], corner[c1].value);
-                    if (!isFiniteVec(vtx)) continue;
+                    // Canonical edge identity + which endpoint is the LOWER one. A unit
+                    // edge varies on exactly one axis; the lower endpoint is the corner
+                    // with the smaller coordinate on that axis. Keying and orienting by
+                    // the lower endpoint makes the payload identical for every cube that
+                    // reaches this physical edge, from any direction or slice.
+                    const int d0x = x + CORNER_OFFSETS[c0][0], d0y = y + CORNER_OFFSETS[c0][1], d0z = z + CORNER_OFFSETS[c0][2];
+                    const int d1x = x + CORNER_OFFSETS[c1][0], d1y = y + CORNER_OFFSETS[c1][1], d1z = z + CORNER_OFFSETS[c1][2];
+                    int axis, low_c, up_c;
+                    if (d0x != d1x)      { axis = 0; low_c = (d0x <= d1x) ? c0 : c1; up_c = (d0x <= d1x) ? c1 : c0; }
+                    else if (d0y != d1y) { axis = 1; low_c = (d0y <= d1y) ? c0 : c1; up_c = (d0y <= d1y) ? c1 : c0; }
+                    else                 { axis = 2; low_c = (d0z <= d1z) ? c0 : c1; up_c = (d0z <= d1z) ? c1 : c0; }
+                    edge_key[e] = EdgeKey{ x + CORNER_OFFSETS[low_c][0],
+                                           y + CORNER_OFFSETS[low_c][1],
+                                           z + CORNER_OFFSETS[low_c][2],
+                                           static_cast<uint8_t>(axis) };
 
-                    const Eigen::Vector3f n0 = cornerNormalAt(c0);
-                    const Eigen::Vector3f n1 = cornerNormalAt(c1);
-                    if (!isFiniteVec(n0) || !isFiniteVec(n1)) continue;
+                    // ONE interpolation parameter drives position, normal and color.
+                    const EdgeCrossing cr = crossingFromLower(
+                        corner_pos[low_c], corner[low_c].value,
+                        corner_pos[up_c],  corner[up_c].value);
+                    if (!cr.ok) continue;
 
-                    const float diff = corner[c0].value - corner[c1].value;
-                    float t = 0.0f;
-                    if (std::isfinite(diff) && std::abs(diff) >= kInterpEpsilon)
-                        t = std::max(0.0f, std::min(1.0f, corner[c0].value / diff));
+                    const Eigen::Vector3f n_low = cornerNormalAt(low_c);
+                    const Eigen::Vector3f n_up  = cornerNormalAt(up_c);
+                    if (!isFiniteVec(n_low) || !isFiniteVec(n_up)) continue;
 
                     // A cancelled endpoint pair blends to the zero vector; refuse the
                     // edge instead of normalizing it into a NaN or a fabricated normal.
-                    const Eigen::Vector3f blended = n0 + t * (n1 - n0);
+                    const Eigen::Vector3f blended = n_low + cr.t * (n_up - n_low);
                     const float blend_len = blended.norm();
                     if (!std::isfinite(blend_len) || blend_len <= kGradientEpsilon) continue;
 
-                    edge_verts[e]  = vtx;
-                    edge_norms[e]  = blended / blend_len;
-                    edge_colors[e][0] = static_cast<uint8_t>(corner_vox[c0].r + t * (static_cast<float>(corner_vox[c1].r) - corner_vox[c0].r));
-                    edge_colors[e][1] = static_cast<uint8_t>(corner_vox[c0].g + t * (static_cast<float>(corner_vox[c1].g) - corner_vox[c0].g));
-                    edge_colors[e][2] = static_cast<uint8_t>(corner_vox[c0].b + t * (static_cast<float>(corner_vox[c1].b) - corner_vox[c0].b));
+                    edge_pos[e]   = cr.position;
+                    edge_norms[e] = blended / blend_len;
+                    edge_colors[e][0] = static_cast<uint8_t>(corner_vox[low_c].r + cr.t * (static_cast<float>(corner_vox[up_c].r) - corner_vox[low_c].r));
+                    edge_colors[e][1] = static_cast<uint8_t>(corner_vox[low_c].g + cr.t * (static_cast<float>(corner_vox[up_c].g) - corner_vox[low_c].g));
+                    edge_colors[e][2] = static_cast<uint8_t>(corner_vox[low_c].b + cr.t * (static_cast<float>(corner_vox[up_c].b) - corner_vox[low_c].b));
                     edge_ok[e] = true;
                 }
 
@@ -248,85 +300,68 @@ std::shared_ptr<MeshData> MarchingCubes::extract(const tsdf::TSDFVolume& volume,
                     const int ea = tables::tri_table[cube_idx][t + 0];
                     const int eb = tables::tri_table[cube_idx][t + 1];
                     const int ec = tables::tri_table[cube_idx][t + 2];
-                    // A triangle needs all three of its vertices; refusing one edge
-                    // costs only the rows that reference it. An edge the mask never
-                    // marked is never read, so a table slip cannot emit garbage here.
                     if (!edge_ok[ea] || !edge_ok[eb] || !edge_ok[ec]) continue;
                     const int tri_edges[3] = {ea, eb, ec};
                     // Reverse winding (2, 1, 0 instead of 0, 1, 2) to fix front-face culling
                     for (int i = 2; i >= 0; --i) {
-                        int e = tri_edges[i];
-                        uint32_t vidx = static_cast<uint32_t>(local_mesh.positions.size());
-                        local_mesh.positions.push_back(edge_verts[e]);
-                        // TSDF gradient already points OUT (toward camera), so keep it positive
-                        local_mesh.normals.push_back(edge_norms[e]);
-                        local_mesh.colors.push_back(edge_colors[e][0]);
-                        local_mesh.colors.push_back(edge_colors[e][1]);
-                        local_mesh.colors.push_back(edge_colors[e][2]);
-                        local_mesh.indices.push_back(vidx);
+                        const int e = tri_edges[i];
+                        const uint32_t vidx = static_cast<uint32_t>(sl.pos.size());
+                        sl.pos.push_back(edge_pos[e]);
+                        sl.nrm.push_back(edge_norms[e]);
+                        sl.col.push_back(edge_colors[e][0]);
+                        sl.col.push_back(edge_colors[e][1]);
+                        sl.col.push_back(edge_colors[e][2]);
+                        sl.key.push_back(edge_key[e]);
+                        sl.idx.push_back(vidx);
                     }
                 }
             }
         }
     }
 
-    // Merge results with unified vertex mapping
-    // Use spatial quantization to ensure vertices at slice boundaries are unified
-    std::shared_ptr<MeshData> total_mesh = std::make_shared<MeshData>();
-    
-    // Quantize positions to voxel grid for reliable unification
-    struct QuantizedPos {
-        int ix, iy, iz;
-        
-        QuantizedPos(const Eigen::Vector3f& pos, float voxel_size) {
-            ix = static_cast<int>(std::round(pos.x() / voxel_size));
-            iy = static_cast<int>(std::round(pos.y() / voxel_size));
-            iz = static_cast<int>(std::round(pos.z() / voxel_size));
-        }
-        
-        bool operator==(const QuantizedPos& other) const {
-            return ix == other.ix && iy == other.iy && iz == other.iz;
-        }
-    };
-    
-    struct QuantizedHash {
-        size_t operator()(const QuantizedPos& q) const {
-            return std::hash<int>{}(q.ix) ^ 
-                   (std::hash<int>{}(q.iy) << 1) ^ 
-                   (std::hash<int>{}(q.iz) << 2);
-        }
-    };
-    
-    std::unordered_map<QuantizedPos, uint32_t, QuantizedHash> global_map;
+    // Serial, deterministic merge: slices in ascending z, triangles in local order,
+    // welded by exact EdgeKey (first insertion wins). Because every cube derives the
+    // same payload for a given key, first-wins is byte-identical regardless of which
+    // cube or thread reached the edge first. The progress callback fires ONLY here,
+    // from the calling thread, so it can never overlap and its sequence is a pure
+    // function of the resolution. The triangle budget stops at a full-triangle
+    // boundary and never emits a partial row.
+    std::unordered_map<EdgeKey, uint32_t, EdgeKeyHash> weld;
+    const size_t cap = max_triangles_cpu_;
+    size_t tri_emitted = 0;
+    bool   truncated   = false;
 
-    for (const auto& sm : slice_meshes) {
-        if (sm.empty()) continue;
-        
-        for (size_t i = 0; i < sm.indices.size(); ++i) {
-            uint32_t old_idx = sm.indices[i];
-            const auto& pos = sm.positions[old_idx];
-            
-            QuantizedPos qpos(pos, p.voxel_size * 0.01f); // Fine quantization for accuracy
-            auto it = global_map.find(qpos);
-            if (it != global_map.end()) {
-                total_mesh->indices.push_back(it->second);
-            } else {
-                uint32_t new_idx = static_cast<uint32_t>(total_mesh->positions.size());
-                global_map[qpos] = new_idx;
-                total_mesh->positions.push_back(pos);
-                total_mesh->normals.push_back(sm.normals[old_idx]);
-                if (sm.colors.size() == sm.positions.size() * 3) {
-                    total_mesh->colors.push_back(sm.colors[old_idx*3+0]);
-                    total_mesh->colors.push_back(sm.colors[old_idx*3+1]);
-                    total_mesh->colors.push_back(sm.colors[old_idx*3+2]);
+    for (int z = 0; z < RES - 1; ++z) {
+        const SliceOut& sl = slices[z];
+        for (size_t i = 0; i + 2 < sl.idx.size(); i += 3) {
+            if (tri_emitted >= cap) { truncated = true; break; }
+            for (int k = 0; k < 3; ++k) {
+                const uint32_t li   = sl.idx[i + k];
+                const EdgeKey& key  = sl.key[li];
+                const auto     it   = weld.find(key);
+                uint32_t       gi;
+                if (it != weld.end()) {
+                    gi = it->second;
+                } else {
+                    gi = static_cast<uint32_t>(out->positions.size());
+                    weld.emplace(key, gi);
+                    out->positions.push_back(sl.pos[li]);
+                    out->normals.push_back(sl.nrm[li]);
+                    out->colors.push_back(sl.col[li * 3 + 0]);
+                    out->colors.push_back(sl.col[li * 3 + 1]);
+                    out->colors.push_back(sl.col[li * 3 + 2]);
                 }
-                total_mesh->indices.push_back(new_idx);
+                out->indices.push_back(gi);
             }
+            ++tri_emitted;
         }
+        if (progress_cb)
+            progress_cb(static_cast<float>(z + 1) / static_cast<float>(RES - 1));
     }
 
+    out->truncated = truncated;
     if (progress_cb) progress_cb(1.0f);
-    return total_mesh;
+    return out;
 }
 
 } // namespace meshing

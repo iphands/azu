@@ -296,6 +296,40 @@ target_link_libraries(marching_cubes_frontier_contract PRIVATE azu_test_core)
 add_test(NAME marching_cubes_frontier_contract COMMAND marching_cubes_frontier_contract)
 set_tests_properties(marching_cubes_frontier_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 17: CPU exact edge-key welding + mesh invariant contracts ----
+# Public TSDFVolume + MarchingCubes::extract only, direct synthetic volumes. The
+# welding contract proves the CPU weld maps each physical crossing edge to exactly
+# ONE global vertex by canonical edge identity (lower voxel + axis) rather than a
+# quantized world position, and that the welded vertex count equals an independent
+# distinct-edge-key oracle. The color contract locks exact color/geometry lockstep,
+# hasColors()/validate(), and that a vertex color is interpolated with the SAME
+# parameter that produced its position. The truncation/progress contract drives the
+# CPU triangle budget (full-triangle boundary, MeshData::truncated, no partial row)
+# and the ProgressCallback thread-safety (never concurrent, monotonic, final 1.0,
+# deterministic sequence, graceful tiny-resolution handling). Expectations are
+# independent oracles, never product snapshots. No device, display, GPU, sensor,
+# thread timing or filesystem.
+add_executable(mesh_welding_contract mesh_welding_contract.cpp)
+target_compile_definitions(mesh_welding_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(mesh_welding_contract PRIVATE azu_test_core)
+
+add_executable(mesh_color_invariant_contract mesh_color_invariant_contract.cpp)
+target_compile_definitions(mesh_color_invariant_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(mesh_color_invariant_contract PRIVATE azu_test_core)
+
+add_executable(mesh_truncation_progress_contract mesh_truncation_progress_contract.cpp)
+target_compile_definitions(mesh_truncation_progress_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(mesh_truncation_progress_contract PRIVATE azu_test_core)
+
+add_test(NAME mesh_welding_contract COMMAND mesh_welding_contract)
+set_tests_properties(mesh_welding_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
+add_test(NAME mesh_color_invariant_contract COMMAND mesh_color_invariant_contract)
+set_tests_properties(mesh_color_invariant_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
+add_test(NAME mesh_truncation_progress_contract COMMAND mesh_truncation_progress_contract)
+set_tests_properties(mesh_truncation_progress_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that
