@@ -1,5 +1,6 @@
 #include "tracking/ICPTracker.h"
 #include "sensor/KinectSensor.h"
+#include "utils/CoordinateMath.h"
 #include <Eigen/Dense>
 #include <cmath>
 #include <algorithm>
@@ -193,7 +194,11 @@ bool ICPTracker::buildLinearSystem(const sensor::FrameData& live,
         for (int x = 1; x < W - 1; ++x) {
             int idx = y * W + x;
             const Eigen::Vector3f& live_v = live.vertices[idx];
-            if (live_v.z() <= 0.001f) continue;
+            // Reject invalid and non-finite live vertices up front. The z bound is
+            // unchanged for finite vertices; the allFinite test additionally drops
+            // NaN/Inf, which the bare `<= 0.001f` predicate let through (a NaN z
+            // compares false), so such a vertex never reaches the projection below.
+            if (live_v.z() <= 0.001f || !live_v.allFinite()) continue;
 
             // Project live vertex into the reference camera (model image)
             Eigen::Vector3f v_ref = R_rel * live_v + t_rel;
@@ -204,8 +209,19 @@ bool ICPTracker::buildLinearSystem(const sensor::FrameData& live,
             float model_x = sensor::FX * v_ref.x() * inv_z + sensor::CX;
             float model_y = sensor::FY * v_ref.y() * inv_z + sensor::CY;
 
-            int mx = static_cast<int>(model_x + 0.5f);
-            int my = static_cast<int>(model_y + 0.5f);
+            // Round the sub-pixel projection to the nearest model pixel with the
+            // shared floor primitive: floor(model + 0.5) (round-half-up), the CPU
+            // canonical rounding (docs/CANONICAL_SEMANTICS.md). floorToInt rejects
+            // a non-finite or out-of-int-range projection (e.g. an inv_z blow-up)
+            // before any integer coordinate is produced, replacing the old
+            // static_cast<int>(model + 0.5f) that truncated toward zero and cast
+            // NaN/Inf as undefined behavior.
+            int mx = 0;
+            int my = 0;
+            if (!utils::floorToInt(model_x + 0.5f, &mx) ||
+                !utils::floorToInt(model_y + 0.5f, &my)) {
+                continue;
+            }
 
             if (mx < 0 || mx >= sensor::FRAME_W || my < 0 || my >= sensor::FRAME_H) continue;
             acc.projected++;

@@ -151,11 +151,17 @@ detected, not only the entry crossing. CPU, CUDA and HIP all detect only
 parity (`tsdf:T26`): a ray that starts inside material never resolves an exit,
 and a single empty sample resets the pending crossing.
 
-Canonical `worldToVoxel` / projection rounding: floor semantics. CPU
-integration uses `std::floor` while `worldToVoxel()` truncates via
-`static_cast<int>`; the two disagree for negative coordinates. **Known CPU
-defect** (owned by the coordinate-rounding todo); backend instance deferred as
-`cross-backend:A18` / `A19`.
+Canonical `worldToVoxel` / projection rounding: floor semantics. Every CPU
+coordinate conversion now floors through the shared helper
+`kfusion::utils::floorToInt` (`include/utils/CoordinateMath.h`): `worldToVoxel()`
+and the ICP model-pixel projection (`std::floor(model + 0.5)`) both floor and
+reject a non-finite or out-of-`int` input before any integer coordinate is
+produced, so CPU integration, `worldToVoxel()` and projection agree for negative
+coordinates. A non-finite or out-of-range `worldToVoxel()` input returns the
+out-of-bounds sentinel `(INT_MIN, INT_MIN, INT_MIN)`, which `inBounds()` rejects
+(so a below-origin point is no longer truncated to voxel `(0,0,0)`). **Fixed by
+big-fix Todo 11**, locked by `tests/coordinate_rounding_contract.cpp`; the
+backend instance remains deferred as `cross-backend:A18` / `A19`.
 
 ## Marching Cubes and winding
 

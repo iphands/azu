@@ -1,4 +1,6 @@
 #include "tsdf/TSDFVolume.h"
+#include "utils/CoordinateMath.h"
+#include <climits>
 #include <iostream>
 #include <algorithm>
 #include <cmath>
@@ -448,7 +450,20 @@ Voxel& TSDFVolume::voxelAt(int x, int y, int z) {
 
 Eigen::Vector3i TSDFVolume::worldToVoxel(const Eigen::Vector3f& world) const {
     Eigen::Vector3f v = (world - params_.origin) / params_.voxel_size;
-    return Eigen::Vector3i(static_cast<int>(v.x()), static_cast<int>(v.y()), static_cast<int>(v.z()));
+    // Floor each axis independently through the shared helper (CPU canonical
+    // rounding, docs/CANONICAL_SEMANTICS.md), so negative coordinates round
+    // toward -inf exactly like the trilinear sampler in getTSDF() and the march
+    // in integrateCPU() already do. A non-finite or out-of-int-range axis yields
+    // the out-of-bounds sentinel, which inBounds() (and every caller, including
+    // the getTSDF fallback) rejects, instead of the old static_cast<int> that
+    // truncated toward zero and aliased a below-origin point to voxel (0,0,0).
+    int vx = 0, vy = 0, vz = 0;
+    if (!utils::floorToInt(v.x(), &vx) ||
+        !utils::floorToInt(v.y(), &vy) ||
+        !utils::floorToInt(v.z(), &vz)) {
+        return Eigen::Vector3i(INT_MIN, INT_MIN, INT_MIN);
+    }
+    return Eigen::Vector3i(vx, vy, vz);
 }
 
 Eigen::Vector3f TSDFVolume::voxelToWorld(const Eigen::Vector3i& v) const {

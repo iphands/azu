@@ -171,6 +171,25 @@ target_link_libraries(mesh_validation_contract PRIVATE azu_test_core)
 add_test(NAME mesh_validation_contract COMMAND mesh_validation_contract)
 set_tests_properties(mesh_validation_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 11: CPU coordinate floor-semantics contract ----
+# Shared kfusion::utils::floorToInt() (include/utils/CoordinateMath.h) plus the
+# two CPU production surfaces that consume it: TSDFVolume::worldToVoxel/getTSDF
+# and the ICP model-pixel projection. Public API only: a small negative-origin,
+# power-of-two-voxel volume is driven through worldToVoxel/getTSDF(fallback)/
+# voxelToWorld, raycast runs the getTSDF path end to end, and ICPTracker::track
+# is exercised with finite, NaN and Inf live vertices through its public entry
+# point (ICPResult::valid_live_points is the witness for the finite guard). No
+# device, display, GPU, sensor, thread timing or filesystem. RED at todo 11
+# before the product fix: worldToVoxel truncated with static_cast<int>, so a
+# below-origin point aliased to voxel (0,0,0) and the NaN/Inf live vertices were
+# counted as valid live; GREEN once both paths floor and reject non-finite input.
+add_executable(coordinate_rounding_contract coordinate_rounding_contract.cpp)
+target_compile_definitions(coordinate_rounding_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(coordinate_rounding_contract PRIVATE azu_test_core)
+
+add_test(NAME coordinate_rounding_contract COMMAND coordinate_rounding_contract)
+set_tests_properties(coordinate_rounding_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # ---- Mechanical anti-synthetic gate (configure-time, comment-hardened) ----
 # big-fix todo 3 hardening of the todo 2 gate:
 #   F1 fix: a raw text MATCHES was satisfiable by a printf-only replica that
