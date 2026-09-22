@@ -120,8 +120,14 @@ void applyCAS_CPU(std::vector<uint8_t>& rgb, int width, int height, float sharpn
 
     std::vector<uint8_t> scratch(rgb.size());
 
-    // Map sharpness [0.0, 1.0] → FSR peak [-1/8, -1/5]
-    const float t    = std::clamp(sharpness, 0.0f, 1.0f);
+    // Map sharpness [0.0, 1.0] → FSR peak [-1/8, -1/5].
+    // std::clamp returns its argument UNCHANGED when both comparisons are false,
+    // i.e. for every non-finite sharpness: NaN stayed NaN, so peak became NaN and
+    // the byte store below evaluated static_cast<uint8_t>(NaN * 255.0f) — undefined
+    // behavior. One explicit finite test now owns the decision (big-fix Todo 22):
+    // NaN, +Inf and -Inf all map to the softest valid sharpen, 0.0f, and nothing
+    // non-finite can reach peak.
+    const float t    = std::isfinite(sharpness) ? std::clamp(sharpness, 0.0f, 1.0f) : 0.0f;
     const float peak = -1.0f / ((1.0f - t) * 8.0f + t * 5.0f);
 
     #pragma omp parallel for schedule(static)

@@ -540,8 +540,15 @@ void PipelineController::trackingLoop() {
     if (preprocessor_) {
         preprocessor_->process(*raw, d_min, d_max);
     }
-    // TODO: Use upscaled RGB for better texture quality in TSDF integration (future scope)
-    // Currently disabled as it causes black textures - needs further investigation
+    // Upscaled RGB for TSDF texturing stays DISABLED (future scope).
+    // srUpscaledAvailable() is now the gate: the CPU path publishes the buffer
+    // only after producing a fresh, correctly sized frame, and any future
+    // consumer MUST check that contract before touching getSrRgbUpscaled() —
+    // the getter alone hands out preallocated zero bytes, which is what made the
+    // uncommented line below produce black textures. GPU upscaled output is
+    // deferred, not valid: no CUDA/HIP conditioner implements an EASU upscaled
+    // pass, so srUpscaledAvailable() reports false there by contract (see
+    // docs/CUDA_HIP_DEFERRED_CHANGES.md).
     // const auto& upscaled_rgb = preprocessor_->getSrRgbUpscaled();
     // sensor::buildFrameData(raw->depth.data(), upscaled_rgb.data(), *frame, d_min, d_max);
     sensor::buildFrameData(raw->depth.data(), raw->rgb.data(), *frame, d_min, d_max);

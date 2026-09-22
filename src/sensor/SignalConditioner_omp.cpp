@@ -31,6 +31,11 @@ constexpr int kHoleFillRadius = 2;
 constexpr int kGuidedRadius = 4;
 constexpr int kRgbBilateralRadius = 2;
 constexpr int kDepthMedianRadius = 1;
+// Only a scale in this range can ever describe an upscaled buffer (big-fix
+// Todo 22). applyEASU_CPU rejects anything outside it, so publishing a buffer
+// for scale 1 or 5 would hand a consumer an image it cannot even size.
+constexpr int kSrScaleMin = 2;
+constexpr int kSrScaleMax = 4;
 constexpr float kEmaJumpResetMeters = 0.05f;
 constexpr float kGuidedSigmaLuma = 0.10f;
 constexpr float kGuidedSigmaDepth = 0.04f;
@@ -90,6 +95,15 @@ void logFrameStats(int frame_id) {
 
 inline uint8_t clampToByte(float v) {
     return static_cast<uint8_t>(std::clamp(v, 0.0f, 255.0f));
+}
+
+// Exact byte size an upscaled buffer must have at `scale` to be publishable
+// (big-fix Todo 22). Widened before each multiply: the scale-4 case is
+// 2560 * 1920 * 3 = 14,745,600 bytes, and a size_t product cannot truncate even
+// if a wider sensor or scale made the intermediate grow past int range.
+inline size_t upscaledBytes(int scale) {
+    return static_cast<size_t>(FRAME_W) * static_cast<size_t>(scale) *
+           static_cast<size_t>(FRAME_H) * static_cast<size_t>(scale) * 3u;
 }
 
 // Edge detection for edge-aware filtering. A sample that is not usable depth
@@ -234,6 +248,7 @@ SignalConditioner::SignalConditioner()
 
 void SignalConditioner::reset() {
     resetEMA();
+    invalidateUpscaled();
     std::fill(sr_rgb_.begin(), sr_rgb_.end(), 0);
     std::fill(sr_rgb_upscaled_.begin(), sr_rgb_upscaled_.end(), 0);
     std::fill(rgb_scratch_.begin(), rgb_scratch_.end(), 0);
@@ -268,6 +283,12 @@ void SignalConditioner::resetEMA() {
 void SignalConditioner::process(RawFrame& raw, cudaStream_t cuda_stream, float min_depth_m, float max_depth_m) {
     (void)cuda_stream;
 
+    // Invalidated before the size guard and before any GPU dispatch (big-fix
+    // Todo 22): a rejected or GPU-consumed frame must not leave the previous
+    // frame's upscaled bytes standing, and no branch below this line can set the
+    // flag except the CPU stage at the bottom of this function.
+    invalidateUpscaled();
+
     if (raw.rgb.size() != sr_rgb_.size() || raw.depth.size() != depth_scratch_.size()) {
         return;
     }
@@ -295,7 +316,7 @@ void SignalConditioner::processCpu(RawFrame& raw, float min_depth_m, float max_d
     }
     
     preprocessRgb(raw.rgb);
-    applySuperResolutionToRgb(raw.rgb); // Apply EASU+RCAS for TSDF texturing
+    applySuperResolutionToRgb(raw.rgb, raw.frame_id); // Apply EASU+RCAS for TSDF texturing
     buildSuperResolutionGuidance(raw.rgb); // Build guidance from processed RGB
     denoiseDepthSpatial(raw.depth, min_depth_m, max_depth_m);
     fillDepthHoles(raw.depth, min_depth_m, max_depth_m);
@@ -333,32 +354,63 @@ void SignalConditioner::buildSuperResolutionGuidance(const std::vector<uint8_t>&
     }
 }
 
-void SignalConditioner::applySuperResolutionToRgb(const std::vector<uint8_t>& rgb) {
-    // Apply EASU upscaling + RCAS sharpening for TSDF texturing
-    // This is separate from guidance to avoid resolution mismatch
-    if (sr_scale_ > 1) {
-#ifdef CUDA_ENABLED
-        static const bool sr_warned = [] {
-            KFLOG_WARN("SR", "EASU upscaling falls back to CPU on the CUDA backend (GPU EASU exists only on HIP)");
-            return true;
-        }();
-        (void)sr_warned;
-#endif
-        // EASU upscaling
-        std::vector<uint8_t> upscaled;
-        sr::applyEASU(rgb, upscaled, FRAME_W, FRAME_H, sr_scale_);
-        
-        // RCAS sharpening on upscaled image
-        int sr_w = FRAME_W * sr_scale_;
-        int sr_h = FRAME_H * sr_scale_;
-        sr::applyCAS(upscaled, sr_w, sr_h, 0.5f);
-        
-        sr_rgb_upscaled_ = upscaled;
-    } else {
-        // Just RCAS sharpening at original resolution
-        sr_rgb_upscaled_ = rgb;
-        sr::applyCAS(sr_rgb_upscaled_, FRAME_W, FRAME_H, 0.5f);
+bool SignalConditioner::srUpscaledAvailable() const {
+    // Geometry-aware (big-fix Todo 22): the flag alone is never trusted, so a
+    // buffer that was resized, cleared or left at the constructor's
+    // original-resolution zero fill cannot read back as a valid upscale.
+    if (!sr_upscaled_available_) return false;
+    if (sr_scale_ < kSrScaleMin || sr_scale_ > kSrScaleMax) return false;
+    return sr_rgb_upscaled_.size() == upscaledBytes(sr_scale_);
+}
+
+bool SignalConditioner::srUpscaledAvailableForFrame(uint64_t frame_id) const {
+    return srUpscaledAvailable() && sr_upscaled_frame_id_ == frame_id;
+}
+
+void SignalConditioner::invalidateUpscaled() {
+    sr_upscaled_available_ = false;
+    sr_upscaled_frame_id_ = 0;
+}
+
+void SignalConditioner::applySuperResolutionToRgb(const std::vector<uint8_t>& rgb, uint64_t frame_id) {
+    // EASU upscaling + RCAS sharpening for TSDF texturing, kept separate from
+    // guidance to avoid a resolution mismatch. Publishes through the availability
+    // contract: process() already invalidated, so the ONLY way this frame ends up
+    // available is a fully produced, correctly sized fresh buffer below.
+    invalidateUpscaled();
+
+    if (sr_scale_ < kSrScaleMin || sr_scale_ > kSrScaleMax) {
+        // Fail closed. The old code copied an ORIGINAL-resolution sharpened image
+        // into sr_rgb_upscaled_ for scale <= 1, which a consumer sizing the buffer
+        // as FRAME_W * scale x FRAME_H * scale would read out of bounds, and which
+        // made "an upscale" of a rejected scale indistinguishable from a real one.
+        return;
     }
+#ifdef CUDA_ENABLED
+    static const bool sr_warned = [] {
+        KFLOG_WARN("SR", "EASU upscaling falls back to CPU on the CUDA backend (GPU EASU exists only on HIP)");
+        return true;
+    }();
+    (void)sr_warned;
+#endif
+    // EASU upscaling
+    std::vector<uint8_t> upscaled;
+    sr::applyEASU(rgb, upscaled, FRAME_W, FRAME_H, sr_scale_);
+
+    const size_t expected = upscaledBytes(sr_scale_);
+    // applyEASU_CPU returns early on an empty source and leaves dst empty; a
+    // buffer that is not exactly the upscaled image is never published.
+    if (upscaled.size() != expected) return;
+
+    // RCAS sharpening on upscaled image
+    const int sr_w = FRAME_W * sr_scale_;
+    const int sr_h = FRAME_H * sr_scale_;
+    sr::applyCAS(upscaled, sr_w, sr_h, 0.5f);
+    if (upscaled.size() != expected) return;
+
+    sr_rgb_upscaled_ = std::move(upscaled);
+    sr_upscaled_frame_id_ = frame_id;
+    sr_upscaled_available_ = true;
 }
 
 void SignalConditioner::denoiseDepthSpatial(std::vector<uint16_t>& depth, float min_depth_m, float max_depth_m) {

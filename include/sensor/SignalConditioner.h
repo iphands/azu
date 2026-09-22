@@ -33,10 +33,52 @@ public:
     void process(RawFrame& raw, cudaStream_t cuda_stream, float min_depth_m, float max_depth_m);
     void setSrScale(int scale) { sr_scale_ = scale; }
     int getSrScale() const { return sr_scale_; }
+
+    // ---- upscaled-RGB availability contract (big-fix Todo 22) ----
+    // The ONLY gate on sr_rgb_upscaled_. The raw getter below is not a validity
+    // signal: the constructor preallocates the buffer with FRAME_W * FRAME_H * 3
+    // zero bytes, so a consumer that reads it unconditionally textures TSDF with
+    // black — the "black textures" complaint that made the only product consumer
+    // (src/app/PipelineController.cpp, trackingLoop) dead in the first place.
+    // Every consumer must check srUpscaledAvailable() first and treat the bytes
+    // as undefined otherwise.
+    //
+    // The contract is CPU-only and fail-closed:
+    //   - false on a freshly constructed object and after reset()
+    //   - false before the first successful process()
+    //   - false whenever the frame geometry or the scale is invalid
+    //     (only 2 <= getSrScale() <= 4 can ever be an upscaled buffer; scale 1
+    //     is an original-resolution image, not an upscale, and is never published)
+    //   - false for the whole of the current frame as soon as process() starts,
+    //     so a size-mismatch early return or a failed CPU stage can never leave
+    //     the PREVIOUS frame's bytes readable as if they were fresh
+    //   - false on the GPU path: processCuda() implements no upscaled pass and
+    //     never publishes, so a GPU backend reports the buffer unavailable
+    //     without any GPU code being compiled or invoked to find that out
+    //     (docs/CUDA_HIP_DEFERRED_CHANGES.md keeps the backend upscaled hazards
+    //     deferred)
+    // True only after the CPU upscale stage has fully produced a fresh buffer of
+    // exactly FRAME_W * sr_scale * FRAME_H * sr_scale * 3 bytes for `raw`.
+    // Definitions live in SignalConditioner_omp.cpp because the geometry check
+    // needs FRAME_W / FRAME_H.
+    bool srUpscaledAvailable() const;
+    // The raw.frame_id the currently published buffer was produced from. Only
+    // meaningful while srUpscaledAvailable() is true; reset() clears it to 0.
+    uint64_t srUpscaledFrameId() const { return sr_upscaled_frame_id_; }
+    // Availability pinned to one frame id, for consumers that hold the frame they
+    // processed and must not texture from a later one.
+    bool srUpscaledAvailableForFrame(uint64_t frame_id) const;
+
+    // Valid ONLY while srUpscaledAvailable() is true; see the contract above.
     const std::vector<uint8_t>& getSrRgbUpscaled() const { return sr_rgb_upscaled_; }
 
 private:
     int sr_scale_ = 2; // Default 2x upscaling
+    // Availability state for sr_rgb_upscaled_. Never consulted on its own:
+    // srUpscaledAvailable() re-derives the geometry and scale every call, so a
+    // stale flag can never outlive the buffer it describes.
+    bool sr_upscaled_available_ = false;
+    uint64_t sr_upscaled_frame_id_ = 0;
     std::vector<float>    ema_buf_m_;
     std::vector<uint8_t>  sr_rgb_; // For guidance (original resolution)
     std::vector<uint8_t>  sr_rgb_upscaled_; // For TSDF texturing (upscaled)
@@ -55,7 +97,10 @@ private:
 
     void preprocessRgb(std::vector<uint8_t>& rgb);
     void buildSuperResolutionGuidance(const std::vector<uint8_t>& rgb);
-    void applySuperResolutionToRgb(const std::vector<uint8_t>& rgb); // Apply EASU+RCAS for TSDF
+    // Publishes sr_rgb_upscaled_ through the availability contract; `frame_id` is
+    // raw.frame_id, recorded only for a buffer that was actually produced.
+    void applySuperResolutionToRgb(const std::vector<uint8_t>& rgb, uint64_t frame_id);
+    void invalidateUpscaled();
     void denoiseDepthSpatial(std::vector<uint16_t>& depth, float min_depth_m, float max_depth_m);
     void applyDepthEma(std::vector<uint16_t>& depth, float min_depth_m, float max_depth_m);
     void fillDepthHoles(std::vector<uint16_t>& depth, float min_depth_m, float max_depth_m);

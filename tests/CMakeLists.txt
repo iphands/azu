@@ -430,6 +430,34 @@ target_link_libraries(cas_border_contract PRIVATE azu_test_core)
 add_test(NAME cas_border_contract COMMAND cas_border_contract)
 set_tests_properties(cas_border_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# ---- big-fix todo 22: CPU upscaled-RGB availability + non-finite sharpness ----
+# sr_upscaled_contract is public CPU API only: the SignalConditioner /
+# Preprocessor availability contract, the real process() production path, and the
+# public sr::applyEASU_CPU / sr::applyCAS_CPU passes (never a reimplementation of
+# EASU or CAS). It locks that a fresh or reset conditioner reports the upscaled
+# buffer UNAVAILABLE even though getSrRgbUpscaled() already holds
+# 640x480x3 zero bytes (the black-texture hazard), that a valid CPU frame
+# publishes exactly FRAME_W*scale * FRAME_H*scale * 3 bytes for scale 2/3/4
+# byte-identically to the product passes over that same frame, that a frame
+# rejected on size retires the PREVIOUS frame's availability too, that scale 1
+# and every scale outside [2,4] fail closed (scale 1 used to publish an
+# original-resolution image whose byte count a 2x-sized consumer would read out
+# of bounds), that reset() clears id and availability even while the buffer keeps
+# a valid-looking 2x size, and that the CUDA/HIP-labelled preprocessor reports
+# the buffer unavailable without any GPU code being constructed, compiled or
+# run. Sharpness: NaN, +Inf and -Inf in the real CPU CAS pass must be
+# byte-identical to the finite 0.0f output (std::clamp passed NaN straight
+# through to static_cast<uint8_t>(NaN * 255.0f), which is UB and on x86
+# blackened the frame), with the 0.5f/1.0f runs as the non-vacuity witness.
+# Deterministic across repeats and OpenMP threads 1/2/4. No device, display, GPU,
+# sensor, thread timing or filesystem.
+add_executable(sr_upscaled_contract sr_upscaled_contract.cpp)
+target_compile_definitions(sr_upscaled_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(sr_upscaled_contract PRIVATE azu_test_core)
+
+add_test(NAME sr_upscaled_contract COMMAND sr_upscaled_contract)
+set_tests_properties(sr_upscaled_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 add_test(NAME glb_linear_color_contract COMMAND glb_linear_color_contract)
 set_tests_properties(glb_linear_color_contract PROPERTIES LABELS cpu TIMEOUT 120)
 

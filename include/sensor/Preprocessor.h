@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -27,6 +28,19 @@ public:
     virtual void resetTemporalState() = 0;
     virtual void process(RawFrame& frame, float min_depth_m, float max_depth_m) = 0;
     virtual void setSrScale(int scale) = 0;
+
+    // Upscaled-RGB availability contract (big-fix Todo 22), mirroring
+    // SignalConditioner::srUpscaledAvailable(). getSrRgbUpscaled() is valid only
+    // while this is true, so the CPU-only upscaled path fails closed here too:
+    // the defaults below are the contract for every non-CPU backend, which
+    // implements no upscaled pass and must report unavailable rather than be
+    // compiled or run to find out.
+    virtual bool srUpscaledAvailable() const { return false; }
+    virtual uint64_t srUpscaledFrameId() const { return 0; }
+    virtual bool srUpscaledAvailableForFrame(uint64_t frame_id) const {
+        return srUpscaledAvailable() && srUpscaledFrameId() == frame_id;
+    }
+
     virtual const std::vector<uint8_t>& getSrRgbUpscaled() const = 0;
 
     // GPU-native access (returns nullptr if CPU backend is used)
@@ -44,6 +58,11 @@ public:
     void resetTemporalState() override;
     void process(RawFrame& frame, float min_depth_m, float max_depth_m) override;
     void setSrScale(int scale) override { conditioner_.setSrScale(scale); }
+    bool srUpscaledAvailable() const override { return conditioner_.srUpscaledAvailable(); }
+    uint64_t srUpscaledFrameId() const override { return conditioner_.srUpscaledFrameId(); }
+    bool srUpscaledAvailableForFrame(uint64_t frame_id) const override {
+        return conditioner_.srUpscaledAvailableForFrame(frame_id);
+    }
     const std::vector<uint8_t>& getSrRgbUpscaled() const override { return conditioner_.getSrRgbUpscaled(); }
     PreprocessBackend backend() const override { return PreprocessBackend::CPU; }
 
@@ -59,6 +78,10 @@ public:
     void resetTemporalState() override;
     void process(RawFrame& frame, float min_depth_m, float max_depth_m) override;
     void setSrScale(int scale) override { conditioner_.setSrScale(scale); }
+    // Deliberately NOT overridden: the CUDA/HIP conditioner implements no EASU
+    // upscaled pass (see docs/CUDA_HIP_DEFERRED_CHANGES.md), so this backend keeps
+    // the base fail-closed defaults and reports the upscaled buffer unavailable
+    // even when its own getSrRgbUpscaled() still hands out preallocated bytes.
     const std::vector<uint8_t>& getSrRgbUpscaled() const override { return conditioner_.getSrRgbUpscaled(); }
     PreprocessBackend backend() const override { return PreprocessBackend::CUDA; }
 

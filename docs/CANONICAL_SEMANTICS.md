@@ -606,13 +606,23 @@ exactly `1.0f` for flat white. Reading the unsharpened input instead of
 different wrong images; all four are pinned by
 `tests/cas_border_contract.cpp`.
 
-Canonical sharpness clamp: NaN must not produce NaN. GPU
-`std::max(0.0f, std::min(sharpness, 1.0f))` maps `NaN → 0.0` (a valid mild
-sharpen, because `std::min(NaN, 1.0f)` is `NaN` and `std::max(0.0f, NaN)`
-returns its first argument). CPU `std::clamp(sharpness, 0.0f, 1.0f)` returns
-`val` unchanged when both comparisons are false, so `NaN → NaN → peak = NaN →
-static_cast<uint8_t>(NaN * 255.0f)`, which is undefined behavior. Canonical:
-an explicit finite test, not an accident of the clamp used. Deferred as
+Canonical sharpness clamp: a non-finite sharpness must map to a defined finite
+sharpen, never to NaN. CPU `applyCAS_CPU()` now owns that decision with one
+explicit `std::isfinite(sharpness)` test: `NaN`, `+Inf` and `-Inf` all map to
+`0.0f`, the softest valid sharpen, before the
+`peak = -1 / ((1-t)*8 + t*5)` mapping, so no non-finite value can reach `peak`
+and the byte store can never evaluate `static_cast<uint8_t>(NaN * 255.0f)` — the
+undefined behavior the old `std::clamp(sharpness, 0.0f, 1.0f)` allowed, since
+`std::clamp` returns `val` unchanged when both comparisons are false
+(`NaN → NaN → peak = NaN`). On this x86 build that UB resolved to an all-zero
+image, i.e. a black frame, which is exactly the signature the contract forbids.
+Finite out-of-range values keep the documented clamp (`-1.0 → 0.0`, `2.0 → 1.0`).
+Test-locked by `tests/sr_upscaled_contract.cpp` against the REAL CPU pass, with
+the `0.5f` and `1.0f` runs pinned as the non-vacuity witness so "identical to
+`0.0f`" is a decision rather than a pass that ignores its input. The GPU form
+`std::max(0.0f, std::min(sharpness, 1.0f))` maps `NaN → 0.0` only as an accident
+of `std::max(0.0f, NaN)` returning its first argument; it is not compiled and not
+runtime-tested here, and that backend asymmetry stays deferred as
 `cross-backend:B5`.
 
 Canonical super-resolution naming: the pass must be called what it is. The
@@ -627,8 +637,10 @@ above code that does not match it. Deferred as `sensor:S-18`.
 
 Canonical failure contract: an allocation or launch failure must be reported,
 never absorbed. Current CPU-side reality: `SignalConditioner::process()`
-returns early on a frame-size mismatch
-(`SignalConditioner_omp.cpp:264`), `processCuda` returns `true`
+invalidates the upscaled-RGB availability contract at entry and only then returns
+early on a frame-size mismatch (`@S.omp` `process()`), so a rejected frame can no
+longer leave the previous frame's bytes readable as if they were fresh (big-fix
+Todo 22, `tests/sr_upscaled_contract.cpp`); `processCuda` returns `true`
 unconditionally and throws on allocation failure instead of returning `false`
 (deferred `cross-backend:A22`), and `applyEASU_GPU` is `void`, zero-filling
 `dst` before the allocation so a failed allocation yields a black frame that is
@@ -646,13 +658,36 @@ the blended code) cannot pass. The same in-place shape still exists in both GPU
 EMA kernels; deferred as `sensor:S-19`. Every other depth pass already ping-pongs
 between the in/out buffers.
 
-Canonical upscaled-RGB path: either consumed or deleted.
-`sr_rgb_upscaled_` is produced every frame (a full 4× bicubic upsample plus
-RCAS over 3.69 MB, plus a 3.69 MB copy) and its only consumer,
-`PipelineController.cpp:505`, is commented out with "causes black textures" —
-which is precisely the `applyEASU_GPU` zero-fill bug above. On CUDA the buffer
-is never even written, because `SuperResolution_cuda.cu` implements no EASU at
-all and `applyEASU` dispatches to CPU there. Deferred as `cross-backend:C8`.
+Canonical upscaled-RGB availability: CPU-only and fail-closed. The buffer is
+gated by `SignalConditioner::srUpscaledAvailable()` / `srUpscaledFrameId()` /
+`srUpscaledAvailableForFrame()`, mirrored on the `Preprocessor` interface where
+every non-CPU backend keeps the base `false`. Availability is geometry-aware, not
+one boolean: it requires `2 <= getSrScale() <= 4`, a buffer of exactly
+`FRAME_W * scale * FRAME_H * scale * 3` bytes, and a publish by `move` only after
+the CPU stage has produced that whole frame, whose `raw.frame_id` it records. It
+is invalidated at the top of `process()` and by `reset()`, so scale 1, a scale
+outside `[2, 4]`, a frame rejected on size and a just-reset buffer all report
+unavailable — including while the bytes still fit a valid 2× shape, which is why
+the geometry test and the flag are both load-bearing. The getter alone is never a
+validity signal: the constructor preallocates `FRAME_W * FRAME_H * 3` zero bytes,
+so an ungated read textures TSDF with black. Scale 1 no longer writes an
+original-resolution image into this buffer either; that copy is what let a
+consumer sized `FRAME_W * scale × FRAME_H * scale` read out of bounds. Locked by
+`tests/sr_upscaled_contract.cpp`, which drives the real `process()` path and the
+public `applyEASU_CPU` / `applyCAS_CPU` passes.
+
+Canonical upscaled-RGB consumer: either consumed or deleted — still open. The
+only consumer, the commented pair at `src/app/PipelineController.cpp:552-553` in
+`trackingLoop()`, stays disabled (its note now says a future consumer must check
+the availability contract first), so the product still produces the buffer every
+frame and still textures from raw RGB. Enabling it is future scope, not this
+todo. Deferred as `cross-backend:C8`. On CUDA the buffer is never even written,
+because `SuperResolution_cuda.cu` implements no EASU at all and `applyEASU`
+dispatches to CPU there. The GPU upscaled-RGB hazard — the dead path, the HIP
+`applyEASU_GPU` zero-fill that yields a black frame consumed as valid, and the
+RCAS sharpness asymmetry — stays deferred as `cross-backend:A15` alongside
+`sensor:S-06` / `cross-backend:A24` / `cross-backend:B5`; none of it was compiled,
+linked or runtime-tested in this CPU-only run.
 
 Canonical super-resolution scale: `setSrScale()` must have an effect.
 `sr_scale_` is never read in either GPU conditioner, so the GUI slider is a
