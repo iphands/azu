@@ -71,6 +71,13 @@ private:
     int          mesh_index_count_ = 0;
     ShaderProgram mesh_shader_;
 
+    // Inverse-transpose normal matrix cache (todo 28): MV changes only when the
+    // camera moves, so the inverse-transpose is recomputed on that change and
+    // reused while the model/view is stable, instead of every frame.
+    Eigen::Matrix4f cached_normal_mv_  = Eigen::Matrix4f::Zero();
+    Eigen::Matrix3f cached_normal_mat_ = Eigen::Matrix3f::Identity();
+    bool            normal_cache_valid_ = false;
+
     void initPointCloudBuffers();
     void initMeshBuffers();
     void initCageBuffers();

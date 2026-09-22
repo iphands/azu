@@ -38,6 +38,8 @@ unsigned int ShaderProgram::compileShader(unsigned int type, const char* src) {
 bool ShaderProgram::load(const char* vert_src, const char* frag_src) {
     initializeOpenGLFunctions();
 
+    // Compile first. Until a new program links, program_id_ keeps whatever valid
+    // program it already had, so a failed reload can never leave a zero handle.
     unsigned int vert = compileShader(GL_VERTEX_SHADER,   vert_src);
     unsigned int frag = compileShader(GL_FRAGMENT_SHADER, frag_src);
     if (!vert || !frag) {
@@ -46,54 +48,77 @@ bool ShaderProgram::load(const char* vert_src, const char* frag_src) {
         return false;
     }
 
-    program_id_ = glCreateProgram();
-    glAttachShader(program_id_, vert);
-    glAttachShader(program_id_, frag);
-    glLinkProgram(program_id_);
+    unsigned int program = glCreateProgram();
+    glAttachShader(program, vert);
+    glAttachShader(program, frag);
+    glLinkProgram(program);
 
-    int success = 0;
-    glGetProgramiv(program_id_, GL_LINK_STATUS, &success);
-    if (!success) {
-        int log_len = 0;
-        glGetProgramiv(program_id_, GL_INFO_LOG_LENGTH, &log_len);
-        std::vector<char> log(log_len);
-        glGetProgramInfoLog(program_id_, log_len, nullptr, log.data());
-        std::cerr << "[Shader] Link error: " << log.data() << "\n";
-        glDeleteProgram(program_id_);
-        program_id_ = 0;
-    }
-
+    // Attached shaders are released once linked (or not), regardless of outcome.
     glDeleteShader(vert);
     glDeleteShader(frag);
-    return program_id_ != 0;
+
+    int success = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+    if (!success) {
+        int log_len = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &log_len);
+        std::vector<char> log(log_len);
+        glGetProgramInfoLog(program, log_len, nullptr, log.data());
+        std::cerr << "[Shader] Link error: " << log.data() << "\n";
+        glDeleteProgram(program);
+        return false;
+    }
+
+    // The new program is valid: release the previous one BEFORE its handle is
+    // overwritten, so repeated load() calls cannot leak a GL program object.
+    if (program_id_) {
+        glDeleteProgram(program_id_);
+    }
+    program_id_ = program;
+    return true;
 }
 
-void ShaderProgram::use()   { glUseProgram(program_id_); }
+void ShaderProgram::use()   { if (program_id_) glUseProgram(program_id_); }
 void ShaderProgram::disuse() { glUseProgram(0); }
 
-void ShaderProgram::setUniformMat4(const char* name, const float* data) {
+bool ShaderProgram::setUniformMat4(const char* name, const float* data) {
+    if (program_id_ == 0) return false;
     int loc = glGetUniformLocation(program_id_, name);
-    if (loc >= 0) glUniformMatrix4fv(loc, 1, GL_FALSE, data);
+    if (loc < 0) return false;
+    glUniformMatrix4fv(loc, 1, GL_FALSE, data);
+    return true;
 }
 
-void ShaderProgram::setUniformMat3(const char* name, const float* data) {
+bool ShaderProgram::setUniformMat3(const char* name, const float* data) {
+    if (program_id_ == 0) return false;
     int loc = glGetUniformLocation(program_id_, name);
-    if (loc >= 0) glUniformMatrix3fv(loc, 1, GL_FALSE, data);
+    if (loc < 0) return false;
+    glUniformMatrix3fv(loc, 1, GL_FALSE, data);
+    return true;
 }
 
-void ShaderProgram::setUniformVec3(const char* name, float x, float y, float z) {
+bool ShaderProgram::setUniformVec3(const char* name, float x, float y, float z) {
+    if (program_id_ == 0) return false;
     int loc = glGetUniformLocation(program_id_, name);
-    if (loc >= 0) glUniform3f(loc, x, y, z);
+    if (loc < 0) return false;
+    glUniform3f(loc, x, y, z);
+    return true;
 }
 
-void ShaderProgram::setUniformFloat(const char* name, float v) {
+bool ShaderProgram::setUniformFloat(const char* name, float v) {
+    if (program_id_ == 0) return false;
     int loc = glGetUniformLocation(program_id_, name);
-    if (loc >= 0) glUniform1f(loc, v);
+    if (loc < 0) return false;
+    glUniform1f(loc, v);
+    return true;
 }
 
-void ShaderProgram::setUniformInt(const char* name, int v) {
+bool ShaderProgram::setUniformInt(const char* name, int v) {
+    if (program_id_ == 0) return false;
     int loc = glGetUniformLocation(program_id_, name);
-    if (loc >= 0) glUniform1i(loc, v);
+    if (loc < 0) return false;
+    glUniform1i(loc, v);
+    return true;
 }
 
 } // namespace rendering

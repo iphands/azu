@@ -41,6 +41,35 @@ Eigen::Matrix4f sensorProjection(int viewport_w, int viewport_h,
     return P;
 }
 
+// Fixed light direction in world/GL space. It used to be a literal *inside* the
+// fragment shader, which is view space, so the highlight was welded to the
+// camera and never moved with the scene. It is now rotated into view space by
+// the current model-view once per frame (todo 28).
+const Eigen::Vector3f kWorldLightDir(1.0f, 2.0f, 3.0f);
+
+// Snapshot/restore guard for exactly the two rasterizer states renderCage()
+// mutates. It captures them on entry and puts them back on scope exit, so the
+// draw cannot leak GL_LEQUAL depth or a widened line into the next pass even if
+// a future early-return is inserted between here and the draw (todo 28).
+class ScopedDepthLineState : protected QOpenGLFunctions_3_3_Core {
+public:
+    ScopedDepthLineState() {
+        initializeOpenGLFunctions();
+        glGetIntegerv(GL_DEPTH_FUNC, &prev_depth_func_);
+        glGetFloatv(GL_LINE_WIDTH, &prev_line_width_);
+    }
+    ScopedDepthLineState(const ScopedDepthLineState&) = delete;
+    ScopedDepthLineState& operator=(const ScopedDepthLineState&) = delete;
+    ~ScopedDepthLineState() {
+        glDepthFunc(static_cast<GLenum>(prev_depth_func_));
+        glLineWidth(prev_line_width_);
+    }
+
+private:
+    GLint   prev_depth_func_  = GL_LESS;
+    GLfloat prev_line_width_  = 1.0f;
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -93,9 +122,10 @@ const char* PreviewRenderer::MESH_FRAG = R"glsl(
 in vec3 vNormal;
 in vec3 vFragPos;
 in vec3 vColor;
+uniform vec3 uLightDir;   // world light rotated into view space each frame
 out vec4 FragColor;
 void main() {
-    vec3 lightDir = normalize(vec3(1.0, 2.0, 3.0));
+    vec3 lightDir = normalize(uLightDir);
     float diff = max(dot(vNormal, lightDir), 0.0);
     vec3 ambient = vec3(0.15);
     vec3 diffuse = vec3(0.6) * diff;
@@ -129,15 +159,20 @@ PreviewRenderer::PreviewRenderer() = default;
 
 PreviewRenderer::~PreviewRenderer() {
     if (!initialized_) return;
-    if (pc_vao_) { glDeleteVertexArrays(1, &pc_vao_); }
-    if (pc_vbo_pos_) { glDeleteBuffers(1, &pc_vbo_pos_); }
-    if (pc_vbo_col_) { glDeleteBuffers(1, &pc_vbo_col_); }
-    if (mesh_vao_) { glDeleteVertexArrays(1, &mesh_vao_); }
-    if (mesh_vbo_pos_) { glDeleteBuffers(1, &mesh_vbo_pos_); }
-    if (mesh_vbo_norm_) { glDeleteBuffers(1, &mesh_vbo_norm_); }
-    if (mesh_ebo_) { glDeleteBuffers(1, &mesh_ebo_); }
-    if (cage_vao_) { glDeleteVertexArrays(1, &cage_vao_); }
-    if (cage_vbo_) { glDeleteBuffers(1, &cage_vbo_); }
+    // Delete each object once and zero its handle, so the guards below cannot
+    // fire a second time on a stale id and a re-run of this path double-deletes
+    // (todo 28). Each `if` is the single-delete guard; the `= 0` is the zeroing.
+    if (pc_vao_)     { glDeleteVertexArrays(1, &pc_vao_);     pc_vao_     = 0; }
+    if (pc_vbo_pos_) { glDeleteBuffers(1, &pc_vbo_pos_);      pc_vbo_pos_ = 0; }
+    if (pc_vbo_col_) { glDeleteBuffers(1, &pc_vbo_col_);      pc_vbo_col_ = 0; }
+    if (mesh_vao_)   { glDeleteVertexArrays(1, &mesh_vao_);   mesh_vao_   = 0; }
+    if (mesh_vbo_pos_)  { glDeleteBuffers(1, &mesh_vbo_pos_);  mesh_vbo_pos_  = 0; }
+    if (mesh_vbo_norm_) { glDeleteBuffers(1, &mesh_vbo_norm_); mesh_vbo_norm_ = 0; }
+    if (mesh_vbo_col_)  { glDeleteBuffers(1, &mesh_vbo_col_);  mesh_vbo_col_  = 0; }
+    if (mesh_ebo_)   { glDeleteBuffers(1, &mesh_ebo_);        mesh_ebo_   = 0; }
+    if (cage_vao_)   { glDeleteVertexArrays(1, &cage_vao_);   cage_vao_   = 0; }
+    if (cage_vbo_)   { glDeleteBuffers(1, &cage_vbo_);        cage_vbo_   = 0; }
+    initialized_ = false;
 }
 
 void PreviewRenderer::initialize() {
@@ -147,9 +182,12 @@ void PreviewRenderer::initialize() {
     glEnable(GL_PROGRAM_POINT_SIZE);
     glClearColor(0.08f, 0.09f, 0.11f, 1.0f);
 
-    pc_shader_.load(POINTCLOUD_VERT, POINTCLOUD_FRAG);
-    mesh_shader_.load(MESH_VERT, MESH_FRAG);
-    cage_shader_.load(CAGE_VERT, CAGE_FRAG);
+    if (!pc_shader_.load(POINTCLOUD_VERT, POINTCLOUD_FRAG))
+        std::cerr << "[Renderer] point-cloud shader failed to load; point cloud disabled\n";
+    if (!mesh_shader_.load(MESH_VERT, MESH_FRAG))
+        std::cerr << "[Renderer] mesh shader failed to load; mesh mode disabled\n";
+    if (!cage_shader_.load(CAGE_VERT, CAGE_FRAG))
+        std::cerr << "[Renderer] cage shader failed to load; volume cage disabled\n";
 
     initPointCloudBuffers();
     initMeshBuffers();
@@ -235,18 +273,30 @@ void PreviewRenderer::initMeshBuffers() {
 void PreviewRenderer::uploadPointCloud(const sensor::FrameData& frame) {
     if (!initialized_) return;
 
-    const int N = frame.width * frame.height;
+    // Validate the backing containers BEFORE any indexing (todo 28). N is the
+    // nominal pixel count, but a malformed/partial frame can hand us a shorter
+    // vertices or rgb vector, so the loop bound is clamped to what those buffers
+    // can actually serve. rgb is read three bytes per pixel, so it caps the loop
+    // at rgb.size()/3; depth_meters stays optional (see the two-path validity
+    // check below). All bounds are size_t, so no signed/unsigned comparison.
+    const size_t pixel_count =
+        static_cast<size_t>(frame.width) * static_cast<size_t>(frame.height);
+    const size_t rgb_limit = frame.rgb.size() / 3;
+    const size_t loop_count =
+        std::min(pixel_count, std::min(frame.vertices.size(), rgb_limit));
+
     std::vector<float> positions, colors;
-    positions.reserve(N * 3);
-    colors.reserve(N * 3);
+    positions.reserve(loop_count * 3);
+    colors.reserve(loop_count * 3);
     int count = 0;
 
-    for (int i = 0; i < N; ++i) {
-        // Handle both live frames (depth check) and raycasted model frames (norm check)
-        // Raycasted points are in WORLD space, so z > 0 check is invalid. 
-        // Use norm > 1e-6 to identify valid hits and skip empty points (0,0,0).
+    for (size_t i = 0; i < loop_count; ++i) {
+        // Handle both live frames (depth check) and raycasted model frames (norm
+        // check). Raycasted points are in WORLD space, so z > 0 is invalid there;
+        // norm > 1e-6 identifies valid hits and skips the empty (0,0,0) sentinel.
         const auto& v = frame.vertices[i];
-        bool valid = (frame.depth_meters.size() > i) ? (frame.depth_meters[i] > 0.0f) : (v.norm() > 1e-6f);
+        bool valid = (i < frame.depth_meters.size()) ? (frame.depth_meters[i] > 0.0f)
+                                                      : (v.norm() > 1e-6f);
         if (!valid || std::isnan(v.x()) || std::isnan(v.y()) || std::isnan(v.z())) continue;
 
         positions.push_back(v.x());
@@ -276,7 +326,15 @@ void PreviewRenderer::clearGeometry() {
 }
 
 void PreviewRenderer::uploadMesh(const meshing::MeshData& mesh) {
-    if (!initialized_ || mesh.empty()) return;
+    if (!initialized_) return;
+
+    // An empty extraction must invalidate the previous mesh. Returning without
+    // clearing mesh_index_count_ kept the last good mesh on screen forever — the
+    // "ghost mesh" that lingers after a reset or a no-geometry scan (todo 28).
+    if (mesh.empty()) {
+        mesh_index_count_ = 0;
+        return;
+    }
 
     glBindVertexArray(mesh_vao_);
 
@@ -343,7 +401,26 @@ void PreviewRenderer::renderMesh() {
     mesh_shader_.setUniformMat4("uMVP", MVP.data());
     mesh_shader_.setUniformMat4("uModelView", MV.data());
 
-    Eigen::Matrix3f normalMatrix = MV.block<3,3>(0,0).inverse().transpose();
+    // World-space light rotated into view space by the CURRENT model-view every
+    // frame, so the highlight is fixed to the scene rather than welded to the
+    // camera. MV's 3x3 is a pure rotation (V orthonormal x the det-1 axis flip),
+    // so it maps a world direction into view space; it is the same rotation the
+    // normal matrix uses, keeping light and normals in one space (todo 28).
+    const Eigen::Vector3f light_view = (MV.block<3, 3>(0, 0) * kWorldLightDir).normalized();
+    mesh_shader_.setUniformVec3("uLightDir", light_view.x(), light_view.y(), light_view.z());
+
+    // Recompute the inverse-transpose only when the model/view input actually
+    // changes; while the camera is still MV is bit-identical and the cached
+    // matrix is reused instead of paying an inverse+transpose every frame.
+    Eigen::Matrix3f normalMatrix;
+    if (!normal_cache_valid_ || !cached_normal_mv_.isApprox(MV, 1e-6f)) {
+        normalMatrix = MV.block<3, 3>(0, 0).inverse().transpose();
+        cached_normal_mv_  = MV;
+        cached_normal_mat_ = normalMatrix;
+        normal_cache_valid_ = true;
+    } else {
+        normalMatrix = cached_normal_mat_;
+    }
     mesh_shader_.setUniformMat3("uNormalMatrix", normalMatrix.data());
 
     glBindVertexArray(mesh_vao_);
@@ -394,13 +471,15 @@ void PreviewRenderer::renderCage() {
     if (cage_outside_) cage_shader_.setUniformVec3("uColor", 0.98f, 0.67f, 0.27f);
     else               cage_shader_.setUniformVec3("uColor", 0.353f, 0.624f, 1.0f);
 
+    // The guard snapshots depth func + line width and restores them at scope
+    // exit, replacing the hand-written GL_LESS / 1.0f restore pair that silently
+    // had to stay in sync with whatever state the pass assumed on entry (todo 28).
+    ScopedDepthLineState state_guard;
     glDepthFunc(GL_LEQUAL);
     glLineWidth(cage_line_width_);
     glBindVertexArray(cage_vao_);
     glDrawArrays(GL_LINES, 0, 24);
     glBindVertexArray(0);
-    glDepthFunc(GL_LESS);
-    glLineWidth(1.0f);
 
     cage_shader_.disuse();
 }
