@@ -101,10 +101,18 @@ emit_deferral_matrix
 # ---------------------------------------------------------------------------
 # grep -xF, not substring: a substring match let one future-gate line be deleted
 # while the gate still passed (caught by todo 3 negative QA).
+#
+# Input form is a here-string (<<<), NOT `printf '%s\n' "$dossier" | grep`.
+# Under `set -euo pipefail`, a dossier larger than the ~64 KiB pipe buffer makes
+# `grep -q` match and exit before `printf` finishes writing: `printf` then takes
+# SIGPIPE (141) and pipefail turns a SUCCESSFUL match into a gate failure. The
+# here-string is spooled to a file by bash, so there is no producer to SIGPIPE
+# and the exact-line/phrase/row-count semantics are unchanged. Do not "simplify"
+# these back into a pipe; see .omo/evidence/big-fix/gate-sigpipe-fix.txt.
 dossier="$(cat "${DOSSIER}")"
 require_fixed_line() {
     local needle="$1"
-    printf '%s\n' "${dossier}" | grep -qxF -- "$needle" ||
+    grep -qxF -- "$needle" <<< "${dossier}" ||
         die "dossier ${DOSSIER} is missing the required exact line: ${needle}"
 }
 DOSSIER_EXACT_LINES=(
@@ -123,10 +131,10 @@ for dossier_line in "${DOSSIER_EXACT_LINES[@]}"; do
     require_fixed_line "$dossier_line"
 done
 for backend_phrase in deferred 'not compiled' 'not runtime-tested'; do
-    printf '%s\n' "${dossier}" | grep -qF -- "$backend_phrase" ||
+    grep -qF -- "$backend_phrase" <<< "${dossier}" ||
         die "dossier ${DOSSIER} is missing required backend status phrase: ${backend_phrase}"
 done
-dossier_rows="$(printf '%s\n' "${dossier}" | grep -c '^| `' || true)"
+dossier_rows="$(grep -c '^| `' <<< "${dossier}" || true)"
 [ "${dossier_rows}" -ge 1 ] || die "dossier has no deferred-change rows"
 printf 'dossier gate: ok (%s deferred-change rows)\n' "${dossier_rows}"
 
