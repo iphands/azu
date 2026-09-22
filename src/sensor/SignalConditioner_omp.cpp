@@ -1,5 +1,6 @@
 #include "sensor/SignalConditioner.h"
 
+#include "sensor/DepthValidity.h"
 #include "sensor/FrameData.h"
 #include "sensor/KinectSensor.h"
 #include "sensor/SuperResolution.h"
@@ -97,20 +98,32 @@ inline uint8_t clampToByte(float v) {
     return static_cast<uint8_t>(std::clamp(v, 0.0f, 255.0f));
 }
 
-// Edge detection for edge-aware filtering
-inline float computeDepthGradient(const std::vector<uint16_t>& depth, int x, int y, int w, int h) {
+// Edge detection for edge-aware filtering. A sample that is not usable depth
+// (raw 0, raw >= 2047, or meters outside the configured band) counts as an
+// edge, which saturates the strength and stops the guided filter from
+// smoothing across it. Using the shared predicate rather than a bare
+// `raw == 0` test matters for raw 2047: its converted meters are 0.0, so a
+// meters-only check would rate it a perfectly smooth neighbour.
+inline float computeDepthGradient(const std::vector<uint16_t>& depth, int x, int y, int w, int h,
+                                  float min_depth_m, float max_depth_m) {
     if (x <= 0 || x >= w - 1 || y <= 0 || y >= h - 1) return 1.0f; // Edge pixel
-    
-    float center = static_cast<float>(depth[y * w + x]);
-    float right = static_cast<float>(depth[y * w + (x + 1)]);
-    float left = static_cast<float>(depth[y * w + (x - 1)]);
-    float down = static_cast<float>(depth[(y + 1) * w + x]);
-    float up = static_cast<float>(depth[(y - 1) * w + x]);
-    
-    if (center == 0 || right == 0 || left == 0 || down == 0 || up == 0) return 1.0f; // Edge pixel
-    
-    float gx = std::abs(right - left);
-    float gy = std::abs(down - up);
+
+    const uint16_t center = depth[y * w + x];
+    const uint16_t right  = depth[y * w + (x + 1)];
+    const uint16_t left   = depth[y * w + (x - 1)];
+    const uint16_t down   = depth[(y + 1) * w + x];
+    const uint16_t up     = depth[(y - 1) * w + x];
+
+    if (!isUsableRawDepth(center, min_depth_m, max_depth_m) ||
+        !isUsableRawDepth(right, min_depth_m, max_depth_m) ||
+        !isUsableRawDepth(left, min_depth_m, max_depth_m) ||
+        !isUsableRawDepth(down, min_depth_m, max_depth_m) ||
+        !isUsableRawDepth(up, min_depth_m, max_depth_m)) {
+        return 1.0f; // Edge pixel
+    }
+
+    float gx = std::abs(static_cast<float>(right) - static_cast<float>(left));
+    float gy = std::abs(static_cast<float>(down) - static_cast<float>(up));
     float gradient = std::sqrt(gx * gx + gy * gy);
     
     // Normalize gradient to [0,1] range (typical depth range 0-2047)
@@ -123,18 +136,15 @@ inline float rgbLuma(const uint8_t* rgb) {
            0.114f * static_cast<float>(rgb[2]);
 }
 
-inline uint16_t metersToRawDepth(float depth_m) {
-    if (depth_m <= 0.0f) return 0;
-    const float raw = (1.0f / depth_m - 3.3309495161f) / -0.0030711016f;
-    // Use explicit long cast to avoid signed/unsigned narrowing on MSVC where
-    // long is 32-bit: std::lround returns long, clamp literals must match.
-    const long clamped = std::clamp(static_cast<long>(std::lround(raw)), 1L, 2046L);
-    return static_cast<uint16_t>(clamped);
-}
-
-inline bool isValidDepthMeters(float d, float min_depth_m, float max_depth_m) {
-    return d >= min_depth_m && d <= max_depth_m;
-}
+// Every validity decision and both raw <-> meters conversions in this file come
+// from sensor/DepthValidity.h (big-fix Todo 20); nothing below open-codes a
+// range check. In particular cpuDepthMetersToRaw() replaces the previous
+// `std::clamp(lround(raw), 1, 2046)` encoder, which was a WALL CLAMP: it snapped
+// an out-of-band meter value onto the nearest legal raw code, and that code
+// decodes back as a real measurement (raw 1 == 0.3005 m, raw 2046 == -0.3387 m).
+// Rejection is now raw 0, so a dropped pixel stays invalid all the way to
+// buildFrameData() instead of becoming a phantom wall, including a wall at a
+// negative distance.
 
 void medianBlur3x3(std::vector<uint8_t>& rgb) {
     std::vector<uint8_t> scratch(rgb.size(), 0);
@@ -223,8 +233,10 @@ SignalConditioner::SignalConditioner()
       sr_rgb_(FRAME_W * FRAME_H * 3, 0),
       sr_rgb_upscaled_(FRAME_W * FRAME_H * 3, 0),
       rgb_scratch_(FRAME_W * FRAME_H * 3, 0),
-      guidance_luma_(FRAME_W * FRAME_H, 0.0f),
-      depth_scratch_(FRAME_W * FRAME_H, 0) {}
+       guidance_luma_(FRAME_W * FRAME_H, 0.0f),
+       depth_scratch_(FRAME_W * FRAME_H, 0),
+       depth_src_(FRAME_W * FRAME_H, 0) {}
+
 
 void SignalConditioner::reset() {
     resetEMA();
@@ -233,6 +245,7 @@ void SignalConditioner::reset() {
     std::fill(rgb_scratch_.begin(), rgb_scratch_.end(), 0);
     std::fill(guidance_luma_.begin(), guidance_luma_.end(), 0.0f);
     std::fill(depth_scratch_.begin(), depth_scratch_.end(), 0);
+    std::fill(depth_src_.begin(), depth_src_.end(), 0);
 
 #ifdef CUDA_ENABLED
     if (d_rgb_in_) cudaMemset(d_rgb_in_.get(), 0, sr_rgb_.size());
@@ -357,12 +370,12 @@ void SignalConditioner::applySuperResolutionToRgb(const std::vector<uint8_t>& rg
 void SignalConditioner::denoiseDepthSpatial(std::vector<uint16_t>& depth, float min_depth_m, float max_depth_m) {
     depth_scratch_ = depth;
 
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) shared(depth, depth_scratch_, min_depth_m, max_depth_m)
     for (int y = 0; y < FRAME_H; ++y) {
         for (int x = 0; x < FRAME_W; ++x) {
             const int idx = y * FRAME_W + x;
-            const float center_depth_m = rawDepthToMeters(depth[idx]);
-            if (!isValidDepthMeters(center_depth_m, min_depth_m, max_depth_m)) {
+            const float center_depth_m = cpuDepthMeters(depth[idx], min_depth_m, max_depth_m);
+            if (center_depth_m == 0.0f) {
                 continue;
             }
 
@@ -372,8 +385,8 @@ void SignalConditioner::denoiseDepthSpatial(std::vector<uint16_t>& depth, float 
                 const int sy = reflectCoord(y + dy, FRAME_H);
                 for (int dx = -kDepthMedianRadius; dx <= kDepthMedianRadius; ++dx) {
                     const int sx = reflectCoord(x + dx, FRAME_W);
-                    const float sample_depth_m = rawDepthToMeters(depth[sy * FRAME_W + sx]);
-                    if (!isValidDepthMeters(sample_depth_m, min_depth_m, max_depth_m)) {
+                    const float sample_depth_m = cpuDepthMeters(depth[sy * FRAME_W + sx], min_depth_m, max_depth_m);
+                    if (sample_depth_m == 0.0f) {
                         continue;
                     }
                     window[count++] = sample_depth_m;
@@ -382,7 +395,9 @@ void SignalConditioner::denoiseDepthSpatial(std::vector<uint16_t>& depth, float 
 
             if (count >= 3) {
                 std::nth_element(window, window + count / 2, window + count);
-                depth_scratch_[idx] = metersToRawDepth(window[count / 2]);
+                // The window is band-clean, so the median is band-clean and the
+                // encoder cannot reject it; the encode stays inside the band.
+                depth_scratch_[idx] = cpuDepthMetersToRaw(window[count / 2], min_depth_m, max_depth_m);
             }
         }
     }
@@ -394,22 +409,40 @@ void SignalConditioner::denoiseDepthSpatial(std::vector<uint16_t>& depth, float 
     }
 }
 
+// Temporal EMA with an explicit source/destination split (big-fix Todo 20).
+//
+// depth_src_ holds this frame's UNCHANGED input; `depth` is the destination.
+// The centre sample AND all eight neighbours of the reset test are read from
+// the source only, so no thread can observe a partially updated neighbour:
+// the previous version wrote depth[i] in the same array it read, which made
+// each pixel's answer depend on OpenMP scheduling. ema_buf_m_ is touched at
+// index i by exactly one thread for each i (index-private state), so it needs
+// no split. Consequently output[i] is a pure function of (source snapshot,
+// state[i], band): order-independent, thread-count-independent and repeatable.
 void SignalConditioner::applyDepthEma(std::vector<uint16_t>& depth, float min_depth_m, float max_depth_m) {
-    #pragma omp parallel for schedule(static)
+    depth_src_ = depth;
+    std::vector<uint16_t>& src = depth_src_;
+    std::vector<float>& ema = ema_buf_m_;
+
+    #pragma omp parallel for schedule(static) shared(depth, src, ema, min_depth_m, max_depth_m)
     for (int i = 0; i < FRAME_W * FRAME_H; ++i) {
-        const float depth_m = rawDepthToMeters(depth[i]);
-        if (!isValidDepthMeters(depth_m, min_depth_m, max_depth_m) || std::isnan(depth_m) || std::isinf(depth_m)) {
-            ema_buf_m_[i] = 0.0f; // Prevent ghosting by resetting stale EMA values
+        const float depth_m = cpuDepthMeters(src[i], min_depth_m, max_depth_m);
+        if (depth_m == 0.0f) {
+            ema[i] = 0.0f; // Prevent ghosting by resetting stale EMA values
             if (g_logging_enabled) {
                 #pragma omp atomic
                 g_stats.ema_reset++;
             }
+            // The destination keeps the incoming raw code untouched: raw 0 stays
+            // raw 0 and the raw 2047 sentinel stays raw 2047. Rewriting either
+            // as 0 would turn "no valid depth returned" into "fillable hole"
+            // for every later consumer of this buffer.
             continue;
         }
 
-        const float previous = ema_buf_m_[i];
+        const float previous = ema[i];
         const float delta = std::abs(depth_m - previous);
-        
+
         // Improved EMA stability: check for temporal consistency with neighbors
         bool reset_ema = (std::isnan(previous) || std::isinf(previous) || previous <= 0.0f || delta > kEmaJumpResetMeters);
         
@@ -426,8 +459,8 @@ void SignalConditioner::applyDepthEma(std::vector<uint16_t>& depth, float min_de
                     const int nx = reflectCoord(x + dx, FRAME_W);
                     const int ny = reflectCoord(y + dy, FRAME_H);
                     const int ni = ny * FRAME_W + nx;
-                    const float nd = rawDepthToMeters(depth[ni]);
-                    if (isValidDepthMeters(nd, min_depth_m, max_depth_m)) {
+                    const float nd = cpuDepthMeters(src[ni], min_depth_m, max_depth_m);
+                    if (nd != 0.0f) {
                         neighbor_sum += nd;
                         neighbor_count++;
                     }
@@ -445,9 +478,14 @@ void SignalConditioner::applyDepthEma(std::vector<uint16_t>& depth, float min_de
         }
         
         const float filtered = reset_ema ? depth_m : (0.7f * depth_m + 0.3f * previous);
+        const uint16_t encoded = cpuDepthMetersToRaw(filtered, min_depth_m, max_depth_m);
 
-        ema_buf_m_[i] = filtered;
-        depth[i] = metersToRawDepth(filtered);
+        // encoded == 0 is only reachable from a stale history value that is
+        // itself outside the band. Reject it rather than encoding a wall code,
+        // and clear the state with it so the temporal history and the emitted
+        // raw code can never disagree about whether this pixel is valid.
+        ema[i]   = (encoded != 0) ? filtered : 0.0f;
+        depth[i] = encoded;
         
         if (g_logging_enabled) {
             #pragma omp atomic
@@ -474,10 +512,15 @@ void SignalConditioner::fillDepthHoles(std::vector<uint16_t>& depth, float min_d
     // instance. PipelineController guarantees this via the single trackingLoop thread.
     depth_scratch_ = depth;
 
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) shared(depth, depth_scratch_, min_depth_m, max_depth_m)
     for (int y = 0; y < FRAME_H; ++y) {
         for (int x = 0; x < FRAME_W; ++x) {
             const int idx = y * FRAME_W + x;
+            // Raw 0 is the ONLY fillable hole. Raw 2047 is the sensor's "no
+            // valid depth returned" sentinel: its meters convert to 0.0 as
+            // well, but it marks a MEASURED saturation/reflection, so
+            // interpolating over it invents surface on top of a real reading.
+            // The predicate is therefore raw-domain, never meters-domain.
             if (depth[idx] != 0) {
                 continue;
             }
@@ -493,8 +536,11 @@ void SignalConditioner::fillDepthHoles(std::vector<uint16_t>& depth, float min_d
                     if (dx == 0 && dy == 0) continue;
                     const int sx = reflectCoord(x + dx, FRAME_W);
 
-                    const float candidate_m = rawDepthToMeters(depth[sy * FRAME_W + sx]);
-                    if (!isValidDepthMeters(candidate_m, min_depth_m, max_depth_m)) {
+                    // cpuDepthMeters() is both the raw predicate and the band
+                    // gate, so a neighbour that measured something out of band
+                    // is not a fill source either.
+                    const float candidate_m = cpuDepthMeters(depth[sy * FRAME_W + sx], min_depth_m, max_depth_m);
+                    if (candidate_m == 0.0f) {
                         continue;
                     }
 
@@ -507,7 +553,7 @@ void SignalConditioner::fillDepthHoles(std::vector<uint16_t>& depth, float min_d
             }
 
             if (valid_neighbors > 0 && weight_sum > 1e-6f) {
-                depth_scratch_[idx] = metersToRawDepth(weighted_sum / weight_sum);
+                depth_scratch_[idx] = cpuDepthMetersToRaw(weighted_sum / weight_sum, min_depth_m, max_depth_m);
                 if (g_logging_enabled) {
                     #pragma omp atomic
                     g_stats.hole_filled++;
@@ -526,27 +572,26 @@ void SignalConditioner::guidedDepthFilter(std::vector<uint16_t>& depth, float mi
     // with a separable bilateral approximation.
     depth_scratch_ = depth;
 
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) shared(depth, depth_scratch_, guidance_luma_, min_depth_m, max_depth_m)
     for (int y = 0; y < FRAME_H; ++y) {
         for (int x = 0; x < FRAME_W; ++x) {
             const int idx = y * FRAME_W + x;
-            const float center_depth = rawDepthToMeters(depth[idx]);
-            
-            if (center_depth <= 0.01f) {
-                depth_scratch_[idx] = 0;
-                continue;
-            }
-            
-            // Prevent guided filter from treating empty space as a massive hole-filler 
-            // which smears sharp object geometry boundaries into the void.
-            if (!isValidDepthMeters(center_depth, min_depth_m, max_depth_m)) {
+            const float center_depth = cpuDepthMeters(depth[idx], min_depth_m, max_depth_m);
+
+            if (center_depth == 0.0f) {
+                // Empty space: never let the guided filter smear geometry
+                // boundaries into it. Pass the incoming raw code through
+                // instead of writing raw 0, so the raw 2047 sentinel is not
+                // demoted to a fillable hole code (both read as 0.0 m
+                // downstream, but only raw 0 means "fillable").
+                depth_scratch_[idx] = depth[idx];
                 continue;
             }
 
             const float center_luma = guidance_luma_[idx];
             
             // Edge-aware filtering: compute depth gradient to reduce filter strength near edges
-            const float edge_strength = computeDepthGradient(depth, x, y, FRAME_W, FRAME_H);
+            const float edge_strength = computeDepthGradient(depth, x, y, FRAME_W, FRAME_H, min_depth_m, max_depth_m);
             if (g_logging_enabled && edge_strength > 0.5f) {
                 #pragma omp atomic
                 g_stats.edge_pixels++;
@@ -561,8 +606,8 @@ void SignalConditioner::guidedDepthFilter(std::vector<uint16_t>& depth, float mi
                     const int sx = reflectCoord(x + dx, FRAME_W);
 
                     const int nidx = sy * FRAME_W + sx;
-                    const float neighbor_depth = rawDepthToMeters(depth[nidx]);
-                    if (!isValidDepthMeters(neighbor_depth, min_depth_m, max_depth_m)) {
+                    const float neighbor_depth = cpuDepthMeters(depth[nidx], min_depth_m, max_depth_m);
+                    if (neighbor_depth == 0.0f) {
                         continue;
                     }
 
@@ -584,7 +629,7 @@ void SignalConditioner::guidedDepthFilter(std::vector<uint16_t>& depth, float mi
             }
 
             if (sum_weights > 1e-6f) {
-                depth_scratch_[idx] = metersToRawDepth(sum_depth / sum_weights);
+                depth_scratch_[idx] = cpuDepthMetersToRaw(sum_depth / sum_weights, min_depth_m, max_depth_m);
                 if (g_logging_enabled) {
                     #pragma omp atomic
                     g_stats.guided_filtered++;

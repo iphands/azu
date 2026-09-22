@@ -380,6 +380,29 @@ add_executable(glb_linear_color_contract glb_linear_color_contract.cpp)
 target_compile_definitions(glb_linear_color_contract PRIVATE ${AZU_TEST_DEFS})
 target_link_libraries(glb_linear_color_contract PRIVATE azu_test_core)
 
+# big-fix todo 20: CPU raw-depth validity + out-of-band meters rejection + hole-fill
+# sentinel semantics. depth_domain_contract walks all 65536 raw codes against an
+# independent double oracle (predicate raw==0||raw>=2047, the reciprocal pole at
+# raw ~1084.6, band acceptance == raws 1..954 for [0.30,2.50], rejection is exactly
+# +0.0f, the encoder never clamps to a wall, hole fill only touches raw 0 and leaves
+# 2047 alone). depth_ema_determinism_contract pins the temporal EMA to a source
+# snapshot: an asymmetric 500/548/586 fixture whose hand-derived answers are raw 534
+# (wall) and raw 575 (centre), with raw 586 asserted absent as the in-place
+# contamination signature, plus digest identity across repeats and 1/2/4 threads.
+add_executable(depth_domain_contract depth_domain_contract.cpp)
+target_compile_definitions(depth_domain_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(depth_domain_contract PRIVATE azu_test_core)
+
+add_executable(depth_ema_determinism_contract depth_ema_determinism_contract.cpp)
+target_compile_definitions(depth_ema_determinism_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(depth_ema_determinism_contract PRIVATE azu_test_core)
+
+add_test(NAME depth_domain_contract COMMAND depth_domain_contract)
+set_tests_properties(depth_domain_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
+add_test(NAME depth_ema_determinism_contract COMMAND depth_ema_determinism_contract)
+set_tests_properties(depth_ema_determinism_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 add_test(NAME color_convergence_contract COMMAND color_convergence_contract)
 set_tests_properties(color_convergence_contract PROPERTIES LABELS cpu TIMEOUT 120)
 

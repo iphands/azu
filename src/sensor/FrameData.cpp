@@ -72,7 +72,7 @@ void updateVerticesFromDepth(FrameData& frame) {
     const float fx_inv = 1.0f / static_cast<float>(FX);
     const float fy_inv = 1.0f / static_cast<float>(FY);
 
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) shared(frame, W, H, fx_inv, fy_inv)
     for (int idx = 0; idx < W * H; ++idx) {
         float d = frame.depth_meters[idx];
         if (d > 0.0f) {
@@ -105,12 +105,19 @@ void buildFrameData(const uint16_t* raw_depth,
     
     const int W = out.width;
     const int H = out.height;
-    #pragma omp parallel for schedule(static)
+    // THE CPU depth boundary for everything downstream (vertices, normals,
+    // pyramid, ICP, TSDF): cpuDepthMeters() applies the canonical raw predicate
+    // AND the configured [min_depth, max_depth] band, and returns exactly 0.0f
+    // when either fails. The reciprocal curve has a pole at raw ~= 1084.61, so
+    // a predicate-only check would let raw 1085 (-836.3 m) reach geometry.
+    // Out-of-band depth is dropped to the invalid sentinel, never clamped to a
+    // wall (big-fix Todo 20, docs/CANONICAL_SEMANTICS.md "Depth domain").
+    #pragma omp parallel for schedule(static) shared(raw_depth, raw_rgb, out, min_depth, max_depth)
     for (int y = 0; y < H; ++y) {
         for (int x = 0; x < W; ++x) {
             int idx = y * W + x;
-            float d = rawDepthToMeters(raw_depth[idx]);
-            if (d < min_depth || d > max_depth) {
+            float d = cpuDepthMeters(raw_depth[idx], min_depth, max_depth);
+            if (d == 0.0f) {
                 out.depth_meters[idx] = 0.0f;
                 out.vertices[idx]     = Eigen::Vector3f::Zero();
                 out.normals[idx]      = Eigen::Vector3f::Zero();
@@ -155,7 +162,7 @@ void computeNormals(FrameData& frame) {
     const int W = frame.width;
     const int H = frame.height;
 
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) shared(frame, W, H)
     for (int y = 1; y < H - 1; ++y) {
         for (int x = 1; x < W - 1; ++x) {
             int c  = y * W + x;
@@ -229,7 +236,7 @@ static FrameData downsample(const FrameData& src) {
 
     const int SW = src.width;
 
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) shared(src, dst, SW)
     for (int y = 0; y < dst.height; ++y) {
         for (int x = 0; x < dst.width; ++x) {
             int sx = x * 2;

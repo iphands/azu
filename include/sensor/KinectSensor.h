@@ -1,5 +1,11 @@
 #pragma once
 
+// The canonical CPU depth-domain boundary lives in its own header so that the
+// sensor, the frame builder and the signal conditioner all consume ONE
+// validity rule (big-fix Todo 20). It is included here because every existing
+// consumer of rawDepthToMeters() already includes this header.
+#include "sensor/DepthValidity.h"
+
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -22,11 +28,11 @@ static constexpr int DEPTH_HEIGHT = 480;
 static constexpr int RGB_WIDTH    = 640;
 static constexpr int RGB_HEIGHT   = 480;
 
-// Convert raw 11-bit depth to meters
-inline float rawDepthToMeters(uint16_t raw) {
-    if (raw == 0 || raw >= 2047) return 0.0f;
-    return 1.0f / (static_cast<float>(raw) * -0.0030711016f + 3.3309495161f);
-}
+// Convert raw 11-bit depth to meters: rawDepthToMeters() and the full
+// configured-band boundary cpuDepthMeters() come from sensor/DepthValidity.h,
+// which is included above. big-fix Todo 20 moved them there so the sensor,
+// FrameData and the signal conditioner share one validity predicate instead of
+// three ad hoc range checks. Do not redefine the curve locally.
 
 struct RawFrame {
     std::vector<uint16_t> depth;

@@ -27,35 +27,69 @@ Canonical invalid predicate: raw `0` and raw `>= 2047` are invalid. Raw `2047`
 is a sensor "no valid depth returned" sentinel, not a fillable hole, and it must
 never be interpolated over.
 
-Current CPU behavior in `include/sensor/KinectSensor.h` `rawDepthToMeters()`:
+Current CPU behavior: one boundary owns the whole domain,
+`include/sensor/DepthValidity.h`. `include/sensor/KinectSensor.h` includes it
+(`rawDepthToMeters()` used to be defined there) and
+`src/sensor/SignalConditioner_omp.cpp` includes it directly:
 
 ```cpp
-if (raw == 0 || raw >= 2047) return 0.0f;
-return 1.0f / (raw * -0.0030711016f + 3.3309495161f);
+if (isInvalidRawDepth(raw)) return 0.0f;   // raw == 0 || raw >= 2047
+return 1.0f / (raw * kRawDepthCurveA + kRawDepthCurveB);   // A=-0.0030711016f, B=3.3309495161f
 ```
 
 The invalid predicate is therefore already canonical. The curve is not.
 
 The reciprocal form has a physical pole at
-`raw = 3.3309495161 / 0.0030711016 ≈ 1084.6`. Consequences, all reachable
-inside the raw 11-bit band:
+`raw = 3.3309495161 / 0.0030711016 ≈ 1084.6106`. Consequences, all reachable
+inside the raw 11-bit band (values below are the float32 result of the curve):
 
 | Raw | Meters | State |
 |---|---|---|
 | `0` | `0.0` (rejected) | invalid, canonical |
-| `1` | ~0.331 | inside the default band |
-| `954` | ~2.499 | last raw inside the default band |
-| `955`–`1003` | 2.50–4.00 | above `max_depth`, out of band |
-| `1004`–`1084` | 4.00 → ~533 | runaway approach to the pole |
-| `1085` | ~ -217 | **negative** |
-| `1085`–`2046` | negative, rising toward ~ -0.0 | **negative but finite and non-zero** |
+| `1` | 0.300492 | first raw inside the default band |
+| `954` | 2.493029 | last raw inside the default band |
+| `955` | 2.512263 | above `max_depth`, out of band |
+| `1003` | 3.989871 | out of band |
+| `1084` | 533.219 | runaway approach to the pole |
+| `1085` | -836.352 | **negative** |
+| `1500` | -0.783882 | **negative but finite and non-zero** |
+| `2046` | -0.338693 | **negative but finite and non-zero** |
 | `2047` | `0.0` (rejected) | invalid, canonical |
 
-Canonical depth-to-meters rule: output must be finite and inside the configured
-band, and anything else becomes invalid (zero) rather than a clamped wall or a
-negative value. The pole means a raw value that is not the sentinel can still
-produce a geometrically impossible negative distance. The invalid predicate
-alone is not a sufficient validity gate; a downstream band check is mandatory.
+So raw `1..954` is exactly the in-band raw set for the default `[0.30, 2.50]`
+band (954 contiguous codes), and `cpuDepthMetersToRaw(rawDepthToMeters(raw))`
+returns `raw` unchanged for every one of them. The pole means a raw value that is
+not the sentinel can still produce a geometrically impossible negative distance.
+The invalid predicate alone is not a sufficient validity gate; a band check is
+mandatory, and it is applied at this boundary rather than at each consumer.
+
+Canonical depth-to-meters rule, implemented as `cpuDepthMeters(raw, min, max)`:
+accept only when `rawDepthToMeters(raw)` is finite and within the configured
+band; anything else returns **exactly `+0.0f`** — never `min_depth`, never
+`max_depth`, never a wall value, never a negative. The reverse direction
+`cpuDepthMetersToRaw(meters, min, max)` rejects out-of-band and non-finite input
+with raw `0` instead of clamping `lround(raw)` into `[1, 2046]`, so a wall code
+can never be written into a depth frame. `isDepthMetersInBand()` is the shared
+finite-plus-band predicate and `isUsableRawDepth()` (valid raw AND in-band
+meters) is the neighbour predicate for every filtering window.
+
+All four CPU depth passes go through that boundary: `buildFrameData()`,
+`denoiseDepthSpatial()`, `applyDepthEma()`, `fillDepthHoles()`,
+`guidedDepthFilter()` and `computeDepthGradient()`. Two further CPU-only rules
+live with them and are locked by `tests/depth_domain_contract.cpp` and
+`tests/depth_ema_determinism_contract.cpp`:
+
+- Hole fill may change **only** pixels that are raw `0`. Raw `2047` is written
+  back exactly as it arrived (demoting it to `0` would silently convert "no
+  valid depth returned" into "fillable hole" for every later consumer), and a
+  window whose usable neighbours are all sentinels or all out-of-band leaves the
+  hole unfilled rather than inventing a value.
+- `applyDepthEma()` reads a source snapshot (`depth_src_`) and writes the
+  destination (`depth`), so its output is a pure function of
+  (input frame, per-pixel history, band) and is bit-identical across thread
+  counts. Reading the destination mid-pass lets already-filtered neighbours
+  contaminate the neighbour mean, which flips the jump-reset branch per pixel and
+  makes the result schedule-dependent.
 
 Canonical band source: `include/app/FusionHyperparams.h`
 `min_depth = 0.30f`, `max_depth = 2.50f`. That pair is the single owner, and the two
@@ -93,12 +127,12 @@ must scale the band by that norm: the integration near clamp is
 `[min_depth, max_depth] * ||ray_cam||`. Applying the band as a raw ray parameter
 instead mislocates every off-axis hit by that ratio.
 
-Known CPU defect (owned by the depth-domain todo): the raw band and the
-min/max band are enforced at different layers, and the CPU hole fill in
-`src/sensor/SignalConditioner_omp.cpp` `fillDepthHoles()` treats only raw `0`
-as a hole, so raw `2047` is left in place. That matches the canonical rule
-(raw `2047` is not fillable). The divergence is with the backends, which treat
-raw `2047` as a hole; see `cross-backend:A5` / `sensor:S-04` in the dossier.
+The raw band and the min/max band are no longer enforced at different layers on
+CPU: `cpuDepthMeters()` applies the raw predicate and the band in one call, and
+`fillDepthHoles()` treats only raw `0` as a hole, so raw `2047` is left in place.
+That matches the canonical rule (raw `2047` is not fillable). The divergence is
+now purely with the backends, which treat raw `2047` as a hole; see
+`cross-backend:A5` / `sensor:S-04` in the dossier.
 
 ## TSDF volume
 
@@ -573,12 +607,17 @@ unconditionally and throws on allocation failure instead of returning `false`
 `dst` before the allocation so a failed allocation yields a black frame that is
 consumed as valid (deferred `sensor:S-06` / `cross-backend:A24`).
 
-Canonical temporal EMA: single-buffer output. `applyDepthEma()` writes
-`depth[i]` while other threads read their neighbours' current-frame values from
-the same buffer, so the reset decision is made on partially updated data and
-the result differs every run. **Known CPU defect** (a data race), with the same
-shape in both GPU EMA kernels. Every other depth pass correctly ping-pongs
-between the in/out buffers; only the EMA is in-place.
+Canonical temporal EMA: single-buffer output. `applyDepthEma()` must not read
+the buffer it is writing, or the reset decision is made on partially updated
+neighbours and the result depends on schedule order. On CPU it now snapshots the
+incoming frame into `depth_src_` and writes `depth`, so the pass is a pure
+function of (input frame, per-pixel history, band) and bit-identical at 1, 2 and
+4 threads — locked by `tests/depth_ema_determinism_contract.cpp`, whose fixture
+is asymmetric between a pixel's own history and its neighbours' precisely so that
+a destination read (which resets the centre and emits its raw input instead of
+the blended code) cannot pass. The same in-place shape still exists in both GPU
+EMA kernels; deferred as `sensor:S-19`. Every other depth pass already ping-pongs
+between the in/out buffers.
 
 Canonical upscaled-RGB path: either consumed or deleted.
 `sr_rgb_upscaled_` is produced every frame (a full 4× bicubic upsample plus
