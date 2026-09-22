@@ -46,11 +46,14 @@ REQUIRED_TESTS=("cpu_smoke_harness" "pipeline_test_seam_smoke" "pipeline_stop_co
     "mesh_truncation_progress_contract" "marching_cubes_winding_contract"
     "color_convergence_contract" "glb_linear_color_contract"
     "depth_domain_contract" "depth_ema_determinism_contract" "cas_border_contract"
-    "sr_upscaled_contract" "kinect_pairing_contract")
+    "sr_upscaled_contract" "kinect_pairing_contract"
+    # todo 24: live hyperparameter propagation + callback/thread serialization.
+    "pipeline_hyperparams_contract")
 # Real controller coupling, proven post-build: a source-only replica that
 # re-declares its own look-alike seam methods has none of these symbols. Both
 # real-controller seam binaries must carry them...
-NM_POSITIVE_TARGETS=("tests/pipeline_test_seam_smoke" "tests/pipeline_stop_contract")
+NM_POSITIVE_TARGETS=("tests/pipeline_test_seam_smoke" "tests/pipeline_stop_contract"
+    "tests/pipeline_hyperparams_contract")
 # ...while a Qt-free control target (cpu_smoke_harness links only azu_test_core,
 # never the controller TU) must NOT carry the controller's internal symbol.
 NM_NEGATIVE_TARGET="tests/cpu_smoke_harness"

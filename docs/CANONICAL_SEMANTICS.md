@@ -111,13 +111,17 @@ Because the band is part of the parameter identity that `sameParams()` compares
 exactly, changing it in `TSDFParams` clears the volume like any other field (the
 Todo 8 rule). Locked by `tests/tsdf_integration_min_depth_contract.cpp`.
 
-Half-live handoff (**known, owned by Todo 24**): after `setHyperparams()` the GUI
-depth sliders take effect immediately for the CPU raycast, because the mirror
-reaches `params_` through `setParams()`. Integration is not live until restart:
-`integrationLoop()` snapshots `d_min` / `d_max` **once** before its worker loop
-(`src/app/PipelineController.cpp:818-823`) and passes those locals to every
-`integrate()` call, so a band change only reaches integration when the loop is
-restarted. Do not describe the integration gate as live mid-session.
+The band is live on **both** consumers (**fixed by big-fix Todo 24**):
+`trackingLoop()` and `integrationLoop()` each take one `hyperparamsSnapshot()`
+per processed frame — after that frame is popped and before anything consumes it
+(`src/app/PipelineController.cpp:663`, `:986`) — so a `setHyperparams()` issued
+while the pipeline runs reaches the ICP, the preprocessor and the next
+integrated frame without a restart. The pre-Todo-24 shape, where
+`integrationLoop()` cached `d_min` / `d_max` **once** before its worker loop and
+passed those locals to every `integrate()` call, so a band change reached
+integration only at restart, no longer exists. Locked by
+`tests/pipeline_hyperparams_contract.cpp`. Deferred backend instance:
+`cross-backend:A28`.
 
 The band is a camera-plane **Z-depth** bound in meters, on both the integration
 and the raycast side. A ray-cam direction `(u, v, 1)` reaches camera depth `z` at
@@ -197,8 +201,11 @@ never reads `TSDFParams::min_depth` / `max_depth`; those fields bound the raycas
 the band reaches integration only through the public entry point's arguments.
 **Fixed by big-fix Todo 15**, locked by `tests/tsdf_integration_min_depth_contract.cpp`
 (which drives the band through `integrate()`'s parameters). Deferred backend instance:
-`tsdf:T8`. The snapshot lifecycle that keeps the GUI slider stale for integration until
-restart is Todo 24, not a Todo 15 defect.
+`tsdf:T8`. The snapshot lifecycle that kept the GUI slider stale for integration until
+restart was Todo 24's scope rather than a Todo 15 defect, and Todo 24 closed it on CPU
+(per-frame snapshot at `PipelineController.cpp:986`, locked by
+`tests/pipeline_hyperparams_contract.cpp`); the backend instance stays deferred as
+`cross-backend:A28`.
 
 Canonical raycast: the march is bounded by `params_.min_depth` / `params_.max_depth`
 scaled to the ray parameter (`t = depth * norm(ray_cam)`), never by the literals `0.3f`
@@ -758,6 +765,65 @@ depth-to-**color** image transform or a registration source to build one, so no
 warp is claimed and none is applied. Evidence:
 `.omo/evidence/big-fix/kinect-depth-color-alignment.txt`.
 
+## Pipeline parameter application, callbacks and thread count
+
+Canonical rule: one owner per live parameter, one snapshot per processed frame,
+and no subscriber ever runs while a controller lock is held.
+
+Current behavior in `src/app/PipelineController.cpp`, **fixed by big-fix Todo 24**
+(CPU only — the CUDA / HIP worker-loop, GPU dispatch, TSDF resize, callback and
+thread-count execution paths keep their own shape and stay deferred as
+`cross-backend:A28`):
+
+- **Owner snapshot per frame.** `hyperparamsSnapshot()` is the only read path to
+  `hyperparams_`, and both workers call it exactly once per processed frame,
+  after that frame is popped and before anything consumes it (`:663` tracking,
+  `:986` integration). No preprocess / `track()` / `integrate()` call runs under
+  `hyper_mutex_`, which is a leaf guard around the copy alone.
+- **Application is serialized by lifecycle.** `setHyperparams()` (`:251`) runs
+  under `control_mutex_`, the same lock `start()` / `stop()` / `reset()` take, so
+  it can never interleave with a start or a shutdown. It then takes
+  `hyper_mutex_`, `tracker_mutex_`, `tsdf_mutex_` (exclusive, because
+  `setParams()` reallocates and clears voxels against the integration, raycast
+  and meshing readers) and `preprocessor_mutex_` **one at a time, never nested**,
+  so no pair of component locks can invert in either direction. A band change
+  clears the volume, which is why the integrated-frame count restarts from zero.
+- **Each component lock owns only its own work.** `tracker_mutex_` spans
+  `params()` / `setParams()` and the whole `track()` solve — and in
+  relocalization the recovery-parameter swap around the hypothesis tracks,
+  restored before the lock is released — with `gpu_mutex_` taken *before*
+  `tracker_mutex_` on the GPU branches. `preprocessor_mutex_` covers `process()`,
+  `setSrScale()`, `resetTemporalState()` and `reset()`, which mutate the temporal
+  EMA and the upscaled buffer. `tsdf_mutex_` keeps its existing shared-read /
+  exclusive-write split. Queue, pose, metrics and callback locks are never held
+  together with a component lock.
+- **Callbacks are copied, never shared.** `setMetricsCallback()`,
+  `setFrameReadyCallback()` and `setMeshReadyCallback()` assign under
+  `callback_mutex_`; `frameReadyCallbackCopy()`, `meshReadyCallbackCopy()` and
+  `hasFrameReadyCallback()` (`:307`) read it under the same lock. Every call
+  site — `dispatchUiFrame()` (`:553`), the meshing loop (`:1296`) and `stop()`'s
+  final full-model view — takes the copy first and invokes **that copy** outside
+  `callback_mutex_`, because a subscriber is arbitrary UI code that may
+  legitimately re-enter the controller. `dispatchUiFrame()` captures only the
+  copy and the shared frame in the queued lambda, never `this`, so a later setter
+  cannot change what an in-flight dispatch delivers.
+- **Thread counts move only at safe points.** `setNumThreads()` (`:340`)
+  publishes the request first; while running it parks the value
+  (`pending_num_threads_`, then `threads_pending_` as the release/acquire edge)
+  and `applyPendingThreadCount()` applies it in `trackingLoop()` after the pop
+  and before the frame is processed (`:658`), so the tracker is never resized
+  mid-`track()`. While stopped it re-checks `running_` under `control_mutex_`
+  and applies immediately, so a `start()` that won the race cannot have a worker
+  already tracking with the old count.
+- **Terminal state is published last.** `stop()` stores `Stopped` only after all
+  three workers have joined (`:407`), because `trackingLoop()` stores
+  `Running` / `TrackingLost` as it finishes a frame; storing it before the join
+  let a mid-frame worker overwrite the terminal state after `stop()` had already
+  returned.
+
+Locked by `tests/pipeline_hyperparams_contract.cpp` (seam-driven, CPU label, no
+device).
+
 ## Pipeline publication
 
 Canonical rule: a published model frame implies a raycast-written buffer.
@@ -770,10 +836,14 @@ block ends in an empty `else { // Fall through to CPU raycast }`. Under HIP with
 stale model frame. Deferred as `pipeline:PC-02`.
 
 Canonical depth band reaches the consumer: `min_depth` / `max_depth` must be
-read inside the integration loop, not snapshotted before it
-(`PipelineController.cpp:778-783` caches `d_min`/`d_max` before the
-`while (running_.load())` loop at `:785`), or a live slider change silently does
-nothing until restart.
+read inside the integration loop, per processed frame, not snapshotted before it.
+CPU satisfies this since big-fix Todo 24: `integrationLoop()` reads
+`hyperparamsSnapshot()` at `src/app/PipelineController.cpp:986`, immediately
+after popping a frame and before `integrate()` sees it, so a live slider change
+takes effect on the next integrated frame. The pre-Todo-24 cache
+(`d_min`/`d_max` stored once before the `while (running_.load())` loop) is gone.
+CUDA / HIP keep the stale-read shape and remain deferred as
+`cross-backend:A28`.
 
 ## Determinism and tolerance
 

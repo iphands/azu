@@ -79,10 +79,15 @@ public:
     bool exportPLY(const std::string& path);
     bool exportGLB(const std::string& path);
 
-    /** Optional subscriber; not invoked automatically — poll metricsSnapshot() from a timer instead. */
-    void setMetricsCallback(MetricsCallback cb)    { metrics_cb_ = std::move(cb); }
-    void setFrameReadyCallback(FrameReadyCallback cb) { frame_ready_cb_ = std::move(cb); }
-    void setMeshReadyCallback(MeshReadyCallback cb)   { mesh_ready_cb_ = std::move(cb); }
+    /**
+     * Optional subscribers. Each member is written and read only under
+     * callback_mutex_; delivery copies the callback and invokes the copy AFTER
+     * releasing that lock, so a subscriber may re-enter the controller and a
+     * replacement can never mutate a callback mid-invocation.
+     */
+    void setMetricsCallback(MetricsCallback cb);
+    void setFrameReadyCallback(FrameReadyCallback cb);
+    void setMeshReadyCallback(MeshReadyCallback cb);
 
     meshing::SharedMesh& sharedMesh() { return shared_mesh_; }
     /** Thread-safe copy for UI / diagnostics (locks internal metrics mutex). */
@@ -102,12 +107,23 @@ private:
     sensor::PreprocessBackend  preferred_backend_ = sensor::PreprocessBackend::Auto;
     std::atomic<sensor::PreprocessBackend> active_backend_{sensor::PreprocessBackend::CPU};
     std::unique_ptr<sensor::Preprocessor> preprocessor_;
+    // Serialises preprocessor_ use against its mutators. process() mutates the
+    // conditioner (temporal EMA, upscaled buffer), so it takes this lock exactly
+    // like setSrScale()/reset()/resetTemporalState() do; a shared_mutex would buy
+    // nothing because there is no concurrent reader of that state.
+    mutable std::mutex                   preprocessor_mutex_;
 
     // Components
     std::unique_ptr<sensor::KinectSensor>    sensor_;
     std::unique_ptr<tracking::ICPTracker>    tracker_;
+    // Serialises ICPTracker::params()/setParams()/setNumThreads() against every
+    // track()/trackGPU() call: ICPTracker::params_ is a plain struct the solver
+    // reads iteration by iteration, and relocalization swaps it around its
+    // hypothesis tracks. Leaf lock — never held with pose/metrics/queue/callback
+    // locks; on the GPU branches gpu_mutex_ is taken first.
+    mutable std::mutex                       tracker_mutex_;
     std::unique_ptr<tsdf::TSDFVolume>        tsdf_;
-    std::shared_mutex                        tsdf_mutex_;
+    mutable std::shared_mutex                  tsdf_mutex_;
     // Serializes ALL GPU kernel dispatches across tracking/integration/meshing threads.
     // On the AMD 5650u iGPU the ROCm ring buffer cannot handle concurrent kernel submissions
     // from multiple host threads on the default stream — this causes TDR (GPU Hang).
@@ -124,6 +140,11 @@ private:
     // Metrics
     PipelineMetrics            metrics_;
     mutable std::mutex         metrics_mutex_;
+    // Leaf lock guarding the three callback members. It is held ONLY to assign
+    // or copy a std::function; every invocation happens after it is released, so
+    // no subscriber ever runs under it and it can never invert with a component
+    // lock.
+    mutable std::mutex         callback_mutex_;
     MetricsCallback            metrics_cb_;
     FrameReadyCallback         frame_ready_cb_;
     MeshReadyCallback          mesh_ready_cb_;
@@ -133,7 +154,12 @@ private:
     std::thread                integration_thread_;
     std::thread                meshing_thread_;
     std::atomic<bool>          running_{false};
+    // Requested worker count. It is NEVER pushed into the tracker mid-track:
+    // while running it is parked as a pending request and applied at the next
+    // frame boundary in trackingLoop(); while stopped it is applied at once.
     std::atomic<int>           num_threads_{0}; // 0 = Auto
+    std::atomic<int>           pending_num_threads_{0};
+    std::atomic<bool>          threads_pending_{false};
 
     // Frame recycling pool (FrameData) - Self-recycling via custom deleter
     static constexpr size_t    DATA_POOL_SIZE = 6;
@@ -240,15 +266,25 @@ private:
     void integrationLoop();
     void meshingLoop();
 
+    /** Push a thread count into the tracker under tracker_mutex_. Callers hold no other lock. */
+    void applyThreadCount(int n);
+    /** Apply a parked thread-count request once, at a frame boundary. */
+    void applyPendingThreadCount();
+    FrameReadyCallback frameReadyCallbackCopy() const;
+    MeshReadyCallback  meshReadyCallbackCopy() const;
+    bool               hasFrameReadyCallback() const;
+
     // Pool helpers
     std::shared_ptr<sensor::FrameData> acquireFreeData();
     void releaseData(std::shared_ptr<sensor::FrameData> data);
     
 public:
-    void setNumThreads(int n) {
-        num_threads_.store(n);
-        if (tracker_) tracker_->setNumThreads(n);
-    }
+    /**
+     * Safe while running: the request is parked and applied at the next frame
+     * boundary. While stopped it is applied immediately. The tracker is never
+     * touched mid-track().
+     */
+    void setNumThreads(int n);
 
 #ifdef AZU_PIPELINE_TEST_SEAM
     // ---- Headless test seam (compile-time; defined only for test targets) ----
@@ -265,6 +301,42 @@ public:
     static int  uiFrameDeliveryCountForTests();
     // Clears hook + delivery counter (call before each seam test).
     static void resetUiFrameTestStateForTests();
+
+    /**
+     * Depth band a worker actually used for one processed frame. generation
+     * advances once per frame that worker handled, so a fixture waits on the
+     * counter it observed rather than on wall time.
+     */
+    struct DepthBandObservation {
+        uint64_t generation = 0;
+        float    min_depth  = 0.0f;
+        float    max_depth  = 0.0f;
+        bool     valid      = false;
+    };
+
+    DepthBandObservation lastTrackingDepthBandForTests() const;
+    DepthBandObservation lastIntegrationDepthBandForTests() const;
+    /** Thread count last pushed into the tracker (frame boundary or stopped). */
+    int  appliedThreadCountForTests() const;
+    /** SR scale last pushed into the preprocessor. */
+    int  appliedSrScaleForTests() const;
+    /** try_lock probes: false means the lock is held, never blocks. */
+    bool callbackMutexIsFreeForTests() const;
+    bool trackerMutexIsFreeForTests() const;
+    bool tsdfMutexIsFreeForTests() const;
+
+private:
+    struct SeamObservation {
+        mutable std::mutex mtx;
+        DepthBandObservation tracking_band;
+        DepthBandObservation integration_band;
+        int applied_threads  = 0;
+        int applied_sr_scale = 0;
+    };
+    SeamObservation seam_obs_;
+    void recordTrackingBandForTests(const FusionHyperparams& h);
+    void recordIntegrationBandForTests(float min_depth, float max_depth);
+public:
 #endif
 };
 

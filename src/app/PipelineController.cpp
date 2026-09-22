@@ -175,10 +175,30 @@ bool PipelineController::startInternal(bool engage_sensor) {
     KFLOG_INFO("Pipeline", "Using CPU-only path (GPU not enabled in build).");
 #endif
 
+    // A freshly built preprocessor carries its own default SR scale, so the
+    // owner's value is pushed here; otherwise a scale set before start() would
+    // silently apply only on the next setHyperparams().
+    const int start_sr_scale = hyperparamsSnapshot().sr_scale;
     configurePreprocessor();
-    if (preprocessor_) {
-        preprocessor_->reset();
+    {
+        std::lock_guard<std::mutex> pp_lk(preprocessor_mutex_);
+        if (preprocessor_) {
+            preprocessor_->reset();
+            preprocessor_->setSrScale(start_sr_scale);
+        }
     }
+#ifdef AZU_PIPELINE_TEST_SEAM
+    {
+        std::lock_guard<std::mutex> obs_lk(seam_obs_.mtx);
+        seam_obs_.applied_sr_scale = preprocessor_ ? start_sr_scale : 0;
+    }
+#endif
+
+    // The requested worker count is pushed here (workers not yet launched,
+    // control_mutex_ held) so a request parked by a previous running session,
+    // or one that raced with stop(), cannot be lost.
+    threads_pending_.store(false);
+    applyThreadCount(num_threads_.load());
 
     // Clear residual work and reset each queue's guarded shutdown predicate
     // before launching workers, so start/stop is idempotent: a previous stop()
@@ -232,14 +252,36 @@ void PipelineController::setHyperparams(const FusionHyperparams &h) {
   FusionHyperparams hp = h;
   syncIcpDepthFromRange(hp);
   syncTsdfDepthFromRange(hp);
+
+  // control_mutex_ serialises this whole application against start()/stop()/
+  // reset(), and each component lock is taken ALONE (never nested), so no order
+  // between tracker/tsdf/preprocessor can ever invert. hyper_mutex_ stays a leaf.
+  std::lock_guard<std::mutex> ctrl_lk(control_mutex_);
   {
     std::lock_guard<std::mutex> lk(hyper_mutex_);
     hyperparams_ = hp;
   }
-  tracker_->setParams(hp.icp);
-  tsdf_->setParams(hp.tsdf);
-  if (preprocessor_) {
-    preprocessor_->setSrScale(hp.sr_scale);
+  {
+    std::lock_guard<std::mutex> tr_lk(tracker_mutex_);
+    tracker_->setParams(hp.icp);
+  }
+  {
+    // Volume parameter replacement reallocates and clears voxels_, so it must be
+    // exclusive against the integration/meshing/raycast readers that already
+    // take this lock. gpu_mutex_ is NOT needed here: this branch never touches
+    // the device (the backends are deferred for this plan).
+    std::unique_lock<std::shared_mutex> tsdf_lk(tsdf_mutex_);
+    tsdf_->setParams(hp.tsdf);
+  }
+  {
+    std::lock_guard<std::mutex> pp_lk(preprocessor_mutex_);
+    if (preprocessor_) {
+      preprocessor_->setSrScale(hp.sr_scale);
+    }
+#ifdef AZU_PIPELINE_TEST_SEAM
+    std::lock_guard<std::mutex> obs_lk(seam_obs_.mtx);
+    seam_obs_.applied_sr_scale = preprocessor_ ? hp.sr_scale : 0;
+#endif
   }
   KFLOGF_INFO(
       "Pipeline",
@@ -247,12 +289,81 @@ void PipelineController::setHyperparams(const FusionHyperparams &h) {
       hp.min_depth, hp.max_depth, hp.tsdf.voxel_size * 1000.0f, hp.sr_scale);
 }
 
+void PipelineController::setMetricsCallback(MetricsCallback cb) {
+  std::lock_guard<std::mutex> lk(callback_mutex_);
+  metrics_cb_ = std::move(cb);
+}
+
+void PipelineController::setFrameReadyCallback(FrameReadyCallback cb) {
+  std::lock_guard<std::mutex> lk(callback_mutex_);
+  frame_ready_cb_ = std::move(cb);
+}
+
+void PipelineController::setMeshReadyCallback(MeshReadyCallback cb) {
+  std::lock_guard<std::mutex> lk(callback_mutex_);
+  mesh_ready_cb_ = std::move(cb);
+}
+
+FrameReadyCallback PipelineController::frameReadyCallbackCopy() const {
+  std::lock_guard<std::mutex> lk(callback_mutex_);
+  return frame_ready_cb_;
+}
+
+MeshReadyCallback PipelineController::meshReadyCallbackCopy() const {
+  std::lock_guard<std::mutex> lk(callback_mutex_);
+  return mesh_ready_cb_;
+}
+
+bool PipelineController::hasFrameReadyCallback() const {
+  std::lock_guard<std::mutex> lk(callback_mutex_);
+  return static_cast<bool>(frame_ready_cb_);
+}
+
+void PipelineController::applyThreadCount(int n) {
+  {
+    std::lock_guard<std::mutex> tr_lk(tracker_mutex_);
+    tracker_->setNumThreads(n);
+  }
+#ifdef AZU_PIPELINE_TEST_SEAM
+  std::lock_guard<std::mutex> obs_lk(seam_obs_.mtx);
+  seam_obs_.applied_threads = n;
+#endif
+}
+
+void PipelineController::applyPendingThreadCount() {
+  if (!threads_pending_.exchange(false)) {
+    return;
+  }
+  applyThreadCount(pending_num_threads_.load());
+}
+
+void PipelineController::setNumThreads(int n) {
+  // Publish the request first; threads_pending_ is the release/acquire edge that
+  // makes the parked value visible to the worker that consumes it.
+  num_threads_.store(n);
+  const auto park = [this, n]() {
+    pending_num_threads_.store(n);
+    threads_pending_.store(true);
+  };
+  if (running_.load()) {
+    park();
+    return;
+  }
+  // Stopped: apply now, but re-check under control_mutex_ so a start() that won
+  // the race cannot have a worker already tracking with the old count.
+  std::lock_guard<std::mutex> ctrl_lk(control_mutex_);
+  if (running_.load()) {
+    park();
+    return;
+  }
+  applyThreadCount(n);
+}
+
 void PipelineController::stop() {
   std::lock_guard<std::mutex> ctrl_lk(control_mutex_);
   if (!running_.load())
     return;
   running_.store(false);
-  state_.store(PipelineState::Stopped);
 
   KFLOG_INFO("Pipeline",
              "Stopping pipeline... Waiting for worker threads to join.");
@@ -290,6 +401,11 @@ void PipelineController::stop() {
   if (meshing_thread_.joinable())
     meshing_thread_.join();
 
+  // Terminal state is published only once every writer is gone: trackingLoop
+  // stores Running/TrackingLost as it finishes a frame, so storing Stopped
+  // before the join let a mid-frame worker overwrite it afterwards.
+  state_.store(PipelineState::Stopped);
+
 #ifdef CUDA_ENABLED
   if (use_gpu_.load()) {
       cudaDeviceSynchronize();
@@ -303,14 +419,19 @@ void PipelineController::stop() {
   // FINAL EXTRACTION: Collect all voxels for a "Full Model" point cloud view
   KFLOG_INFO("Pipeline", "Extracting full model point cloud for final view...");
   auto global_frame = std::make_shared<sensor::FrameData>();
-  tsdf_->extractGlobalPointCloud(global_frame->vertices, global_frame->rgb);
+  {
+    std::shared_lock<std::shared_mutex> tsdf_lk(tsdf_mutex_);
+    tsdf_->extractGlobalPointCloud(global_frame->vertices, global_frame->rgb);
+  }
   global_frame->width = 1;
   global_frame->height = static_cast<int>(global_frame->vertices.size());
   global_frame->depth_meters.assign(global_frame->height, 1.0f);
   global_frame->pose = Eigen::Matrix4f::Identity();
 
-  if (frame_ready_cb_) {
-    frame_ready_cb_(*global_frame);
+  // Copy, then invoke outside callback_mutex_: the final-view subscriber is
+  // arbitrary UI code and may legitimately call back into the controller.
+  if (FrameReadyCallback on_frame = frameReadyCallbackCopy()) {
+    on_frame(*global_frame);
   }
 
 #ifdef CUDA_ENABLED
@@ -375,7 +496,10 @@ void PipelineController::reset() {
         model_buffers_.ready_idx.store(2);
     }
 
-    tsdf_->reset();
+    {
+        std::unique_lock<std::shared_mutex> tsdf_lk(tsdf_mutex_);
+        tsdf_->reset();
+    }
     {
         std::lock_guard<std::mutex> lk(pose_mutex_);
         current_pose_ = Eigen::Matrix4f::Identity();
@@ -388,8 +512,11 @@ void PipelineController::reset() {
     success_log_counter_  = 0;
     hip_ui_skip_          = 0;
     metrics_      = PipelineMetrics{};
-    if (preprocessor_) {
-        preprocessor_->reset();
+    {
+        std::lock_guard<std::mutex> pp_lk(preprocessor_mutex_);
+        if (preprocessor_) {
+            preprocessor_->reset();
+        }
     }
     shared_mesh_.update(std::make_shared<meshing::MeshData>());
     state_.store(PipelineState::Idle);
@@ -397,6 +524,7 @@ void PipelineController::reset() {
 }
 
 void PipelineController::configurePreprocessor() {
+    std::lock_guard<std::mutex> pp_lk(preprocessor_mutex_);
     sensor::PreprocessBackend resolved = sensor::PreprocessBackend::CPU;
     preprocessor_ = sensor::makePreprocessor(preferred_backend_,
                                              use_gpu_.load(),
@@ -423,12 +551,16 @@ std::atomic<int> g_seam_ui_deliveries{0};
 #endif
 
 void PipelineController::dispatchUiFrame(std::shared_ptr<sensor::FrameData> ui_frame) {
+    // Snapshot the subscriber once. The queued lambda captures THAT copy and the
+    // shared frame, never `this`, so a later setFrameReadyCallback() (or
+    // controller teardown ordering) cannot change what this dispatch invokes.
+    FrameReadyCallback on_frame = frameReadyCallbackCopy();
     if (qApp) {
         QMetaObject::invokeMethod(
             qApp,
-            [this, ui_frame]() {
-                if (frame_ready_cb_)
-                    frame_ready_cb_(*ui_frame);
+            [on_frame = std::move(on_frame), ui_frame]() {
+                if (on_frame)
+                    on_frame(*ui_frame);
             },
             Qt::QueuedConnection);
         return;
@@ -444,9 +576,9 @@ void PipelineController::dispatchUiFrame(std::shared_ptr<sensor::FrameData> ui_f
         hook(*ui_frame);
         return;
     }
-    if (frame_ready_cb_) {
+    if (on_frame) {
         g_seam_ui_deliveries.fetch_add(1, std::memory_order_relaxed);
-        frame_ready_cb_(*ui_frame);
+        on_frame(*ui_frame);
     }
     // No hook and no callback: deterministic no-op; null qApp is never touched.
 #endif
@@ -521,6 +653,18 @@ void PipelineController::trackingLoop() {
       raw_queue_.pop();
     }
 
+    // Frame boundary: the only place a running thread-count request is allowed
+    // to reach the tracker (never mid-track).
+    applyPendingThreadCount();
+
+    // One owner snapshot per processed frame, taken after the frame is popped
+    // and before anything consumes it. hyper_mutex_ is released immediately: no
+    // preprocess/track/integrate call ever runs under it.
+    const FusionHyperparams hp = hyperparamsSnapshot();
+#ifdef AZU_PIPELINE_TEST_SEAM
+    recordTrackingBandForTests(hp);
+#endif
+
     // Build processed frame here (using pool)
     auto frame = acquireFreeData();
     if (!frame) {
@@ -530,15 +674,10 @@ void PipelineController::trackingLoop() {
     }
     
     frame->frame_id = raw->frame_id;
-    float d_min = 0.3f, d_max = 5.0f;
-    {
-        std::lock_guard<std::mutex> lk(hyper_mutex_);
-        d_min = hyperparams_.min_depth;
-        d_max = hyperparams_.max_depth;
-    }
 
     if (preprocessor_) {
-        preprocessor_->process(*raw, d_min, d_max);
+        std::lock_guard<std::mutex> pp_lk(preprocessor_mutex_);
+        preprocessor_->process(*raw, hp.min_depth, hp.max_depth);
     }
     // Upscaled RGB for TSDF texturing stays DISABLED (future scope).
     // srUpscaledAvailable() is now the gate: the CPU path publishes the buffer
@@ -550,8 +689,8 @@ void PipelineController::trackingLoop() {
     // pass, so srUpscaledAvailable() reports false there by contract (see
     // docs/CUDA_HIP_DEFERRED_CHANGES.md).
     // const auto& upscaled_rgb = preprocessor_->getSrRgbUpscaled();
-    // sensor::buildFrameData(raw->depth.data(), upscaled_rgb.data(), *frame, d_min, d_max);
-    sensor::buildFrameData(raw->depth.data(), raw->rgb.data(), *frame, d_min, d_max);
+    // sensor::buildFrameData(raw->depth.data(), upscaled_rgb.data(), *frame, hp.min_depth, hp.max_depth);
+    sensor::buildFrameData(raw->depth.data(), raw->rgb.data(), *frame, hp.min_depth, hp.max_depth);
     sensor::computeNormals(*frame);
     
     // We can release 'raw' immediately after buildFrameData copies it
@@ -615,9 +754,48 @@ void PipelineController::trackingLoop() {
     tracking::ICPResult icp_result;
     bool is_lost = (state_.load() == PipelineState::TrackingLost);
 
+    // Both solvers run with tracker_mutex_ ALREADY HELD by the caller: the
+    // solver reads ICPTracker::params_ iteration by iteration, so the lock must
+    // span the whole track() (and, in relocalization, the recovery-params swap
+    // around it). They do not lock, so a caller can hold the lock across
+    // several calls without a self-deadlock.
+    auto solve_cpu = [&](const sensor::FramePyramid& pyramid,
+                         const Eigen::Matrix4f& estimate) -> tracking::ICPResult {
+        return tracker_->track(pyramid, *model_ref, estimate, prev_pose);
+    };
+    auto solve_gpu = [&](const Eigen::Matrix4f& estimate) -> tracking::ICPResult {
+        tracking::ICPResult res;
+#ifdef CUDA_ENABLED
+        res = tracker_->trackGPU(
+            preprocessor_->getGPUDepthMeters(),
+            preprocessor_->getGPURgb(),
+            frame->width, frame->height,
+            *model_ref, estimate, prev_pose
+        );
+#elif defined(HIP_ENABLED)
+        res = tracker_->trackGPU(
+            preprocessor_->getGPUDepthMeters(),
+            preprocessor_->getGPURgb(),
+            frame->width, frame->height,
+            *model_ref, estimate, prev_pose
+        );
+#else
+        (void)estimate;
+#endif
+        return res;
+    };
+
+    // gpu_mutex_ first, tracker_mutex_ second — the order every other GPU path
+    // uses; the CPU branches take the tracker lock alone.
+    std::unique_lock<std::mutex> gpu_lk;
+    if (use_gpu_.load())
+        gpu_lk = std::unique_lock<std::mutex>(gpu_mutex_);
+    std::unique_lock<std::mutex> tracker_lk(tracker_mutex_);
+
     if (is_lost) {
-      // RELOCALIZATION MODE: Multi-hypothesis search
-      tracking::ICPParams recovery_params = hyperparams_.icp;
+      // RELOCALIZATION MODE: Multi-hypothesis search. Params come from this
+      // frame's snapshot, never from an unsynchronized hyperparams_ read.
+      tracking::ICPParams recovery_params = hp.icp;
       recovery_params.dist_threshold *= 2.5f; 
       recovery_params.angle_threshold = 45.0f;
       
@@ -626,7 +804,7 @@ void PipelineController::trackingLoop() {
           recovery_params.max_iterations[l] *= 2;
       }
 
-      tracking::ICPParams original_params = tracker_->params();
+      const tracking::ICPParams original_params = tracker_->params();
       tracker_->setParams(recovery_params);
 
       // Hypothesis 1: Last known pose
@@ -644,30 +822,14 @@ void PipelineController::trackingLoop() {
       best_result.tracking_ok = false;
       best_result.inliers = 0;
 
+      sensor::FramePyramid pyramid;
+      if (!use_gpu_.load()) {
+          sensor::buildFramePyramid(*frame, pyramid);
+      }
+
       for (const auto& h_pose : hypotheses) {
-          tracking::ICPResult res;
-          if (use_gpu_.load()) {
-            std::lock_guard<std::mutex> gpu_lk(gpu_mutex_);
-#ifdef CUDA_ENABLED
-            res = tracker_->trackGPU(
-                preprocessor_->getGPUDepthMeters(),
-                preprocessor_->getGPURgb(),
-                frame->width, frame->height,
-                *model_ref, h_pose, prev_pose
-            );
-#elif defined(HIP_ENABLED)
-            res = tracker_->trackGPU(
-                preprocessor_->getGPUDepthMeters(),
-                preprocessor_->getGPURgb(),
-                frame->width, frame->height,
-                *model_ref, h_pose, prev_pose
-            );
-#endif
-          } else {
-            sensor::FramePyramid pyramid;
-            sensor::buildFramePyramid(*frame, pyramid);
-            res = tracker_->track(pyramid, *model_ref, h_pose, prev_pose);
-          }
+          tracking::ICPResult res = use_gpu_.load() ? solve_gpu(h_pose)
+                                                   : solve_cpu(pyramid, h_pose);
 
           // Always track the best-inlier hypothesis so diagnostics are
           // meaningful even when every hypothesis fails (tracking_ok==false).
@@ -678,50 +840,30 @@ void PipelineController::trackingLoop() {
       }
       
       icp_result = best_result;
+      // Restored under the same lock the swap happened under, so the tracker can
+      // never be left holding recovery params, and a concurrent setHyperparams()
+      // cannot land between the swap and the restore.
       tracker_->setParams(original_params);
     } else {
       if (use_gpu_.load()) {
-        std::lock_guard<std::mutex> gpu_lk(gpu_mutex_);
-#ifdef CUDA_ENABLED
-        icp_result = tracker_->trackGPU(
-            preprocessor_->getGPUDepthMeters(),
-            preprocessor_->getGPURgb(),
-            frame->width, frame->height,
-            *model_ref, predicted_pose, prev_pose
-        );
+        icp_result = solve_gpu(predicted_pose);
         if (!icp_result.tracking_ok) {
-          icp_result = tracker_->trackGPU(
-              preprocessor_->getGPUDepthMeters(),
-              preprocessor_->getGPURgb(),
-              frame->width, frame->height,
-              *model_ref, prev_pose, prev_pose
-          );
+          icp_result = solve_gpu(prev_pose);
         }
-#elif defined(HIP_ENABLED)
-        icp_result = tracker_->trackGPU(
-            preprocessor_->getGPUDepthMeters(),
-            preprocessor_->getGPURgb(),
-            frame->width, frame->height,
-            *model_ref, predicted_pose, prev_pose
-        );
-        if (!icp_result.tracking_ok) {
-          icp_result = tracker_->trackGPU(
-              preprocessor_->getGPUDepthMeters(),
-              preprocessor_->getGPURgb(),
-              frame->width, frame->height,
-              *model_ref, prev_pose, prev_pose
-          );
-        }
-#endif
       } else {
         sensor::FramePyramid pyramid;
         sensor::buildFramePyramid(*frame, pyramid);
-        icp_result = tracker_->track(pyramid, *model_ref, predicted_pose, prev_pose);
+        icp_result = solve_cpu(pyramid, predicted_pose);
         if (!icp_result.tracking_ok) {
-          icp_result = tracker_->track(pyramid, *model_ref, prev_pose, prev_pose);
+          icp_result = solve_cpu(pyramid, prev_pose);
         }
       }
     }
+    tracker_lk.unlock();
+    // gpu_lk is only ever owned on the GPU path; unlocking an unowned
+    // unique_lock throws system_error(EPERM).
+    if (gpu_lk.owns_lock())
+        gpu_lk.unlock();
 
     // Robust Camera Path Detection: Sanity check the pose update
     if (icp_result.tracking_ok) {
@@ -801,11 +943,13 @@ void PipelineController::trackingLoop() {
         } else {
             // RELOCALIZATION: If tracking lost, don't update state or pose, but don't stop.
             // We just don't integrate the frame. This keeps the model "clean".
-            if (!is_lost) {
+             if (!is_lost) {
                  KFLOG_WARN("Pipeline", "Tracking lost! Suspension of TSDF integration. Entering relocalization mode...");
                  if (preprocessor_) {
+                     std::lock_guard<std::mutex> pp_lk(preprocessor_mutex_);
                      preprocessor_->resetTemporalState();
                  }
+
                  // Clear the integration queue to prevent "garbage" poses from being integrated
                  std::lock_guard<std::mutex> lk(integration_queue_mutex_);
                  std::queue<std::shared_ptr<sensor::FrameData>> empty;
@@ -821,13 +965,6 @@ void PipelineController::integrationLoop() {
   static constexpr int MESH_TRIGGER_FRAMES =
       5; // trigger mesh update every N integrated frames
   int frames_since_mesh = 0;
-  
-  float d_min = 0.3f, d_max = 5.0f;
-  {
-      std::lock_guard<std::mutex> lk(hyper_mutex_);
-      d_min = hyperparams_.min_depth;
-      d_max = hyperparams_.max_depth;
-  }
 
   while (running_.load()) {
     std::shared_ptr<sensor::FrameData> frame;
@@ -842,6 +979,15 @@ void PipelineController::integrationLoop() {
       frame = integration_queue_.front();
       integration_queue_.pop();
     }
+
+    // Owner snapshot per integrated frame, after the pop and before the TSDF
+    // sees the frame: a depth-band change can no longer be applied to whatever
+    // happens to be queued next, mid-integration.
+    const FusionHyperparams hp = hyperparamsSnapshot();
+#ifdef AZU_PIPELINE_TEST_SEAM
+    recordIntegrationBandForTests(hp.min_depth, hp.max_depth);
+#endif
+    const float d_min = hp.min_depth, d_max = hp.max_depth;
 
     {
       utils::ScopedTimer t("TSDF Integration");
@@ -918,7 +1064,7 @@ void PipelineController::integrationLoop() {
                              model_back.normals.data(), model_back.colors.data());
           }
 
-          if (frame_ready_cb_) {
+          if (hasFrameReadyCallback()) {
             size_t n = sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT;
             auto ui_frame = std::make_shared<sensor::FrameData>();
 
@@ -966,7 +1112,7 @@ void PipelineController::integrationLoop() {
                                 model_back.d_normals.get(), model_back.d_colors.get());
           }
           // Sync to CPU for UI preview
-          if (frame_ready_cb_) {
+          if (hasFrameReadyCallback()) {
             size_t n = sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT;
             std::vector<float3> h_v(n);
             std::vector<float3> h_n(n);
@@ -1016,7 +1162,7 @@ void PipelineController::integrationLoop() {
           // pipeline and starves the GNOME compositor. Only send a UI update every
           // HIP_UI_PREVIEW_INTERVAL integrated frames to keep the display responsive.
           static constexpr int HIP_UI_PREVIEW_INTERVAL = 3;
-          if (frame_ready_cb_ && (++hip_ui_skip_ % HIP_UI_PREVIEW_INTERVAL == 0)) {
+          if (hasFrameReadyCallback() && (++hip_ui_skip_ % HIP_UI_PREVIEW_INTERVAL == 0)) {
             size_t n = sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT;
             std::vector<float3> h_v(n);
             std::vector<uchar3> h_c(n);
@@ -1144,19 +1290,23 @@ void PipelineController::meshingLoop() {
       metrics_.mesh_extract_pct = 100.0f;
     }
 
+    // Copy under callback_mutex_, invoke outside it: setMeshReadyCallback() can
+    // run on the UI thread while this thread is mid-extraction, and the
+    // subscriber is arbitrary code that may re-enter the controller.
+    MeshReadyCallback on_mesh = meshReadyCallbackCopy();
     if (mesh && !mesh->empty()) {
       KFLOGF_INFO("Pipeline",
                   "Mesh Extraction SUCCESS: %zu triangles, %zu vertices ready "
                   "for rendering.",
                   mesh->triangleCount(), mesh->positions.size());
       shared_mesh_.update(std::move(mesh));
-      if (mesh_ready_cb_)
-        mesh_ready_cb_();
+      if (on_mesh)
+        on_mesh();
     } else {
       KFLOG_WARN("Pipeline", "Mesh Extraction EMPTY: Volume might be too "
                              "sparse or clipping values too aggressive.");
-      if (mesh_ready_cb_)
-        mesh_ready_cb_();
+      if (on_mesh)
+        on_mesh();
     }
     is_meshing_.store(false);
   }
@@ -1244,6 +1394,71 @@ std::shared_ptr<sensor::FrameData> PipelineController::acquireFreeData() {
 void PipelineController::releaseData(std::shared_ptr<sensor::FrameData>) {
   // Managed by custom deleter
 }
+
+#ifdef AZU_PIPELINE_TEST_SEAM
+void PipelineController::recordTrackingBandForTests(const FusionHyperparams& h) {
+  // Leaf lock only: callers hold no controller lock here (the hyperparams_
+  // snapshot was already copied out of hyper_mutex_).
+  std::lock_guard<std::mutex> lk(seam_obs_.mtx);
+  auto& band        = seam_obs_.tracking_band;
+  band.generation  += 1;
+  band.min_depth    = h.min_depth;
+  band.max_depth    = h.max_depth;
+  band.valid        = true;
+}
+
+void PipelineController::recordIntegrationBandForTests(float min_depth, float max_depth) {
+  std::lock_guard<std::mutex> lk(seam_obs_.mtx);
+  auto& band        = seam_obs_.integration_band;
+  band.generation  += 1;
+  band.min_depth    = min_depth;
+  band.max_depth    = max_depth;
+  band.valid        = true;
+}
+
+PipelineController::DepthBandObservation
+PipelineController::lastTrackingDepthBandForTests() const {
+  std::lock_guard<std::mutex> lk(seam_obs_.mtx);
+  return seam_obs_.tracking_band;
+}
+
+PipelineController::DepthBandObservation
+PipelineController::lastIntegrationDepthBandForTests() const {
+  std::lock_guard<std::mutex> lk(seam_obs_.mtx);
+  return seam_obs_.integration_band;
+}
+
+int PipelineController::appliedThreadCountForTests() const {
+  std::lock_guard<std::mutex> lk(seam_obs_.mtx);
+  return seam_obs_.applied_threads;
+}
+
+int PipelineController::appliedSrScaleForTests() const {
+  std::lock_guard<std::mutex> lk(seam_obs_.mtx);
+  return seam_obs_.applied_sr_scale;
+}
+
+bool PipelineController::callbackMutexIsFreeForTests() const {
+  std::unique_lock<std::mutex> lk(callback_mutex_, std::try_to_lock);
+  return lk.owns_lock();
+}
+
+bool PipelineController::trackerMutexIsFreeForTests() const {
+  std::unique_lock<std::mutex> lk(tracker_mutex_, std::try_to_lock);
+  return lk.owns_lock();
+}
+
+bool PipelineController::tsdfMutexIsFreeForTests() const {
+  // Shared probe on purpose: only the exclusive (writer) sections matter here.
+  // A concurrent raycast reader is legitimate during a live scan, so an
+  // exclusive probe would make the assertion timing-dependent.
+  if (tsdf_mutex_.try_lock_shared()) {
+    tsdf_mutex_.unlock_shared();
+    return true;
+  }
+  return false;
+}
+#endif
 
 } // namespace app
 } // namespace kfusion

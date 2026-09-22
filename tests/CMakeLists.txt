@@ -118,6 +118,25 @@ set_tests_properties(pipeline_stop_contract PROPERTIES
     # this (see .omo/evidence/big-fix/pipeline-stop-loop.txt).
 )
 
+# ---- big-fix todo 24: CPU-only hyperparameter / callback contract ----
+# Drives the real controller while it is RUNNING: per-frame depth-band owner
+# snapshots (tracking + integration), a live setHyperparams() reaching the
+# preprocessor, setNumThreads() parked to a frame boundary, and the UI
+# subscriber observed running with callback_mutex_ released. Every wait is
+# bounded by an injected-frame count and a generation counter the production
+# loops advance, so TIMEOUT (never an in-test sleep) is the hang detector.
+# Links azu_test_pipeline so the real PipelineController runs (gate 6 below).
+add_executable(pipeline_hyperparams_contract pipeline_hyperparams_contract.cpp)
+target_compile_definitions(pipeline_hyperparams_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(pipeline_hyperparams_contract PRIVATE azu_test_pipeline)
+
+add_test(NAME pipeline_hyperparams_contract COMMAND pipeline_hyperparams_contract)
+set_tests_properties(pipeline_hyperparams_contract PROPERTIES
+    LABELS cpu TIMEOUT 120
+    # ~48 injected frames at 500ms spacing plus bounded waits; the cap protects
+    # against a worker that stops draining its queue entirely.
+)
+
 # ---- big-fix todo 6: Marching Cubes fail-before-fix contracts ----
 # marching_cubes_table_contract is CPU-only (header + integer math, no volume)
 # and validates all 256 rows against an independent crossing-edge oracle: it
@@ -660,4 +679,47 @@ if(NOT "${AZU_KINECT_TEST_LINKS}" MATCHES "azu_test_core")
         "got: ${AZU_KINECT_TEST_LINKS}")
 endif()
 
-message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract registered (label=cpu)")
+# 6) big-fix todo 24: pipeline_hyperparams_contract must drive the REAL
+#    controller hyperparameter/callback path, not a synthetic replica. Same
+#    discipline as gate 1/4/5: comments are stripped, so only a genuine call
+#    shape (receiver '.'/'>'/'::' + name + '(') configures the gate, and the
+#    target must link azu_test_pipeline. The required calls are exactly the
+#    propagation and serialization surfaces this todo owns: seam start/injection,
+#    the hyperparameter setter and reader, both per-frame band observations, and
+#    the thread-count/SR-scale observations.
+get_target_property(AZU_HYPER_TEST_SOURCES pipeline_hyperparams_contract SOURCES)
+if(NOT AZU_HYPER_TEST_SOURCES)
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: pipeline_hyperparams_contract has no SOURCES.")
+endif()
+set(AZU_HYPER_TEST_TEXT "")
+foreach(_azu_hyper_src ${AZU_HYPER_TEST_SOURCES})
+    get_filename_component(_azu_hyper_abs "${_azu_hyper_src}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(NOT EXISTS "${_azu_hyper_abs}")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: registered pipeline_hyperparams_contract source ${_azu_hyper_abs} does not exist.")
+    endif()
+    file(READ "${_azu_hyper_abs}" _azu_hyper_txt)
+    azu_strip_c_comments(_azu_hyper_txt_code _azu_hyper_txt)
+    string(APPEND AZU_HYPER_TEST_TEXT "${_azu_hyper_txt_code}")
+endforeach()
+foreach(_azu_hyper_call startWithoutSensorForTests injectRawFrameForTests
+                        setHyperparams hyperparamsSnapshot setNumThreads
+                        lastTrackingDepthBandForTests lastIntegrationDepthBandForTests
+                        appliedSrScaleForTests appliedThreadCountForTests
+                        callbackMutexIsFreeForTests setFrameReadyCallback stop)
+    if(NOT AZU_HYPER_TEST_TEXT MATCHES "[.>:]${_azu_hyper_call}[ \t\r\n]*\\(")
+        message(FATAL_ERROR
+            "ANTI-SYNTHETIC GATE: the pipeline_hyperparams_contract source must call ${_azu_hyper_call}() "
+            "on the real PipelineController (a comment or string literal naming it is not a call). "
+            "A queue/parameter replica does not satisfy this todo.")
+    endif()
+endforeach()
+get_target_property(AZU_HYPER_TEST_LINKS pipeline_hyperparams_contract LINK_LIBRARIES)
+if(NOT "${AZU_HYPER_TEST_LINKS}" MATCHES "azu_test_pipeline")
+    message(FATAL_ERROR
+        "ANTI-SYNTHETIC GATE: pipeline_hyperparams_contract must link azu_test_pipeline, "
+        "got: ${AZU_HYPER_TEST_LINKS}")
+endif()
+
+message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract registered (label=cpu)")
