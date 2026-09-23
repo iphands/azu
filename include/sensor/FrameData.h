@@ -30,6 +30,10 @@ struct FrameData {
     int width  = FRAME_W;
     int height = FRAME_H;
     uint64_t frame_id = 0;
+    // false when the sensor published this frame depth-only (no RGB sample
+    // within the pairing window); `rgb` then holds stale bytes and must not be
+    // fused into the volume.
+    bool rgb_valid = true;
     
     // The world-from-camera transformation found by the tracker for this specific frame
     Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();

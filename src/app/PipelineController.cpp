@@ -774,6 +774,7 @@ void PipelineController::trackingLoopBody() {
     }
     
     frame->frame_id = raw->frame_id;
+    frame->rgb_valid = raw->rgb_valid;
 
     if (preprocessor_) {
         std::lock_guard<std::mutex> pp_lk(preprocessor_mutex_);
@@ -1096,6 +1097,8 @@ void PipelineController::integrationLoopBody() {
     recordIntegrationBandForTests(hp.min_depth, hp.max_depth);
 #endif
     const float d_min = hp.min_depth, d_max = hp.max_depth;
+    // A depth-only frame still integrates geometry, but its colour is not fused.
+    const uint8_t* fuse_rgb = frame->rgb_valid ? frame->rgb.data() : nullptr;
 
     {
       utils::ScopedTimer t("TSDF Integration");
@@ -1107,7 +1110,7 @@ void PipelineController::integrationLoopBody() {
       if (use_gpu_.load()) {
           tsdf_->integrate(
               frame->depth_meters.data(),
-              frame->rgb.data(),
+              fuse_rgb,
               frame->pose,
               static_cast<float>(sensor::FX), static_cast<float>(sensor::FY),
               static_cast<float>(sensor::CX), static_cast<float>(sensor::CY),
@@ -1115,7 +1118,7 @@ void PipelineController::integrationLoopBody() {
       } else {
           gpu_lk.unlock(); // CPU path doesn't need GPU serialization
           tsdf_->integrate(
-              frame->depth_meters.data(), frame->rgb.data(), frame->pose,
+              frame->depth_meters.data(), fuse_rgb, frame->pose,
               static_cast<float>(sensor::FX), static_cast<float>(sensor::FY),
               static_cast<float>(sensor::CX), static_cast<float>(sensor::CY),
               frame->width, frame->height, d_min, d_max);
@@ -1124,7 +1127,7 @@ void PipelineController::integrationLoopBody() {
       if (use_gpu_.load()) {
           tsdf_->integrate(
               frame->depth_meters.data(),
-              frame->rgb.data(),
+              fuse_rgb,
               frame->pose,
               static_cast<float>(sensor::FX), static_cast<float>(sensor::FY),
               static_cast<float>(sensor::CX), static_cast<float>(sensor::CY),
@@ -1132,7 +1135,7 @@ void PipelineController::integrationLoopBody() {
       } else {
           gpu_lk.unlock(); // CPU path doesn't need GPU serialization
           tsdf_->integrate(
-              frame->depth_meters.data(), frame->rgb.data(), frame->pose,
+              frame->depth_meters.data(), fuse_rgb, frame->pose,
               static_cast<float>(sensor::FX), static_cast<float>(sensor::FY),
               static_cast<float>(sensor::CX), static_cast<float>(sensor::CY),
               frame->width, frame->height, d_min, d_max);
@@ -1140,7 +1143,7 @@ void PipelineController::integrationLoopBody() {
 #else
       gpu_lk.unlock(); // CPU-only build: no GPU serialization needed
       tsdf_->integrate(
-          frame->depth_meters.data(), frame->rgb.data(), frame->pose,
+          frame->depth_meters.data(), fuse_rgb, frame->pose,
           static_cast<float>(sensor::FX), static_cast<float>(sensor::FY),
           static_cast<float>(sensor::CX), static_cast<float>(sensor::CY),
           frame->width, frame->height, d_min, d_max);
