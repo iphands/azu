@@ -437,9 +437,15 @@ add_test(NAME recording_trim_contract COMMAND recording_trim_contract)
 set_tests_properties(recording_trim_contract PROPERTIES LABELS cpu TIMEOUT 60)
 
 # End to end: generated protocol take -> azu_trim -> checks -> azu_replay.
+# The replay step runs only in optimised trees (see trim_e2e.cmake).
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(_azu_trim_replay "")
+else()
+    set(_azu_trim_replay "$<TARGET_FILE:azu_replay>")
+endif()
 add_test(NAME trim_e2e
     COMMAND ${CMAKE_COMMAND} -DGEN=$<TARGET_FILE:make_fake_dump> -DTRIM=$<TARGET_FILE:azu_trim>
-            -DREPLAY=$<TARGET_FILE:azu_replay> -DDIR=${CMAKE_CURRENT_BINARY_DIR}/trim_e2e
+            "-DREPLAY=${_azu_trim_replay}" -DDIR=${CMAKE_CURRENT_BINARY_DIR}/trim_e2e
             -P ${CMAKE_CURRENT_SOURCE_DIR}/trim_e2e.cmake)
 set_tests_properties(trim_e2e PROPERTIES LABELS cpu TIMEOUT 180)
 

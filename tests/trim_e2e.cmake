@@ -1,5 +1,5 @@
 # End-to-end check of tools/azu_trim on a generated protocol take (ctest script).
-#   -DGEN=<make_fake_dump> -DTRIM=<azu_trim> -DREPLAY=<azu_replay> -DDIR=<scratch dir>
+#   -DGEN=<make_fake_dump> -DTRIM=<azu_trim> [-DREPLAY=<azu_replay>] -DDIR=<scratch dir>
 # make_fake_dump "protocol": holds at frames 15-74 and 96-155 (33.37 ms/frame),
 # i.e. 0.50-2.47 s and 3.20-5.17 s, positioning before, a reach after.
 # The detector trims inside the holds: the 0.5 s accelerometer window eats up to
@@ -43,11 +43,14 @@ if(NOT EXISTS "${DIR}/trimmed/device.json")
     message(FATAL_ERROR "device.json not copied")
 endif()
 
-# The trimmed copy is a normal recording.
-execute_process(COMMAND "${REPLAY}" "${DIR}/trimmed" --backend cpu --out "${DIR}/replay" --quiet
-                RESULT_VARIABLE rc OUTPUT_VARIABLE rout ERROR_VARIABLE rerr)
-if(NOT rc EQUAL 0 OR NOT rout MATCHES "frames [0-9]+")
-    message(FATAL_ERROR "azu_replay on the trimmed recording failed (${rc}):\n${rout}\n${rerr}")
+# The trimmed copy is a normal recording. REPLAY is empty in Debug trees: the
+# unoptimised pipeline (fusion, loop check, mesh export) takes minutes there.
+if(REPLAY)
+    execute_process(COMMAND "${REPLAY}" "${DIR}/trimmed" --backend cpu --max-frames 30 --out "${DIR}/replay" --quiet
+                    RESULT_VARIABLE rc OUTPUT_VARIABLE rout ERROR_VARIABLE rerr)
+    if(NOT rc EQUAL 0 OR NOT rout MATCHES "frames [0-9]+")
+        message(FATAL_ERROR "azu_replay on the trimmed recording failed (${rc}):\n${rout}\n${rerr}")
+    endif()
 endif()
 
 file(REMOVE_RECURSE "${DIR}")
