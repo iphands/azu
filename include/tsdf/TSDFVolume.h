@@ -278,8 +278,10 @@ private:
     bool    gpu_enabled_ = false;
 
     // Internal helpers
-    float getTSDF(const Eigen::Vector3f& world_pos) const;
-    Eigen::Vector3f computeNormal(const Eigen::Vector3f& world_pos) const;
+    // Trilinear sample; false unless all 8 cell corners are observed (weight > 0).
+    bool sampleTSDF(const Eigen::Vector3f& world_pos, float& f_out) const;
+    // Unit gradient from 6 valid samples at +-voxel_size; false if any is invalid.
+    bool computeNormal(const Eigen::Vector3f& world_pos, Eigen::Vector3f& n_out) const;
 };
 
 } // namespace tsdf

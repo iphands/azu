@@ -11,9 +11,9 @@
 //      its Z-depth is inside the band (the two readings give opposite answers)
 //   C  the configured near/far bounds ARE the gate (same field, only the band differs:
 //      hit vs the documented empty state)
-//   D  both crossings resolve: entry from outside, and EXIT for a ray that starts
-//      inside material - the exit case is also the color-ghost discriminator, because
-//      the entry-layer color is precisely the stale/adjacent-surface answer
+//   D  the entry crossing resolves with the entry layer's colour; a ray that starts
+//      inside material reports NO surface (front-face-only: a back face is not a
+//      visible surface)
 //   E  non-finite volume samples are never emitted as a hit, and a non-finite layer
 //      BEHIND a resolved surface does not erase that valid hit
 //   F  global output invariant: every pixel is either exactly the empty state or a
@@ -92,7 +92,6 @@ constexpr double kWallHitZ = 0.38;
 //   back  zero = 0.40 + 0.04*(0.5/(0.5+1)) = 0.4133333333
 constexpr float  kSlabA = 0.39f, kSlabB = 0.41f, kSlabTau = 0.02f;
 constexpr double kSlabFrontZ = 0.36 + 0.04 * (1.0 / 1.5);
-constexpr double kSlabBackZ  = 0.40 + 0.04 * (0.5 / 1.5);
 
 const float kNaN = std::numeric_limits<float>::quiet_NaN();
 const float kInf = std::numeric_limits<float>::infinity();
@@ -284,12 +283,10 @@ void gateC_configuredBounds() {
 }
 
 // ---------------------------------------------------------------------------
-// D. both crossings resolve; the exit hit is the anti-ghost discriminator
+// D. front-face crossing resolves; an interior start is the empty state
 // ---------------------------------------------------------------------------
 // Exterior start -> ENTRY zero 0.3866667 (layer 9 color).
-// Interior start (min_depth 0.402, inside the slab) -> EXIT zero 0.4133333, which
-// lives in layer 10. Handing back the entry-layer color for an interior-start ray is
-// exactly the stale/adjacent-surface ghost this todo removes.
+// Interior start (min_depth 0.402, inside the slab) -> the empty state.
 void gateD_bothCrossings() {
     const std::string tag = "D/both-crossings";
     const auto        ext = makeVolume(kMinDepth, kMaxDepth, slabField);
@@ -303,22 +300,16 @@ void gateD_bothCrossings() {
                                             rgbStr(front_layer.r, front_layer.g, front_layer.b) +
                                             ", got " + rgbStr(entry));
 
+    // A ray that starts inside material only meets the slab's BACK face (-→+).
+    // Front-face-only raycast (big-fix-two T0.10): that is the empty state, not a
+    // hit. Reporting it was the phantom-surface bug: surfaces seen from behind
+    // produced model points ICP matched against the wrong side.
     const Hit exit_ = castPixel(*inn, 3, 3);
-    CHECK(!exit_.empty_state, tag + ": a ray that starts inside material resolves a crossing");
-    CHECK(near(exit_.v.z(), kSlabBackZ),
-          tag + ": EXIT crossing at 0.4133333 within 1e-5 m, got " + std::to_string(exit_.v.z()));
-    CHECK(!near(exit_.v.z(), kSlabFrontZ),
-          tag + ": the interior-start hit is the back face, not a fabricated front face");
-    const Rgb back_face = layerColor(layerOf(kSlabBackZ));
-    CHECK(colorEq(exit_, back_face), tag + ": exit color is the back-face layer's RGB " +
-                                            rgbStr(back_face.r, back_face.g, back_face.b) +
-                                            ", got " + rgbStr(exit_));
-    CHECK(!colorEq(exit_, front_layer),
-          tag + ": exit color is NOT the entry layer's stale color (no ghost)");
-    CHECK(near(exit_.n.norm(), 1.0, 1e-4), tag + ": the exit normal is unit length");
-    std::printf("D entry_z=%.7f want=%.7f | exit_z=%.7f want=%.7f rgb=%s want=%s\n", entry.v.z(),
-                kSlabFrontZ, exit_.v.z(), kSlabBackZ, rgbStr(exit_).c_str(),
-                rgbStr(back_face.r, back_face.g, back_face.b).c_str());
+    CHECK(exit_.empty_state,
+          tag + ": a ray that starts inside material reports no surface (no back-face hit), got z=" +
+              std::to_string(exit_.v.z()));
+    std::printf("D entry_z=%.7f want=%.7f | interior start empty=%d\n", entry.v.z(),
+                kSlabFrontZ, static_cast<int>(exit_.empty_state));
 }
 
 // ---------------------------------------------------------------------------

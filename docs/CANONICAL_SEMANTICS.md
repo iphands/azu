@@ -178,30 +178,20 @@ Current CPU behavior:
   `Voxel{0.0f, 0.0f, 128, 128, 128}`, which put every reset voxel on the zero
   isosurface so an unobserved voxel could be meshed as surface. The CPU
   contract is `tests/tsdf_reset_contract.cpp`.
-- `include/tsdf/TSDFVolume.h` now names the CPU sentinel pair
+- `include/tsdf/TSDFVolume.h` names the CPU sentinel pair
   `EMPTY_TSDF = 1.0f` / `EMPTY_WEIGHT = 0.0f` (plus
-  `EMPTY_COLOR = 128.0f / 255.0f`, which publishes the neutral byte `128`), and
-  `unlocked_reset()`, `getTSDF()` and the `raycast()` empty-space markers use
-  them. Seven lines of `src/tsdf/TSDFVolume.cpp` still carry the raw literal
-  `1.0f` (eight textual occurrences — the diagnostic line carries two), and none
-  of them is an empty-voxel marker. Site by site: the ray projection `z = 1`
-  twice, `ray_cam(..., 1.0f)` at `:283` (integration) and `:425` (raycast); the
-  `[-1,1]` truncation clamp once, `tsdf_new = std::min(1.0f, sdf / trunc)` at
-  `:321`; the clamping diagnostic once, `tsdf_new >= 1.0f || tsdf_new <= -1.0f`
-  at `:324`; the per-frame weight increment `w_new = 1.0f` at `:359`; the color
-  fusion denominator once, `denom = w_old + 1.0f + 1e-6f` at `:383` — one
-  literal and not three, because the three color channels divide by that single
-  `denom`, and the TSDF blend at `:362` reaches the same value through the named
-  `w_new` instead of a second literal;
-  and the point-cloud `weight > 1.0f` gate at `:631`. The backends still carry no such constant, and CPU
-  meshing applies its own named `kWeightEpsilon = 0.001f` rather than
-  `EMPTY_WEIGHT`: one shared epsilon remains open (`tsdf:T2`, `tsdf:T5`,
-  `tsdf:T11`, `tsdf:T24`).
+  `EMPTY_COLOR = 128.0f / 255.0f`, which publishes the neutral byte `128`);
+  `unlocked_reset()` and the samplers use them. The backends still carry no
+  such constant, and CPU meshing applies its own named `kWeightEpsilon =
+  0.001f` rather than `EMPTY_WEIGHT`: one shared epsilon remains open
+  (`tsdf:T2`, `tsdf:T5`, `tsdf:T11`, `tsdf:T24`).
 - Emptiness thresholds are inconsistent across layers: `weight > 0.0f` in the
   CPU trilinear sampler, `kWeightEpsilon = 0.001f` in CPU meshing. Canonical:
   one named epsilon.
-- `src/tsdf/TSDFVolume.cpp` `getTSDF()` samples an unobserved voxel as
-  `EMPTY_TSDF` — canonical, and it is the rule Marching Cubes relies on.
+- Marching Cubes samples an unobserved voxel as `EMPTY_TSDF`. The raycast
+  sampler `sampleTSDF()` does NOT: a trilinear sample is valid only when all
+  8 cell corners are observed (big-fix-two T0.10), because blending observed
+  values with the `+1` sentinel manufactures zero crossings.
 - `src/tsdf/TSDFVolume.cpp` `setParams()` compares every field of the incoming
   `TSDFParams` against the current one and clears the host volume (and
   `integrated_frames_`) on **any** difference, reallocating only when
@@ -236,7 +226,7 @@ Canonical integration (**big-fix-two T0.9**): voxel-projective, KinectFusion
 Alg. 1, the same scheme as the CUDA kernel.
 
 - Voxel `i` stands for its **corner** `origin + i * voxel_size`. The integrator,
-  `getTSDF()` trilinear sampling, marching cubes and the raycast all use this one
+  `sampleTSDF()` trilinear sampling, marching cubes and the raycast all use this one
   convention. (The replaced per-pixel ray march stored an SDF sampled somewhere
   inside the voxel at the corner, biasing a flat wall ~4-7 mm toward the camera.)
 - Only voxels inside the camera frustum's AABB (camera centre + image corners at
@@ -261,23 +251,35 @@ error < 0.5 mm, weight == frames, identical volume at 1/4/16 threads),
 `tests/tsdf_integration_race_contract.cpp` (hand-derived two-frame fold) and
 `tests/tsdf_integration_min_depth_contract.cpp` (the band gate).
 
-Canonical raycast: the march is bounded by `params_.min_depth` / `params_.max_depth`
-scaled to the ray parameter (`t = depth * norm(ray_cam)`), never by the literals `0.3f`
-/ `5.0f` that CPU, CUDA and HIP all used to hard-code. CPU now samples the trilinear field
-at a uniform `0.5 * voxel_size` step — the crossing is interpolated between two adjacent
-samples, so a coarser step skips features thinner than the step — and resolves the hit
-with `t_prev + (t - t_prev) * f_prev / (f_prev - f_cur)`, where the divisor is the step
-actually taken (the legacy `t - vs * tsdf / (tsdf - prev)` assumed a full-voxel step
-while the refinement stepped half a voxel, biasing every hit by ~half a voxel). A
-non-finite sample aborts that ray to the canonical no-surface state, and vertex,
-normal and color are written together only for a resolved finite hit, so a rejected ray
-can never leave a stale vertex behind a fresh color. Color is read from the voxel the
-resolved hit actually falls in, and only when that voxel is fused (`weight > 0`).
-**Fixed by big-fix Todo 15**, locked by `tests/tsdf_raycast_contract.cpp` and
-`tests/tsdf_subvoxel_thin_feature_contract.cpp`. Both backends still hard-code the
-bounds and the legacy interpolation (`tsdf:T7`, `tsdf:T16`, `tsdf:T19`, `cross-backend:A11`
-/ `A12` / `A27`). Note the volume's own extent is `256 × 0.010 m = 2.56 m`, so under the
-default `max_depth = 2.50f` the configured far bound, not the extent, is the limit.
+Canonical raycast (**big-fix-two T0.10**):
+
+- Each pixel ray is bounded by `[min_depth, max_depth] * ||ray_cam||` (the band
+  is a Z-depth band) intersected with the volume box (slab test), never by
+  literals.
+- Samples come from `sampleTSDF()`: trilinear over the 8 cell corners, valid only
+  when every corner is observed.
+- Adaptive step: `max(0.5*vs, 0.8*trunc)` while the sample is invalid or `f >=
+  0.999`, else `max(0.5*vs, 0.8*f*trunc)`.
+- **Front faces only.** A hit is the first `f_prev > 0 && f <= 0` bracket
+  between two valid samples, refined with one secant step `t_prev + (t -
+  t_prev) * f_prev / (f_prev - f)`. A ray that starts in material, meets a
+  `-→+` crossing, or enters observed negative space straight from unobserved
+  space reports no surface. (The old uniform half-voxel march accepted both
+  crossing directions and sampled unobserved voxels as `+1`, which produced
+  phantom surfaces behind and beside real ones.)
+- The normal is the normalized central difference of 6 valid samples at
+  `±voxel_size`; if any is invalid, or the gradient is degenerate, the pixel
+  is empty.
+- A non-finite sample ends the ray with no surface. Vertex, normal and colour
+  are written together only for a resolved finite hit. Colour comes from the
+  voxel containing the hit, only when fused; a non-finite colour withdraws it.
+
+Locked by `tests/raycast_accuracy_contract.cpp` (front view: every hit within
+1 mm of a fused plane; from behind: zero hits; 45°: no hit off by > 2 mm),
+`tests/tsdf_raycast_contract.cpp` and
+`tests/tsdf_subvoxel_thin_feature_contract.cpp`. Both backends still hard-code
+the bounds and accept back faces (`tsdf:T7`, `tsdf:T16`, `tsdf:T19`,
+`cross-backend:A11` / `A12` / `A27`).
 
 Canonical ray crossing: a TSDF exit crossing (`prev < 0 && cur >= 0`) must be detected,
 not only the entry crossing. CPU detects both directions, so a ray that starts inside

@@ -337,6 +337,14 @@ target_link_libraries(fusion_bias_contract PRIVATE azu_test_core)
 add_test(NAME fusion_bias_contract COMMAND fusion_bias_contract)
 set_tests_properties(fusion_bias_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# big-fix-two T0.10: raycast hits lie on the fused surface; no phantom
+# surfaces from behind or at oblique views.
+add_executable(raycast_accuracy_contract raycast_accuracy_contract.cpp)
+target_compile_definitions(raycast_accuracy_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(raycast_accuracy_contract PRIVATE azu_test_core)
+add_test(NAME raycast_accuracy_contract COMMAND raycast_accuracy_contract)
+set_tests_properties(raycast_accuracy_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 add_executable(tsdf_integration_race_contract tsdf_integration_race_contract.cpp)
 target_compile_definitions(tsdf_integration_race_contract PRIVATE ${AZU_TEST_DEFS})
 target_link_libraries(tsdf_integration_race_contract PRIVATE azu_test_core)

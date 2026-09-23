@@ -207,16 +207,12 @@ void gateA_nearBound() {
           tag + ": front face normal points back at the camera, got (" +
               std::to_string(h.normal.x()) + "," + std::to_string(h.normal.y()) + "," +
               std::to_string(h.normal.z()) + ")");
-    // A near bound INSIDE the plate cannot hide it: the first crossing then is the back
-    // face, at field(5)=-0.5 -> field(6)=+1, i.e. 0.20 + 0.04*0.5/1.5 = 0.2133333 with the
-    // normal flipped. Only a bound past the back face (0.22) makes the plate disappear.
-    const Hit inside = castOnce(slabs, 0.20f, kFar);
-    expectHit(tag, inside, 0.21333333f, 5, "min_depth=0.20 starts inside the plate");
-    CHECK(std::fabs(inside.normal.z() - 1.0f) < 1e-4f && std::fabs(inside.normal.x()) < 1e-4f &&
-              std::fabs(inside.normal.y()) < 1e-4f,
-          tag + ": back face normal points away from the camera, got (" +
-              std::to_string(inside.normal.x()) + "," + std::to_string(inside.normal.y()) + "," +
-              std::to_string(inside.normal.z()) + ")");
+    // A near bound INSIDE the plate starts the ray in material. The only crossing
+    // ahead is the back face (-→+), which the camera cannot see: the raycast is
+    // front-face only (big-fix-two T0.10), so this is no surface rather than a
+    // phantom back-face hit with a flipped normal.
+    expectMiss(tag, castOnce(slabs, 0.20f, kFar),
+               "min_depth=0.20 starts inside the plate: the back face is not reported");
     expectMiss(tag, castOnce(slabs, 0.22f, kFar),
                "min_depth=0.22 past the back face hides the plate entirely");
 }

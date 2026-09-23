@@ -221,7 +221,7 @@ void TSDFVolume::integrateCPU(const float*           depth_meters,
 {
     // Voxel-projective integration (KinectFusion Alg. 1; the CUDA kernel's
     // scheme). Every voxel inside the camera frustum's bounding box projects
-    // its CORNER position origin + i*vs (the convention getTSDF, marching cubes
+    // its CORNER position origin + i*vs (the convention sampleTSDF, marching cubes
     // and the raycast all read back) into the depth image and takes exactly one
     // update per frame. One writer per voxel makes the result independent of
     // thread count and schedule with no sort or serial fold; the old per-pixel
@@ -350,13 +350,24 @@ void TSDFVolume::raycast(const Eigen::Matrix4f& pose,
     std::shared_lock<std::shared_mutex> lk(mutex_);
 
     const float vs    = params_.voxel_size;
+    const float trunc = params_.truncation;
     const Eigen::Vector3f cam_origin = pose.block<3,1>(0,3);
     const Eigen::Matrix3f R_cw       = pose.block<3,3>(0,0);
+    // Trilinear cells need both corners, so the samplable box ends one voxel
+    // short of the last index.
+    const Eigen::Vector3f box_lo = params_.origin;
+    const Eigen::Vector3f box_hi = params_.origin +
+        Eigen::Vector3f::Constant(static_cast<float>(params_.resolution - 1) * vs);
+    // Adaptive step (KinectFusion / InfiniTAM): far from the surface |f| ~ 1 the
+    // ray may advance most of a truncation band without skipping a zero
+    // crossing; near it the step shrinks with f, never below half a voxel.
+    const float min_step = 0.5f * vs;
+    const float far_step = std::max(min_step, 0.8f * trunc);
 
-    #pragma omp parallel for schedule(dynamic, 32)
+    #pragma omp parallel for schedule(dynamic, 16)
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
-            int out_idx = y * width + x;
+            const int out_idx = y * width + x;
             vertices_out[out_idx] = Eigen::Vector3f::Zero();
             normals_out[out_idx]  = Eigen::Vector3f::Zero();
             if (colors_out) {
@@ -365,131 +376,147 @@ void TSDFVolume::raycast(const Eigen::Matrix4f& pose,
                 colors_out[out_idx*3+2] = 0;
             }
 
-            Eigen::Vector3f ray_cam((x - cx) / fx, (y - cy) / fy, 1.0f);
-            // The band is a camera-plane Z-depth bound; a point at ray parameter t sits
-            // at camera depth t / |ray_cam|, so the band maps to t by that scale.
-            const float t_near = params_.min_depth * ray_cam.norm();
-            const float t_far  = params_.max_depth * ray_cam.norm();
-            Eigen::Vector3f ray_world = (R_cw * ray_cam).normalized();
+            const Eigen::Vector3f ray_cam((x - cx) / fx, (y - cy) / fy, 1.0f);
+            // The band is a camera-plane Z-depth bound; a point at ray parameter t
+            // sits at camera depth t / |ray_cam|.
+            const float ray_norm = ray_cam.norm();
+            const Eigen::Vector3f dir = (R_cw * ray_cam) / ray_norm;
+            float t_near = params_.min_depth * ray_norm;
+            float t_far  = params_.max_depth * ray_norm;
 
-            // Uniform half-voxel march: the crossing is interpolated between two
-            // adjacent samples, so a coarser step would miss features thinner than the
-            // step, and the interpolation divisor must be the step actually taken.
-            const float h = 0.5f * vs;
+            // Slab-clip against the volume box: no samples outside it.
+            for (int a = 0; a < 3; ++a) {
+                const float inv = 1.0f / dir[a];
+                float t0 = (box_lo[a] - cam_origin[a]) * inv;
+                float t1 = (box_hi[a] - cam_origin[a]) * inv;
+                if (t0 > t1) std::swap(t0, t1);
+                if (std::isnan(t0) || std::isnan(t1)) {   // parallel to this slab
+                    if (cam_origin[a] < box_lo[a] || cam_origin[a] > box_hi[a]) t_far = -1.0f;
+                    continue;
+                }
+                t_near = std::max(t_near, t0);
+                t_far  = std::min(t_far, t1);
+            }
+            if (!(t_near < t_far)) continue;
 
+            // Walk until the first +→- crossing between two observed samples.
+            // A -→+ crossing means the ray started inside or behind a surface
+            // (a back face the camera cannot see): stop with no hit instead of
+            // reporting a phantom surface.
             float t_prev = t_near;
-            float f_prev = getTSDF(cam_origin + ray_world * t_prev);
-            if (!std::isfinite(f_prev)) continue;
+            float f_prev = 1.0f;
+            bool  prev_valid = sampleTSDF(cam_origin + dir * t_prev, f_prev);
+            if (prev_valid && !std::isfinite(f_prev)) continue;
+            if (prev_valid && f_prev < 0.0f) continue;
 
-            float t_hit = t_near;
-            bool  found = (f_prev == 0.0f);
-            for (float t = t_near + h; !found && t <= t_far; t += h) {
-                const float f_cur = getTSDF(cam_origin + ray_world * t);
-                if (!std::isfinite(f_cur)) { found = false; break; }
-                if ((f_prev > 0.0f && f_cur <= 0.0f) || (f_prev < 0.0f && f_cur >= 0.0f)) {
-                    t_hit = t_prev + (t - t_prev) * (f_prev / (f_prev - f_cur));
-                    found = true;
+            bool  found = false;
+            float t_hit = 0.0f;
+            while (t_prev < t_far) {
+                const float step = (!prev_valid || f_prev >= 0.999f)
+                                       ? far_step
+                                       : std::max(min_step, 0.8f * f_prev * trunc);
+                const float t = std::min(t_prev + step, t_far);
+                float f = 1.0f;
+                const bool valid = sampleTSDF(cam_origin + dir * t, f);
+                if (valid && !std::isfinite(f)) break;       // corrupt volume: no hit
+                if (valid && prev_valid) {
+                    if (f_prev > 0.0f && f <= 0.0f) {
+                        // One secant step on the bracket.
+                        t_hit = t_prev + (t - t_prev) * (f_prev / (f_prev - f));
+                        found = true;
+                        break;
+                    }
+                    if (f_prev < 0.0f && f >= 0.0f) break;    // exiting a back face
+                } else if (valid && f < 0.0f) {
+                    // Entered observed material straight from unobserved space:
+                    // no bracketed front-face crossing exists.
                     break;
                 }
                 t_prev = t;
-                f_prev = f_cur;
+                f_prev = f;
+                prev_valid = valid;
+                if (t >= t_far) break;
             }
             if (!found) continue;
 
-            const Eigen::Vector3f hit_world = cam_origin + ray_world * t_hit;
-            const Eigen::Vector3f normal    = computeNormal(hit_world);
-            if (!std::isfinite(t_hit) || !hit_world.allFinite() || !normal.allFinite()) continue;
+            const Eigen::Vector3f hit_world = cam_origin + dir * t_hit;
+            Eigen::Vector3f normal;
+            if (!computeNormal(hit_world, normal)) continue;
+            if (!hit_world.allFinite()) continue;
 
-            vertices_out[out_idx] = hit_world;
-            normals_out[out_idx]  = normal;
             if (colors_out) {
-                // Color comes from the voxel the resolved hit actually falls in, and
-                // only from a fused (weighted) one, so it cannot be sampled from a
-                // neighbour the surface never reached.
+                // Colour comes from the voxel the resolved hit falls in, and only
+                // from a fused one. A non-finite voxel colour withdraws the hit
+                // (all-or-nothing output contract).
                 const Eigen::Vector3i vi = worldToVoxel(hit_world);
                 if (inBounds(vi.x(), vi.y(), vi.z())) {
                     const Voxel& vox = voxels_[idx(vi.x(), vi.y(), vi.z())];
                     if (vox.weight > EMPTY_WEIGHT) {
-                        // One shared quantization policy at the byte boundary: a
-                        // finite color, however far outside [0,1], publishes its
-                        // saturated byte. Only a non-finite voxel color is a bug
-                        // upstream, and then the whole surface output for this pixel
-                        // is withdrawn (the documented all-or-nothing raycast
-                        // contract) instead of emitting a fabricated black.
                         uint8_t qc[3] = {0, 0, 0};
-                        if (utils::srgbFloatToUint8(vox.r, qc[0]) &&
-                            utils::srgbFloatToUint8(vox.g, qc[1]) &&
-                            utils::srgbFloatToUint8(vox.b, qc[2])) {
-                            colors_out[out_idx*3+0] = qc[0];
-                            colors_out[out_idx*3+1] = qc[1];
-                            colors_out[out_idx*3+2] = qc[2];
-                        } else {
-                            vertices_out[out_idx] = Eigen::Vector3f::Zero();
-                            normals_out[out_idx]  = Eigen::Vector3f::Zero();
+                        if (!(utils::srgbFloatToUint8(vox.r, qc[0]) &&
+                              utils::srgbFloatToUint8(vox.g, qc[1]) &&
+                              utils::srgbFloatToUint8(vox.b, qc[2]))) {
+                            continue;
                         }
+                        colors_out[out_idx*3+0] = qc[0];
+                        colors_out[out_idx*3+1] = qc[1];
+                        colors_out[out_idx*3+2] = qc[2];
                     }
                 }
             }
+            vertices_out[out_idx] = hit_world;
+            normals_out[out_idx]  = normal;
         }
     }
 }
 
-Eigen::Vector3f TSDFVolume::computeNormal(const Eigen::Vector3f& world_pos) const {
-    const float vs = params_.voxel_size;
-    Eigen::Vector3f n;
-    n.x() = (getTSDF(world_pos + Eigen::Vector3f(vs, 0, 0)) - getTSDF(world_pos - Eigen::Vector3f(vs, 0, 0)));
-    n.y() = (getTSDF(world_pos + Eigen::Vector3f(0, vs, 0)) - getTSDF(world_pos - Eigen::Vector3f(0, vs, 0)));
-    n.z() = (getTSDF(world_pos + Eigen::Vector3f(0, 0, vs)) - getTSDF(world_pos - Eigen::Vector3f(0, 0, vs)));
-    float len = n.norm();
-    if (len > 1e-6f) return n / len;
-    return Eigen::Vector3f::Zero();
+bool TSDFVolume::computeNormal(const Eigen::Vector3f& p, Eigen::Vector3f& n_out) const {
+    const float h = params_.voxel_size;
+    float s[6];
+    const Eigen::Vector3f off[3] = {{h, 0, 0}, {0, h, 0}, {0, 0, h}};
+    for (int a = 0; a < 3; ++a) {
+        if (!sampleTSDF(p + off[a], s[2 * a]) || !sampleTSDF(p - off[a], s[2 * a + 1])) return false;
+    }
+    const Eigen::Vector3f n(s[0] - s[1], s[2] - s[3], s[4] - s[5]);
+    const float len = n.norm();
+    if (!(len > 1e-6f) || !std::isfinite(len)) return false;
+    n_out = n / len;
+    return true;
 }
 
-float TSDFVolume::getTSDF(const Eigen::Vector3f& world_pos) const {
-    const float vs = params_.voxel_size;
-    const int res = params_.resolution;
-    
-    Eigen::Vector3f v = (world_pos - params_.origin) / vs;
-    
-    // Trilinear interpolation
-    int x0 = static_cast<int>(std::floor(v.x()));
-    int y0 = static_cast<int>(std::floor(v.y()));
-    int z0 = static_cast<int>(std::floor(v.z()));
-    
-    if (x0 < 0 || x0 >= res - 1 || y0 < 0 || y0 >= res - 1 || z0 < 0 || z0 >= res - 1) {
-        Eigen::Vector3i vi = worldToVoxel(world_pos);
-        if (!inBounds(vi.x(), vi.y(), vi.z())) return EMPTY_TSDF;
-        const Voxel& vox = voxels_[idx(vi.x(), vi.y(), vi.z())];
-        return (vox.weight > 0.0f) ? vox.tsdf : EMPTY_TSDF;
+bool TSDFVolume::sampleTSDF(const Eigen::Vector3f& world_pos, float& f_out) const {
+    // Trilinear interpolation over the 8 corners of the cell containing the
+    // point. The sample is VALID only when every corner has been observed
+    // (weight > 0): mixing observed values with the unobserved +1 sentinel
+    // manufactures zero crossings where observed material meets unobserved
+    // space, which is where phantom raycast surfaces came from.
+    const float vs  = params_.voxel_size;
+    const int   res = params_.resolution;
+    const Eigen::Vector3f v = (world_pos - params_.origin) / vs;
+    const float fx0 = std::floor(v.x()), fy0 = std::floor(v.y()), fz0 = std::floor(v.z());
+    if (!(fx0 >= 0.0f && fy0 >= 0.0f && fz0 >= 0.0f &&
+          fx0 < static_cast<float>(res - 1) && fy0 < static_cast<float>(res - 1) &&
+          fz0 < static_cast<float>(res - 1))) {
+        return false;
     }
+    const int x0 = static_cast<int>(fx0), y0 = static_cast<int>(fy0), z0 = static_cast<int>(fz0);
+    const float tx = v.x() - fx0, ty = v.y() - fy0, tz = v.z() - fz0;
 
-    float tx = v.x() - x0;
-    float ty = v.y() - y0;
-    float tz = v.z() - z0;
-
-    auto getV = [&](int x, int y, int z) {
-        const Voxel& vox = voxels_[idx(x, y, z)];
-        return (vox.weight > 0.0f) ? vox.tsdf : EMPTY_TSDF;
-    };
-
-    float v000 = getV(x0, y0, z0);
-    float v100 = getV(x0+1, y0, z0);
-    float v010 = getV(x0, y0+1, z0);
-    float v110 = getV(x0+1, y0+1, z0);
-    float v001 = getV(x0, y0, z0+1);
-    float v101 = getV(x0+1, y0, z0+1);
-    float v011 = getV(x0, y0+1, z0+1);
-    float v111 = getV(x0+1, y0+1, z0+1);
-
-    float v00 = v000 * (1 - tx) + v100 * tx;
-    float v01 = v001 * (1 - tx) + v101 * tx;
-    float v10 = v010 * (1 - tx) + v110 * tx;
-    float v11 = v011 * (1 - tx) + v111 * tx;
-
-    float v0 = v00 * (1 - ty) + v10 * ty;
-    float v1 = v01 * (1 - ty) + v11 * ty;
-
-    return v0 * (1 - tz) + v1 * tz;
+    const size_t sx = 1, sy = static_cast<size_t>(res), sz = static_cast<size_t>(res) * res;
+    const Voxel* b = &voxels_[static_cast<size_t>(idx(x0, y0, z0))];
+    const Voxel* c[8] = {b, b + sx, b + sy, b + sx + sy, b + sz, b + sx + sz, b + sy + sz,
+                         b + sx + sy + sz};
+    for (const Voxel* cv : c) {
+        if (!(cv->weight > EMPTY_WEIGHT)) return false;
+    }
+    const float v00 = c[0]->tsdf * (1 - tx) + c[1]->tsdf * tx;
+    const float v10 = c[2]->tsdf * (1 - tx) + c[3]->tsdf * tx;
+    const float v01 = c[4]->tsdf * (1 - tx) + c[5]->tsdf * tx;
+    const float v11 = c[6]->tsdf * (1 - tx) + c[7]->tsdf * tx;
+    const float v0 = v00 * (1 - ty) + v10 * ty;
+    const float v1 = v01 * (1 - ty) + v11 * ty;
+    f_out = v0 * (1 - tz) + v1 * tz;
+    return true;
 }
 
 const Voxel& TSDFVolume::voxelAt(int x, int y, int z) const {
@@ -506,10 +533,10 @@ Eigen::Vector3i TSDFVolume::worldToVoxel(const Eigen::Vector3f& world) const {
     Eigen::Vector3f v = (world - params_.origin) / params_.voxel_size;
     // Floor each axis independently through the shared helper (CPU canonical
     // rounding, docs/CANONICAL_SEMANTICS.md), so negative coordinates round
-    // toward -inf exactly like the trilinear sampler in getTSDF() and the march
-    // in integrateCPU() already do. A non-finite or out-of-int-range axis yields
+    // toward -inf exactly like the trilinear sampler sampleTSDF() and the
+    // projection in integrateCPU() already do. A non-finite or out-of-int-range axis yields
     // the out-of-bounds sentinel, which inBounds() (and every caller, including
-    // the getTSDF fallback) rejects, instead of the old static_cast<int> that
+    // the colour lookup) rejects, instead of the old static_cast<int> that
     // truncated toward zero and aliased a below-origin point to voxel (0,0,0).
     int vx = 0, vy = 0, vz = 0;
     if (!utils::floorToInt(v.x(), &vx) ||
