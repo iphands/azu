@@ -58,6 +58,15 @@ struct RawFrame {
 
 using FrameCallback = std::function<void(std::shared_ptr<RawFrame>)>;
 
+// Cumulative capture counters since construction (monotonic; read lock-free).
+struct SensorStats {
+    uint64_t depth_callbacks  = 0;
+    uint64_t rgb_callbacks    = 0;
+    uint64_t paired           = 0;   // published with RGB
+    uint64_t depth_only       = 0;   // published without RGB (no sample within the window)
+    uint64_t pool_exhausted   = 0;   // samples dropped: every pooled buffer was in use
+};
+
 class KinectSensor {
 public:
     // libfreenect stamps frames with the Kinect's 60 MHz hardware counter, NOT
@@ -89,8 +98,22 @@ public:
     bool isRunning() const { return running_.load(); }
     bool isConnected() const { return device_ != nullptr; }
 
-    // Register callback invoked on UI/pipeline thread (posted from capture thread)
-    void setFrameCallback(FrameCallback cb) { frame_callback_ = std::move(cb); }
+    // Register the callback invoked (outside the pairing lock) for every
+    // published frame, on the libusb event thread.
+    void setFrameCallback(FrameCallback cb) {
+        std::lock_guard<std::mutex> lk(sync_mutex_);
+        frame_callback_ = std::move(cb);
+    }
+
+    SensorStats stats() const {
+        SensorStats st;
+        st.depth_callbacks = depth_callbacks_.load(std::memory_order_relaxed);
+        st.rgb_callbacks   = rgb_callbacks_.load(std::memory_order_relaxed);
+        st.paired          = paired_.load(std::memory_order_relaxed);
+        st.depth_only      = depth_only_.load(std::memory_order_relaxed);
+        st.pool_exhausted  = pool_exhausted_.load(std::memory_order_relaxed);
+        return st;
+    }
 
     // Returns latest synchronized frame (zero-copy)
     std::shared_ptr<RawFrame> getLatestFrame();
@@ -134,6 +157,9 @@ private:
 
     uint64_t frame_counter_ = 0;
     uint64_t pair_log_      = 0;
+
+    std::atomic<uint64_t> depth_callbacks_{0}, rgb_callbacks_{0};
+    std::atomic<uint64_t> paired_{0}, depth_only_{0}, pool_exhausted_{0};
 
     std::atomic<bool> running_{false};
     std::thread       capture_thread_;

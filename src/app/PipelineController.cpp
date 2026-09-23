@@ -275,8 +275,8 @@ bool PipelineController::startInternal(bool engage_sensor) {
     integration_thread_ = std::thread(&PipelineController::integrationLoop, this);
     meshing_thread_     = std::thread(&PipelineController::meshingLoop, this);
 
-  last_capture_time_ = steady_clock::now();
-  last_tracking_time_ = steady_clock::now();
+  start_ns_.store(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count(),
+                 std::memory_order_relaxed);
 
   KFLOG_INFO("Pipeline",
              "Worker threads launched (Tracking, Integration, Meshing).");
@@ -284,9 +284,49 @@ bool PipelineController::startInternal(bool engage_sensor) {
 }
 
 PipelineMetrics PipelineController::metricsSnapshot() const {
+  const auto now = steady_clock::now();
+  const uint64_t raw = raw_frames_total_.load(std::memory_order_relaxed);
+  const uint64_t tracked = tracked_frames_total_.load(std::memory_order_relaxed);
+  const int64_t last_ns = last_raw_frame_ns_.load(std::memory_order_relaxed);
+  const sensor::SensorStats sst = sensor_->stats();
+  const bool running = running_.load();
+
   std::lock_guard<std::mutex> lk(metrics_mutex_);
   PipelineMetrics m = metrics_;
   m.state = state_.load();
+
+  // Sliding rate window, re-based at most every 0.5 s.
+  const float window = duration<float>(now - rate_.t0).count();
+  if (rate_.t0 == steady_clock::time_point{} || raw < rate_.raw0 || tracked < rate_.tracked0) {
+    rate_ = RateWindow{now, raw, tracked, 0.0f, 0.0f, rate_.stall_logged};
+  } else if (window >= 0.5f) {
+    rate_.capture_fps  = static_cast<float>(raw - rate_.raw0) / window;
+    rate_.tracking_fps = static_cast<float>(tracked - rate_.tracked0) / window;
+    rate_.t0 = now;
+    rate_.raw0 = raw;
+    rate_.tracked0 = tracked;
+  }
+  // The stall clock starts at the last frame, or at start() if none came yet.
+  const int64_t now_ns = duration_cast<nanoseconds>(now.time_since_epoch()).count();
+  const int64_t since_ns = now_ns - std::max(last_ns, start_ns_.load(std::memory_order_relaxed));
+  m.seconds_since_frame = static_cast<float>(since_ns) * 1e-9f;
+  m.sensor_stalled = running && m.seconds_since_frame > 1.0f;
+  m.capture_fps  = m.sensor_stalled ? 0.0f : rate_.capture_fps;
+  m.tracking_fps = m.sensor_stalled ? 0.0f : rate_.tracking_fps;
+  if (m.sensor_stalled && !rate_.stall_logged) {
+    KFLOGF_WARN("Pipeline",
+                "NO FRAMES for %.1f s (sensor: depth callbacks %llu, rgb callbacks %llu, "
+                "depth-only %llu, pool exhausted %llu)",
+                m.seconds_since_frame, static_cast<unsigned long long>(sst.depth_callbacks),
+                static_cast<unsigned long long>(sst.rgb_callbacks),
+                static_cast<unsigned long long>(sst.depth_only),
+                static_cast<unsigned long long>(sst.pool_exhausted));
+  }
+  rate_.stall_logged = m.sensor_stalled;
+  m.sensor_depth_callbacks = sst.depth_callbacks;
+  m.sensor_rgb_callbacks   = sst.rgb_callbacks;
+  m.sensor_depth_only      = sst.depth_only;
+  m.sensor_pool_exhausted  = sst.pool_exhausted;
   return m;
 }
 
@@ -709,30 +749,24 @@ void PipelineController::onRawFrame(std::shared_ptr<sensor::RawFrame> raw) {
   // publishLatest() does for the frame it replaces.
   displaced.reset();
 
-  // Update capture FPS
-  auto now = steady_clock::now();
-  float dt = duration<float>(now - last_capture_time_).count();
-  last_capture_time_ = now;
+  raw_frames_total_.fetch_add(1, std::memory_order_relaxed);
+  last_raw_frame_ns_.store(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count(),
+                           std::memory_order_relaxed);
 
   int fc = 0;
-  float inst_fps = 0.0f;
   int dropped = 0;
   {
     // metrics_mutex_ is a leaf: taken after the queue lock is released, never
     // nested inside it.
     std::lock_guard<std::mutex> lk(metrics_mutex_);
-    metrics_.capture_fps = (dt > 0.0f) ? (1.0f / dt) : 0.0f;
     metrics_.frame_count = ++frame_count_;
     if (displaced_a_frame) ++metrics_.dropped_frames;
     fc = metrics_.frame_count;
-    inst_fps = metrics_.capture_fps;
     dropped = metrics_.dropped_frames;
   }
   if (fc % 150 == 0) {
-    KFLOGF_DEBUG("Pipeline",
-                 "Sensor throughput: %d frames received @ %.2f FPS "
-                 "(%d stale frames displaced)",
-                 fc, inst_fps, dropped);
+    KFLOGF_DEBUG("Pipeline", "Sensor throughput: %d frames received (%d stale frames displaced)",
+                 fc, dropped);
   }
 }
 
@@ -1030,14 +1064,9 @@ void PipelineController::trackingLoopBody() {
         }
     }
 
-    // Update tracking fps
-    auto now = steady_clock::now();
-    float dt = duration<float>(now - last_tracking_time_).count();
-    last_tracking_time_ = now;
-
+    tracked_frames_total_.fetch_add(1, std::memory_order_relaxed);
     {
       std::lock_guard<std::mutex> lk(metrics_mutex_);
-      metrics_.tracking_fps = (dt > 0.0f) ? (1.0f / dt) : 0.0f;
       metrics_.icp_error = icp_result.error;
       metrics_.tracking_ok = icp_result.tracking_ok;
       if (icp_result.valid_live_points > 0) {

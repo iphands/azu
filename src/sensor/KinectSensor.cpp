@@ -46,21 +46,29 @@ bool KinectSensor::init() {
 
     if (freenect_init(&ctx_, nullptr) < 0) {
         KFLOG_ERROR("Sensor", "freenect_init FAILED: Could not initialize libfreenect.");
+        ctx_ = nullptr;
         return false;
     }
+    // Every failure below releases the context, so a retry starts clean
+    // instead of leaking one libusb context per attempt.
+    auto fail = [this](const char* msg) {
+        KFLOG_ERROR("Sensor", msg);
+        freenect_shutdown(ctx_);
+        ctx_ = nullptr;
+        return false;
+    };
     freenect_set_log_level(ctx_, FREENECT_LOG_ERROR);
     freenect_select_subdevices(ctx_,
         static_cast<freenect_device_flags>(FREENECT_DEVICE_MOTOR | FREENECT_DEVICE_CAMERA));
 
     int num_devices = freenect_num_devices(ctx_);
     if (num_devices < 1) {
-        KFLOG_ERROR("Sensor", "No Kinect devices detected. Please check USB and power.");
-        return false;
+        return fail("No Kinect devices detected. Please check USB and power.");
     }
 
     if (freenect_open_device(ctx_, &device_, 0) < 0) {
-        KFLOG_ERROR("Sensor", "freenect_open_device FAILED: Could not open Kinect index 0.");
-        return false;
+        device_ = nullptr;
+        return fail("freenect_open_device FAILED: Could not open Kinect index 0.");
     }
 
     freenect_set_user(device_, this);
@@ -82,8 +90,15 @@ bool KinectSensor::start() {
     if (!device_) return false;
     if (running_.load()) return true;
 
-  freenect_start_depth(device_);
-  freenect_start_video(device_);
+    if (freenect_start_depth(device_) < 0) {
+        KFLOG_ERROR("Sensor", "freenect_start_depth FAILED.");
+        return false;
+    }
+    if (freenect_start_video(device_) < 0) {
+        KFLOG_ERROR("Sensor", "freenect_start_video FAILED.");
+        freenect_stop_depth(device_);
+        return false;
+    }
 
     running_.store(true);
     capture_thread_ = std::thread(&KinectSensor::captureLoop, this);
@@ -99,13 +114,17 @@ void KinectSensor::stop() {
     if (!running_.load()) return;
     running_.store(false);
 
-  if (device_) {
-    freenect_stop_depth(device_);
-    freenect_stop_video(device_);
-  }
-
+    // Join the event pump FIRST. freenect_stop_*() cancels the iso transfers
+    // and then pumps libusb events itself until they are reaped; doing that
+    // while the capture thread is still pumping means two threads handling
+    // events (and callbacks) at once. After the join there is one pumper.
     if (capture_thread_.joinable())
         capture_thread_.join();
+
+    if (device_) {
+        freenect_stop_depth(device_);
+        freenect_stop_video(device_);
+    }
 #endif
     // A restart must not pair against samples from before the stop.
     std::shared_ptr<RawFrame> rgb, depth;
@@ -175,6 +194,7 @@ void KinectSensor::markDepthOnlyLocked(RawFrame& depth) {
 }
 
 void KinectSensor::deliver(std::shared_ptr<RawFrame> frame, FrameCallback& callback) {
+    (frame->rgb_valid ? paired_ : depth_only_).fetch_add(1, std::memory_order_relaxed);
     if (++pair_log_ % 150 == 0) {
         KFLOGF_DEBUG("Sensor", "Frame %lu published (rgb %s, depth-rgb %.2f ms)",
                      frame->frame_id, frame->rgb_valid ? "paired" : "missing",
@@ -195,8 +215,12 @@ void KinectSensor::onDepth(const void* data, uint32_t timestamp) {
     {
         std::lock_guard<std::mutex> lk(sync_mutex_);
 
+        depth_callbacks_.fetch_add(1, std::memory_order_relaxed);
         std::shared_ptr<RawFrame> frame = acquireFreeFrame();
-        if (!frame) return; // Pool exhausted: consumers are holding every buffer.
+        if (!frame) {   // consumers are holding every pooled buffer
+            pool_exhausted_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
 
         std::memcpy(frame->depth.data(), data, DEPTH_WIDTH * DEPTH_HEIGHT * 2);
         frame->depth_ticks     = timestamp;
@@ -244,8 +268,12 @@ void KinectSensor::onRgb(const void* data, uint32_t timestamp) {
     {
         std::lock_guard<std::mutex> lk(sync_mutex_);
 
+        rgb_callbacks_.fetch_add(1, std::memory_order_relaxed);
         std::shared_ptr<RawFrame> frame = acquireFreeFrame();
-        if (!frame) return;
+        if (!frame) {
+            pool_exhausted_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
 
         std::memcpy(frame->rgb.data(), data, RGB_WIDTH * RGB_HEIGHT * 3);
         frame->rgb_ticks     = timestamp;
@@ -314,7 +342,7 @@ std::shared_ptr<RawFrame> KinectSensor::acquireFreeFrame() {
 }
 
 void KinectSensor::releaseFrame(std::shared_ptr<RawFrame>) {
-    // No-op manually; handled by custom deleter now
+    // No-op: pooled frames recycle through their deleter.
 }
 
 #ifdef AZU_PIPELINE_TEST_SEAM

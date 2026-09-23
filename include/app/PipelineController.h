@@ -60,6 +60,15 @@ struct PipelineMetrics {
     // NVIDIA GeForce RTX 4060 (7721 MB free, 1090 MB needed)" or "CPU: no CUDA
     // device fits: ..."). Set once per start().
     std::string backend = "CPU";
+    // Frames stopped arriving while Running (> 1 s since the last raw frame).
+    // capture_fps then reads 0 instead of freezing at its last value.
+    bool     sensor_stalled     = false;
+    float    seconds_since_frame = 0.0f;
+    // Cumulative sensor counters (KinectSensor::stats()); zero in seam tests.
+    uint64_t sensor_depth_callbacks = 0;
+    uint64_t sensor_rgb_callbacks   = 0;
+    uint64_t sensor_depth_only      = 0;
+    uint64_t sensor_pool_exhausted  = 0;
     size_t   mesh_triangles     = 0;
     float    mesh_extract_pct   = 0.0f;
     float    export_pct         = 0.0f;
@@ -240,9 +249,20 @@ private:
     // tracking_shutdown_, guarded by integration_queue_mutex_.
     bool                                           integration_shutdown_ = false;
 
-    // Timing
-    std::chrono::steady_clock::time_point last_capture_time_;
-    std::chrono::steady_clock::time_point last_tracking_time_;
+    // Rates are measured from counters over a sliding window when metrics are
+    // read, so they decay to 0 when frames stop (an instantaneous 1/dt set only
+    // on arrival froze at its last value and hid a starved pipeline).
+    std::atomic<uint64_t> raw_frames_total_{0};
+    std::atomic<uint64_t> tracked_frames_total_{0};
+    std::atomic<int64_t>  last_raw_frame_ns_{0};
+    std::atomic<int64_t>  start_ns_{0};
+    struct RateWindow {
+        std::chrono::steady_clock::time_point t0{};
+        uint64_t raw0 = 0, tracked0 = 0;
+        float    capture_fps = 0.0f, tracking_fps = 0.0f;
+        bool     stall_logged = false;
+    };
+    mutable RateWindow rate_;   // guarded by metrics_mutex_
     int                                   frame_count_    = 0;
     bool                                  first_frame_    = true;
 

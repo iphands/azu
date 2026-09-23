@@ -354,6 +354,14 @@ target_link_libraries(icp_refpose_contract PRIVATE azu_test_core)
 add_test(NAME icp_refpose_contract COMMAND icp_refpose_contract)
 set_tests_properties(icp_refpose_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# big-fix-two T0.3: capture fps decays to 0 and the stall is flagged when
+# frames stop (the hang used to look like a healthy 30 fps).
+add_executable(pipeline_stall_visibility_contract pipeline_stall_visibility_contract.cpp)
+target_compile_definitions(pipeline_stall_visibility_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(pipeline_stall_visibility_contract PRIVATE azu_test_pipeline)
+add_test(NAME pipeline_stall_visibility_contract COMMAND pipeline_stall_visibility_contract)
+set_tests_properties(pipeline_stall_visibility_contract PROPERTIES LABELS cpu TIMEOUT 60)
+
 add_executable(tsdf_integration_race_contract tsdf_integration_race_contract.cpp)
 target_compile_definitions(tsdf_integration_race_contract PRIVATE ${AZU_TEST_DEFS})
 target_link_libraries(tsdf_integration_race_contract PRIVATE azu_test_core)

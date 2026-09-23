@@ -188,7 +188,17 @@ void MetricsPanel::update(const app::PipelineMetrics& m) {
         case app::PipelineState::Error:        state_str = "Error";        break;
         case app::PipelineState::Stopped:      state_str = "Stopped";      break;
     }
+    if (m.sensor_stalled) {
+        // The one state that used to look like a hang: say so, with the sensor
+        // counters that tell "no USB callbacks" from "callbacks but no frames".
+        state_str = QString("NO FRAMES for %1 s (depth cb %2, rgb cb %3, pool full %4)")
+                        .arg(m.seconds_since_frame, 0, 'f', 1)
+                        .arg(m.sensor_depth_callbacks)
+                        .arg(m.sensor_rgb_callbacks)
+                        .arg(m.sensor_pool_exhausted);
+    }
     lbl_state_->setText("State: " + state_str);
+    lbl_state_->setStyleSheet(m.sensor_stalled ? "color: #d33;" : "");
 }
 
 } // namespace gui
