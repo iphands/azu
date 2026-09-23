@@ -28,6 +28,8 @@ public:
     virtual void resetTemporalState() = 0;
     virtual void process(RawFrame& frame, float min_depth_m, float max_depth_m) = 0;
     virtual void setSrScale(int scale) = 0;
+    // Opt-in upscale (off by default; only the CPU backend implements one).
+    virtual void setUpscaleEnabled(bool) {}
 
     // Upscaled-RGB availability contract (big-fix Todo 22), mirroring
     // SignalConditioner::srUpscaledAvailable(). getSrRgbUpscaled() is valid only
@@ -58,6 +60,7 @@ public:
     void resetTemporalState() override;
     void process(RawFrame& frame, float min_depth_m, float max_depth_m) override;
     void setSrScale(int scale) override { conditioner_.setSrScale(scale); }
+    void setUpscaleEnabled(bool enabled) override { conditioner_.setUpscaleEnabled(enabled); }
     bool srUpscaledAvailable() const override { return conditioner_.srUpscaledAvailable(); }
     uint64_t srUpscaledFrameId() const override { return conditioner_.srUpscaledFrameId(); }
     bool srUpscaledAvailableForFrame(uint64_t frame_id) const override {

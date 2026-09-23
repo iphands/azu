@@ -399,6 +399,8 @@ void SignalConditioner::applySuperResolutionToRgb(const std::vector<uint8_t>& rg
     // available is a fully produced, correctly sized fresh buffer below.
     invalidateUpscaled();
 
+    if (!upscale_enabled_) return;   // no consumer: stays unavailable, costs nothing
+
     if (sr_scale_ < kSrScaleMin || sr_scale_ > kSrScaleMax) {
         // Fail closed. The old code copied an ORIGINAL-resolution sharpened image
         // into sr_rgb_upscaled_ for scale <= 1, which a consumer sizing the buffer

@@ -161,6 +161,7 @@ void restoreThreads() {
 // ---------------------------------------------------------------------------
 void sectionFreshObject() {
     SignalConditioner sc;
+    sc.setUpscaleEnabled(true);   // opt-in since big-fix-two T0.14
     CHECK(!sc.srUpscaledAvailable(), "a fresh conditioner reports the upscaled buffer unavailable");
     CHECK(sc.srUpscaledFrameId() == kNoFrame, "a fresh conditioner has no upscaled frame id");
     CHECK(!sc.srUpscaledAvailableForFrame(kNoFrame),
@@ -178,12 +179,26 @@ void sectionFreshObject() {
 }
 
 // ---------------------------------------------------------------------------
+// H  the upscale is opt-in (big-fix-two T0.14): a default conditioner, which is
+//    what the pipeline builds, never publishes and so never pays for EASU+RCAS
+// ---------------------------------------------------------------------------
+void sectionDefaultOff() {
+    RawFrame raw = makeFrame(0x77);
+    SignalConditioner sc;
+    CHECK(!sc.upscaleEnabled(), "the upscale is off by default");
+    sc.setSrScale(2);
+    sc.process(raw, nullptr, kDepthMinM, kDepthMaxM);
+    CHECK(!sc.srUpscaledAvailable(), "a default conditioner publishes no upscaled buffer");
+}
+
+// ---------------------------------------------------------------------------
 // B  valid CPU production through the real process() path
 // ---------------------------------------------------------------------------
 void sectionProduction(int scale) {
     const uint64_t kId = 0x1234 + static_cast<uint64_t>(scale);
     RawFrame raw = makeFrame(kId);
     SignalConditioner sc;
+    sc.setUpscaleEnabled(true);   // opt-in since big-fix-two T0.14
     sc.setSrScale(scale);
     CHECK(sc.getSrScale() == scale, "scale accepted by the public setter");
 
@@ -221,6 +236,7 @@ void sectionProduction(int scale) {
 // ---------------------------------------------------------------------------
 void sectionInvalidGeometry() {
     SignalConditioner sc;
+    sc.setUpscaleEnabled(true);   // opt-in since big-fix-two T0.14
     sc.setSrScale(2);
     RawFrame good = makeFrame(11);
     sc.process(good, nullptr, kDepthMinM, kDepthMaxM);
@@ -260,6 +276,7 @@ void sectionInvalidGeometry() {
 // ---------------------------------------------------------------------------
 void sectionScalePolicy() {
     SignalConditioner sc;
+    sc.setUpscaleEnabled(true);   // opt-in since big-fix-two T0.14
     sc.setSrScale(kScaleMin);
     RawFrame good = makeFrame(21);
     sc.process(good, nullptr, kDepthMinM, kDepthMaxM);
@@ -299,6 +316,7 @@ void sectionScalePolicy() {
 // ---------------------------------------------------------------------------
 void sectionResetClears() {
     SignalConditioner sc;
+    sc.setUpscaleEnabled(true);   // opt-in since big-fix-two T0.14
     sc.setSrScale(2);
     RawFrame good = makeFrame(41);
     sc.process(good, nullptr, kDepthMinM, kDepthMaxM);
@@ -403,6 +421,9 @@ void sectionPreprocessorContract() {
     RawFrame good = makeFrame(51);
     cpu->setSrScale(3);
     cpu->process(good, kDepthMinM, kDepthMaxM);
+    CHECK(!cpu->srUpscaledAvailable(), "a default CPU preprocessor does not upscale (opt-in)");
+    cpu->setUpscaleEnabled(true);
+    cpu->process(good, kDepthMinM, kDepthMaxM);
     CHECK(cpu->srUpscaledAvailable(), "CPU preprocessor publishes after a valid frame");
     CHECK(cpu->srUpscaledFrameId() == 51, "CPU preprocessor reports the frame id");
     CHECK(cpu->srUpscaledAvailableForFrame(51), "frame-pinned query agrees");
@@ -447,6 +468,7 @@ struct Run {
 Run runUpscaled(int scale, uint64_t id) {
     RawFrame raw = makeFrame(id);
     SignalConditioner sc;
+    sc.setUpscaleEnabled(true);   // opt-in since big-fix-two T0.14
     sc.setSrScale(scale);
     sc.process(raw, nullptr, kDepthMinM, kDepthMaxM);
     const std::vector<uint8_t>& buf = sc.getSrRgbUpscaled();
@@ -484,6 +506,7 @@ void sectionDeterminism() {
 
 int main() {
     sectionFreshObject();
+    sectionDefaultOff();
     sectionProduction(2);
     sectionProduction(3);
     sectionProduction(4);

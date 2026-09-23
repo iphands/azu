@@ -32,6 +32,10 @@ public:
     void resetEMA();
     void process(RawFrame& raw, cudaStream_t cuda_stream, float min_depth_m, float max_depth_m);
     void setSrScale(int scale) { sr_scale_ = scale; }
+    // The EASU+RCAS upscale is opt-in: it costs ~5-45 ms per frame and nothing in
+    // the pipeline consumes it, so it only runs for a caller that turned it on.
+    void setUpscaleEnabled(bool enabled) { upscale_enabled_ = enabled; }
+    bool upscaleEnabled() const { return upscale_enabled_; }
     int getSrScale() const { return sr_scale_; }
 
     // ---- upscaled-RGB availability contract (big-fix Todo 22) ----
@@ -107,6 +111,7 @@ private:
     Stats                stats_;
     int                  stats_frame_{0};
     int sr_scale_ = 2; // Default 2x upscaling
+    bool upscale_enabled_ = false;
     // Availability state for sr_rgb_upscaled_. Never consulted on its own:
     // srUpscaledAvailable() re-derives the geometry and scale every call, so a
     // stale flag can never outlive the buffer it describes.
