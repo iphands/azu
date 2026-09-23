@@ -159,9 +159,13 @@ app::FusionHyperparams applyFusionPreset(const app::FusionHyperparams& base, Fus
         h.icp.max_iterations[0] = 10;
         break;
     case FusionPreset::kRoom:
-        h.tsdf.voxel_size = 0.030f;
-        h.tsdf.resolution = 256;
-        h.tsdf.truncation = 0.100f;
+        // 384 x 2 cm = 7.68 m, centred on the camera below: the device ceiling
+        // (4 m) in every direction. 3 cm voxels lost a synthetic 360 degree spin
+        // at ~150 degrees (walls 1.2 m away); 2 cm held it. ~1.1 GB on CPU,
+        // ~2.3 GB on CUDA.
+        h.tsdf.voxel_size = 0.020f;
+        h.tsdf.resolution = 384;
+        h.tsdf.truncation = 0.060f;
         h.icp.dist_threshold  = 0.20f;
         h.icp.angle_threshold = 60.0f;
         // The old Room preset asked for 8 m; the device cannot measure past the
@@ -185,6 +189,20 @@ app::FusionHyperparams applyFusionPreset(const app::FusionHyperparams& base, Fus
         break;
     case FusionPreset::kCustom:
         break; // handled above
+    }
+
+    // Place the volume from its (new) extent. Before, every preset kept the
+    // base origin (-1.28,-1.28,0), which only centres a 2.56 m box: Chair's
+    // 2.05 m box then ended 0.77 m right of the camera and Room's 7.68 m box
+    // ran 6.4 m to the right and down. Object presets put the camera on the
+    // box's near face, centred left-right and up-down (you scan what is in
+    // front of you). Room puts the camera at the centre of the box, so standing
+    // in the middle of a room and turning a full circle stays inside it.
+    const float extent = h.tsdf.voxel_size * static_cast<float>(h.tsdf.resolution);
+    if (preset == FusionPreset::kRoom) {
+        h.tsdf.origin = Eigen::Vector3f::Constant(-0.5f * extent);
+    } else {
+        h.tsdf.origin = Eigen::Vector3f(-0.5f * extent, -0.5f * extent, 0.0f);
     }
 
     return h;

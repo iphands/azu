@@ -425,6 +425,10 @@ target_include_directories(pipeline_spin_contract PRIVATE ${CMAKE_CURRENT_SOURCE
 target_link_libraries(pipeline_spin_contract PRIVATE azu_test_pipeline)
 add_test(NAME pipeline_spin_contract COMMAND pipeline_spin_contract)
 set_tests_properties(pipeline_spin_contract PROPERTIES LABELS cpu TIMEOUT 300)
+# The same turn with the GUI's Room preset (volume centred on the camera).
+add_test(NAME pipeline_spin_room_preset COMMAND pipeline_spin_contract)
+set_tests_properties(pipeline_spin_room_preset PROPERTIES
+    LABELS cpu TIMEOUT 300 ENVIRONMENT "AZU_SPIN_PRESET=room")
 
 add_executable(tsdf_integration_race_contract tsdf_integration_race_contract.cpp)
 target_compile_definitions(tsdf_integration_race_contract PRIVATE ${AZU_TEST_DEFS})

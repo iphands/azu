@@ -12,7 +12,8 @@
 //   * NaN / +/-Inf / non-positive geometry rejected (no divide-by-zero on the ratio)
 //   * FusionHyperparams::defaults() passes
 //   * each preset stages ONE complete atomic value (non-preset fields carried
-//     from the base, preset fields overwritten) and validates against defaults
+//     from the base, preset fields overwritten, origin placed from the preset's
+//     extent) and validates against defaults
 //   * the overlap band maps icp_valid_model == -1 to the textual "--" UNKNOWN
 //     band (never a premature warming colour)
 //   * the band cache transitions only on a band change and never re-polishes when
@@ -280,12 +281,21 @@ void sectionPresetStaging() {
     }
 
     // Atomicity: applying a preset yields base + patch, never a fresh default. A
-    // field no preset touches (sr_scale, origin) must survive from the base.
+    // field no preset touches (sr_scale) must survive from the base. The origin
+    // is placed from the preset's extent (it used to be carried from the base,
+    // which left every box but the default 2.56 m one off-centre).
     for (fgui::FusionPreset p : presets) {
         const FusionHyperparams base = sentinelBase();
         const FusionHyperparams out = fgui::applyFusionPreset(base, p);
         CHECK(out.sr_scale == base.sr_scale, "preset carries sr_scale from the base");
-        CHECK(out.tsdf.origin.isApprox(base.tsdf.origin), "preset carries origin from the base");
+        const float half = 0.5f * out.tsdf.voxel_size * static_cast<float>(out.tsdf.resolution);
+        CHECK_NEAR(out.tsdf.origin.x(), -half, "preset centres the box left-right on the camera");
+        CHECK_NEAR(out.tsdf.origin.y(), -half, "preset centres the box up-down on the camera");
+        if (p == fgui::FusionPreset::kRoom) {
+            CHECK_NEAR(out.tsdf.origin.z(), -half, "room surrounds the camera (spin in place)");
+        } else {
+            CHECK_NEAR(out.tsdf.origin.z(), 0.0f, "object presets start the box at the camera");
+        }
     }
 
     // Documented per-preset field values (the exact set the widget used to mutate).
@@ -309,7 +319,8 @@ void sectionPresetStaging() {
     }
     {
         const auto h = fgui::applyFusionPreset(sentinelBase(), fgui::FusionPreset::kRoom);
-        CHECK_NEAR(h.tsdf.voxel_size, 0.030f, "room voxel");
+        CHECK_NEAR(h.tsdf.voxel_size, 0.020f, "room voxel");
+        CHECK(h.tsdf.resolution == 384, "room resolution (7.68 m, the 4 m ceiling each way)");
         CHECK_NEAR(h.max_depth, fgui::kDeviceMaxDepthMeters,
                    "room max depth is clamped to the device ceiling, not 8 m");
         CHECK_NEAR(h.icp.dist_threshold, 0.20f, "room icp dist");

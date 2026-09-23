@@ -13,14 +13,15 @@
 // camera sees one or two bare walls, so several motion directions are
 // unobservable; that is what keepObservableMotion() is for.
 //
-// Env: AZU_SPIN_VERBOSE=1 prints every 10th frame; AZU_SPIN_PRESET=chair uses the
-// field-report Chair preset volume (off-centre, in front of the camera), which
-// cannot hold a spin and is expected to fail until presets place the volume.
+// Env: AZU_SPIN_VERBOSE=1 prints every 10th frame; AZU_SPIN_PRESET=room|chair
+// applies that GUI preset (Chair is a box in front of the camera for objects and
+// is expected to fail a full turn); chair-legacy is the field-report config.
 //
 //   A  tracking is never lost for the whole turn
 //   B  >= 90% of frames are graded Good (integrated)
 //   C  after 360 degrees the pose is within 5 cm / 2 degrees of the truth
 #include "app/PipelineController.h"
+#include "gui/FusionUiModel.h"
 #include "sensor/DepthValidity.h"
 #include "sensor/KinectSensor.h"
 #include "support/SyntheticScene.h"
@@ -95,17 +96,28 @@ int main() {
     PipelineController pc(kfusion::sensor::PreprocessBackend::CPU);
     auto hp = pc.hyperparamsSnapshot();
     hp.tsdf.origin = Eigen::Vector3f(-1.28f, -1.28f, -1.28f);   // centred on the start camera
-    // AZU_SPIN_PRESET=chair reproduces the field report: the Chair preset's
-    // 2.048 m box left at the default origin (off-centre, in front of the camera).
-    if (const char* preset = std::getenv("AZU_SPIN_PRESET"); preset && std::string(preset) == "chair") {
-        hp.tsdf.voxel_size = 0.008f;
-        hp.tsdf.resolution = 256;
-        hp.tsdf.origin = Eigen::Vector3f(-1.28f, -1.28f, 0.0f);
-        hp.max_depth = 3.0f;
-        hp.icp.angle_threshold = 45.0f;
-        hp.icp.max_iterations[0] = 10;
-        hp.icp.max_iterations[1] = 15;
-        hp.icp.max_iterations[2] = 20;
+    // AZU_SPIN_PRESET=room|chair applies the GUI preset (gui/FusionUiModel.h).
+    // "chair-legacy" is the field report: the Chair box left at the old default
+    // origin, off-centre in front of the camera.
+    if (const char* preset = std::getenv("AZU_SPIN_PRESET")) {
+        const std::string name = preset;
+        if (name == "room") {
+            hp = kfusion::gui::applyFusionPreset(hp, kfusion::gui::FusionPreset::kRoom);
+        } else if (name == "chair" || name == "chair-legacy") {
+            hp = kfusion::gui::applyFusionPreset(hp, kfusion::gui::FusionPreset::kChair);
+            if (name == "chair-legacy") hp.tsdf.origin = Eigen::Vector3f(-1.28f, -1.28f, 0.0f);
+        }
+    }
+    // Experiment overrides on top: AZU_SPIN_VOXEL / _RES / _TRUNC / _DIST / _ANGLE.
+    auto envf = [](const char* k, float& v) { if (const char* e = std::getenv(k)) v = std::strtof(e, nullptr); };
+    envf("AZU_SPIN_VOXEL", hp.tsdf.voxel_size);
+    envf("AZU_SPIN_TRUNC", hp.tsdf.truncation);
+    envf("AZU_SPIN_DIST", hp.icp.dist_threshold);
+    envf("AZU_SPIN_ANGLE", hp.icp.angle_threshold);
+    if (const char* e = std::getenv("AZU_SPIN_RES")) hp.tsdf.resolution = std::atoi(e);
+    if (std::getenv("AZU_SPIN_VOXEL") || std::getenv("AZU_SPIN_RES")) {
+        const float half = 0.5f * hp.tsdf.voxel_size * static_cast<float>(hp.tsdf.resolution);
+        hp.tsdf.origin = Eigen::Vector3f::Constant(-half);
     }
     pc.setHyperparams(hp);
     CHECK(pc.startWithoutSensorForTests(), "seam start");

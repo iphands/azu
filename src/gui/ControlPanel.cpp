@@ -146,7 +146,7 @@ void ControlPanel::setupUI() {
     combo_presets_->addItem("Custom / Current");
     combo_presets_->addItem("Helmet (Small, High Detail)");
     combo_presets_->addItem("Chair (Medium, Standard)");
-    combo_presets_->addItem("Room (Large Environment)");
+    combo_presets_->addItem("Room (Stand in the middle, turn around)");
     combo_presets_->addItem("Human (Detail, Low Weight)");
     v_pre->addWidget(combo_presets_);
     inner_layout->addWidget(grp_presets);
@@ -196,7 +196,7 @@ void ControlPanel::setupUI() {
     spin_origin_y_ = makeDoubleSpin(-4.0, 4.0, 0.05, 2, grp_hp_);
     g->addWidget(spin_origin_y_, r++, 1);
     g->addWidget(new QLabel("Origin Z", grp_hp_), r, 0);
-    spin_origin_z_ = makeDoubleSpin(-2.0, 4.0, 0.05, 2, grp_hp_);
+    spin_origin_z_ = makeDoubleSpin(-4.0, 4.0, 0.05, 2, grp_hp_);   // Room: -3.84
     g->addWidget(spin_origin_z_, r++, 1);
 
     g->addWidget(new QLabel("ICP dist (m)", grp_hp_), r, 0);
