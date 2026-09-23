@@ -21,6 +21,7 @@
 //                   [--preset helmet|chair|room|human] [--intrinsics device|legacy]
 //                   [--volume front|centred] [--res N] [--voxel M]
 //                   [--min-depth M] [--max-depth M] [--max-frames N] [--quiet]
+#include "FakenectRecording.h"
 #include "app/PipelineController.h"
 #include "gui/FusionUiModel.h"
 #include "sensor/FrameData.h"
@@ -49,7 +50,6 @@ namespace {
 using namespace kfusion;
 using Clock = std::chrono::steady_clock;
 
-constexpr double kCountsPerG = 819.0;   // Kinect v1 accelerometer (libfreenect)
 constexpr double kGravity    = 9.80665;
 
 struct Options {
@@ -103,27 +103,6 @@ bool jsonNumber(const std::string& text, const std::string& key, double* out) {
     return true;
 }
 
-// fakenect frame file: one header line, then raw bytes.
-bool readPayload(const std::string& path, size_t bytes, std::vector<uint8_t>& out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    std::string header;
-    std::getline(f, header);
-    out.resize(bytes);
-    f.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(bytes));
-    return static_cast<size_t>(f.gcount()) == bytes;
-}
-
-// a-*.dump is a raw freenect_raw_tilt_state; its first three int16 are the
-// accelerometer counts.
-bool readAccel(const std::string& path, Eigen::Vector3d& g) {
-    std::ifstream f(path, std::ios::binary);
-    int16_t xyz[3];
-    if (!f.read(reinterpret_cast<char*>(xyz), sizeof(xyz))) return false;
-    g = Eigen::Vector3d(xyz[0], xyz[1], xyz[2]) * (kGravity / kCountsPerG);
-    return true;
-}
-
 double angleDeg(const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
     const double c = a.normalized().dot(b.normalized());
     return std::acos(std::max(-1.0, std::min(1.0, c))) * 180.0 / M_PI;
@@ -152,8 +131,9 @@ int main(int argc, char** argv) {
     }
     mkdir(opt.out.c_str(), 0755);
 
-    std::ifstream index(opt.dir + "/INDEX.txt");
-    if (!index) {
+    bool index_ok = false;
+    const std::vector<azu_rec::Entry> entries = azu_rec::parseIndex(opt.dir, &index_ok);
+    if (!index_ok) {
         std::fprintf(stderr, "no INDEX.txt in %s\n", opt.dir.c_str());
         return 1;
     }
@@ -248,20 +228,16 @@ int main(int argc, char** argv) {
     const size_t rgb_bytes = static_cast<size_t>(sensor::RGB_WIDTH) * sensor::RGB_HEIGHT * 3;
     const auto t_start = Clock::now();
     int timeouts = 0;
-    std::string line;
-    while (std::getline(index, line)) {
-        if (line.size() < 3) continue;
-        char type = 0;
-        double host_time = 0.0;
-        unsigned int ticks = 0;
-        if (std::sscanf(line.c_str(), "%c-%lf-%u-", &type, &host_time, &ticks) != 3) continue;
-        const std::string path = opt.dir + "/" + line;
+    for (const azu_rec::Entry& e : entries) {
+        const char type = e.type;
+        const uint32_t ticks = e.ticks;
+        const std::string path = opt.dir + "/" + e.file;
         if (type == 'a') {
             // ~10 samples per frame; the mean over the frame interval removes
             // most hand jitter from the gravity estimate.
-            Eigen::Vector3d g;
-            if (readAccel(path, g)) {
-                accel_sum += g;
+            int16_t xyz[3];
+            if (azu_rec::readAccelCounts(opt.dir, e, xyz)) {
+                accel_sum += Eigen::Vector3d(xyz[0], xyz[1], xyz[2]) * (kGravity / azu_rec::kCountsPerG);
                 ++accel_count;
             }
             continue;
@@ -273,10 +249,10 @@ int main(int argc, char** argv) {
             accel_count = 0;
         }
         if (type == 'd') {
-            if (!readPayload(path, depth_bytes, buf)) continue;
+            if (!azu_rec::readPayload(path, depth_bytes, buf)) continue;
             pairing.ingestDepth(buf.data(), ticks);
         } else if (type == 'r') {
-            if (!readPayload(path, rgb_bytes, buf)) continue;
+            if (!azu_rec::readPayload(path, rgb_bytes, buf)) continue;
             pairing.ingestRgb(buf.data(), ticks);
         }
 
