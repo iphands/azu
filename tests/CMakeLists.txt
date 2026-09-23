@@ -391,6 +391,11 @@ set_tests_properties(pipeline_relocalization_contract PROPERTIES LABELS cpu TIME
 add_executable(make_fake_dump make_fake_dump.cpp)
 target_include_directories(make_fake_dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(make_fake_dump PRIVATE azu_test_core)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    # Sphere-tracing 60 frames at -O0 exceeds the fixture timeout; same -O2
+    # harness tuning as azu_test_core/azu_test_pipeline above.
+    target_compile_options(make_fake_dump PRIVATE -O2)
+endif()
 add_executable(smoke_fakenect smoke_fakenect.cpp)
 target_link_libraries(smoke_fakenect PRIVATE azu_test_pipeline)
 find_library(AZU_FAKENECT_LIB NAMES fakenect
