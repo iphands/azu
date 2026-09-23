@@ -430,6 +430,12 @@ add_test(NAME pipeline_spin_room_preset COMMAND pipeline_spin_contract)
 set_tests_properties(pipeline_spin_room_preset PROPERTIES
     LABELS cpu TIMEOUT 300 ENVIRONMENT "AZU_SPIN_PRESET=room")
 
+# Still-period detection behind tools/azu_trim (pure, tools/Stillness.h).
+add_executable(recording_trim_contract recording_trim_contract.cpp)
+target_include_directories(recording_trim_contract PRIVATE ${CMAKE_SOURCE_DIR}/tools)
+add_test(NAME recording_trim_contract COMMAND recording_trim_contract)
+set_tests_properties(recording_trim_contract PROPERTIES LABELS cpu TIMEOUT 60)
+
 add_executable(tsdf_integration_race_contract tsdf_integration_race_contract.cpp)
 target_compile_definitions(tsdf_integration_race_contract PRIVATE ${AZU_TEST_DEFS})
 target_link_libraries(tsdf_integration_race_contract PRIVATE azu_test_core)
