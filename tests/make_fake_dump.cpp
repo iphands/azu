@@ -17,7 +17,10 @@
 // (2 * reference_pixel_size)), as fakenect-record does for a real unit; the
 // default (none) renders with the legacy 525 px and writes no device.json.
 //
-// usage: make_fake_dump <out_dir> [frames] [pan|spin] [fx]
+// An optional noise scale (1.0 = the Kinect v1 axial model sigma(z) = 0.0012 +
+// 0.0019 (z - 0.4)^2, per frame, seeded by frame index) adds depth noise.
+//
+// usage: make_fake_dump <out_dir> [frames] [pan|spin] [fx] [noise]
 #include "sensor/DepthValidity.h"
 #include "support/SyntheticScene.h"
 
@@ -40,7 +43,8 @@ int main(int argc, char** argv) {
     mkdir(dir.c_str(), 0755);
     const bool spin = argc > 3 && std::string(argv[3]) == "spin";
     azu_test::Intrinsics K;
-    if (argc > 4) {
+    const float noise = argc > 5 ? std::strtof(argv[5], nullptr) : 0.0f;
+    if (argc > 4 && std::strtof(argv[4], nullptr) > 0.0f) {
         K.fx = K.fy = std::strtof(argv[4], nullptr);
         const double ref_distance = 120.0;
         const double ref_pixel = ref_distance / (2.0 * K.fx);
@@ -89,7 +93,8 @@ int main(int argc, char** argv) {
                 const float ph = static_cast<float>(di < frames / 2 ? di : frames - di);
                 pose = azu_test::makePose({0.0f, 0.003f * ph, 0.0f}, {0.0015f * ph, 0.0f, 0.0f});
             }
-            const std::vector<float> m = scene.renderDepth(pose, K);
+            const std::vector<float> m =
+                scene.renderDepth(pose, K, noise, static_cast<uint32_t>(1000 + di));
             std::vector<uint16_t> raw(m.size());
             for (size_t i = 0; i < m.size(); ++i)
                 raw[i] = m[i] > 0.0f ? kfusion::sensor::cpuDepthMetersToRaw(m[i], 0.3f, 5.0f) : 0;

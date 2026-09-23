@@ -1,4 +1,6 @@
 #include "sensor/SignalConditioner.h"
+#include <cstdlib>
+#include <string>
 
 #include "sensor/BorderMode.h"  // cpuReflectCoord: the one CPU border-mode owner
 #include "sensor/DepthValidity.h"
@@ -236,7 +238,11 @@ SignalConditioner::SignalConditioner()
       rgb_scratch_(FRAME_W * FRAME_H * 3, 0),
        guidance_luma_(FRAME_W * FRAME_H, 0.0f),
        depth_scratch_(FRAME_W * FRAME_H, 0),
-       depth_src_(FRAME_W * FRAME_H, 0) {}
+       depth_src_(FRAME_W * FRAME_H, 0) {
+    if (const char* mode = std::getenv("AZU_PREPROCESS")) {
+        minimal_depth_ = std::string(mode) == "minimal";
+    }
+}
 
 void SignalConditioner::logDiagnostics() {
     CsvSink& sink = csvSink();
@@ -333,9 +339,11 @@ void SignalConditioner::processCpu(RawFrame& raw, float min_depth_m, float max_d
     applySuperResolutionToRgb(raw.rgb, raw.frame_id); // Apply EASU+RCAS for TSDF texturing
     buildSuperResolutionGuidance(raw.rgb); // Build guidance from processed RGB
     denoiseDepthSpatial(raw.depth, min_depth_m, max_depth_m);
-    fillDepthHoles(raw.depth, min_depth_m, max_depth_m);
-    guidedDepthFilter(raw.depth, min_depth_m, max_depth_m);
-    applyDepthEma(raw.depth, min_depth_m, max_depth_m);
+    if (!minimal_depth_) {
+        fillDepthHoles(raw.depth, min_depth_m, max_depth_m);
+        guidedDepthFilter(raw.depth, min_depth_m, max_depth_m);
+        applyDepthEma(raw.depth, min_depth_m, max_depth_m);
+    }
     
     logDiagnostics();
 }

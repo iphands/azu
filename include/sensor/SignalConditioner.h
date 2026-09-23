@@ -35,6 +35,13 @@ public:
     // The EASU+RCAS upscale is opt-in: it costs ~5-45 ms per frame and nothing in
     // the pipeline consumes it, so it only runs for a caller that turned it on.
     void setUpscaleEnabled(bool enabled) { upscale_enabled_ = enabled; }
+    // Minimal depth conditioning: the per-frame 3x3 spatial median only. Hole
+    // filling (blends foreground into background at occlusion edges), the
+    // RGB-guided filter (the guide is the unregistered RGB image) and the
+    // temporal EMA (lags every pixel while the camera moves) are skipped.
+    // AZU_PREPROCESS=minimal turns it on at construction (A/B experiments).
+    void setMinimalDepth(bool minimal) { minimal_depth_ = minimal; }
+    bool minimalDepth() const { return minimal_depth_; }
     bool upscaleEnabled() const { return upscale_enabled_; }
     int getSrScale() const { return sr_scale_; }
 
@@ -112,6 +119,7 @@ private:
     int                  stats_frame_{0};
     int sr_scale_ = 2; // Default 2x upscaling
     bool upscale_enabled_ = false;
+    bool minimal_depth_ = false;
     // Availability state for sr_rgb_upscaled_. Never consulted on its own:
     // srUpscaledAvailable() re-derives the geometry and scale every call, so a
     // stale flag can never outlive the buffer it describes.
