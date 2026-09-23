@@ -1,6 +1,7 @@
 #ifdef CUDA_ENABLED
 
 #include "tracking/ICPTracker.h"
+#include "tracking/ICPShared.h"
 #include "sensor/KinectSensor.h"
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
@@ -220,18 +221,25 @@ __global__ void computeHessianKernel(
                                 // nvcc hard error). Guard form copied from ICPTracker_hip.hip:220.
                                 if (!isnan(J[0]) && !isinf(J[0]) && !isnan(J[3]) && !isinf(J[3])) {
                                     float abs_err = fabsf(err);
-                                    float huber_k = 0.02f; 
+                                    // Canonical Huber IRLS (tracking/ICPShared.h,
+                                    // CPU ICPTracker.cpp): curvature w*J*J^T,
+                                    // gradient J*(w*e), objective psi(|e|).
+                                    // The unweighted curvature here made a
+                                    // 3 deg / 4 cm motion diverge (GPU-02).
+                                    const float huber_k = kHuberK;
                                     float w = (abs_err <= huber_k) ? 1.0f : huber_k / abs_err;
                                     float weighted_err = err * w;
 
                                     int count = 0;
                                     for (int i = 0; i < 6; ++i) {
                                         for (int j = i; j < 6; ++j) {
-                                            local_A[count++] += J[i] * J[j];
+                                            local_A[count++] += w * J[i] * J[j];
                                         }
                                         local_b[i] -= J[i] * weighted_err;
                                     }
-                                    local_res += weighted_err * weighted_err;
+                                    local_res += (abs_err <= huber_k)
+                                                     ? abs_err * abs_err
+                                                     : 2.0f * huber_k * abs_err - huber_k * huber_k;
                                     local_inliers++;
                                 }
                             } else local_angle_filtered++;

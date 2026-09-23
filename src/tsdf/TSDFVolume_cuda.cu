@@ -138,10 +138,10 @@ void TSDFVolume::syncToGPU() {
             size_t idx = offset + i;
             gpu_data[i].tsdf   = voxels_[idx].tsdf;
             gpu_data[i].weight = voxels_[idx].weight;
-            // Store colors directly in 0-255 range (no normalization)
-            gpu_data[i].r      = static_cast<float>(voxels_[idx].r);
-            gpu_data[i].g      = static_cast<float>(voxels_[idx].g);
-            gpu_data[i].b      = static_cast<float>(voxels_[idx].b);
+            // Host colour is float sRGB [0,1]; device colour is sRGB [0,255].
+            gpu_data[i].r      = voxels_[idx].r * 255.0f;
+            gpu_data[i].g      = voxels_[idx].g * 255.0f;
+            gpu_data[i].b      = voxels_[idx].b * 255.0f;
         }
         CUDA_CHECK(cudaMemcpy(d_voxels_.get() + offset, gpu_data.data(), current_chunk * sizeof(VoxelGPU), cudaMemcpyHostToDevice));
     }
@@ -161,10 +161,11 @@ void TSDFVolume::syncFromGPU() {
             voxels_[idx].weight = w;
             if (w > 0.001f) {
                 voxels_[idx].tsdf = gpu_data[i].tsdf;
-                // Store colors directly in 0-255 range (no denormalization)
-                voxels_[idx].r = (uint8_t)fminf(255.0f, fmaxf(0.0f, gpu_data[i].r));
-                voxels_[idx].g = (uint8_t)fminf(255.0f, fmaxf(0.0f, gpu_data[i].g));
-                voxels_[idx].b = (uint8_t)fminf(255.0f, fmaxf(0.0f, gpu_data[i].b));
+                // Device sRGB [0,255] -> host float sRGB [0,1] (the old code
+                // stored a truncated byte value into the [0,1] float domain).
+                voxels_[idx].r = fminf(255.0f, fmaxf(0.0f, gpu_data[i].r)) / 255.0f;
+                voxels_[idx].g = fminf(255.0f, fmaxf(0.0f, gpu_data[i].g)) / 255.0f;
+                voxels_[idx].b = fminf(255.0f, fmaxf(0.0f, gpu_data[i].b)) / 255.0f;
             } else {
                 voxels_[idx].tsdf = 1.0f;
             }
@@ -333,11 +334,11 @@ __global__ void raycastKernel(
                     int vz = __float2int_rd((pf.z - origin.z) / voxel_size);
                     if (vx >= 0 && vx < resolution && vy >= 0 && vy < resolution && vz >= 0 && vz < resolution) {
                         VoxelGPU& v = voxels[vz * resolution * resolution + vy * resolution + vx];
-                        // Store colors directly in 0-255 range (no denormalization)
+                        // Device sRGB [0,255], rounded to nearest byte.
                         out_c[py * width + px] = make_uchar3(
-                            (uint8_t)fminf(255.0f, fmaxf(0.0f, v.r)),
-                            (uint8_t)fminf(255.0f, fmaxf(0.0f, v.g)),
-                            (uint8_t)fminf(255.0f, fmaxf(0.0f, v.b))
+                            (uint8_t)__float2int_rn(fminf(255.0f, fmaxf(0.0f, v.r))),
+                            (uint8_t)__float2int_rn(fminf(255.0f, fmaxf(0.0f, v.g))),
+                            (uint8_t)__float2int_rn(fminf(255.0f, fmaxf(0.0f, v.b)))
                         );
                     }
                 }
@@ -437,11 +438,10 @@ __global__ void compactPointsKernel(
             origin.z + z * voxel_size
         );
         const VoxelGPU& v = voxels[idx];
-        // Store colors directly in 0-255 range (no denormalization)
         out_colors[out_idx] = make_uchar3(
-            (uint8_t)fmaxf(0, fminf(255, v.r)),
-            (uint8_t)fmaxf(0, fminf(255, v.g)),
-            (uint8_t)fmaxf(0, fminf(255, v.b))
+            (uint8_t)__float2int_rn(fmaxf(0.0f, fminf(255.0f, v.r))),
+            (uint8_t)__float2int_rn(fmaxf(0.0f, fminf(255.0f, v.g))),
+            (uint8_t)__float2int_rn(fmaxf(0.0f, fminf(255.0f, v.b)))
         );
     }
 }
