@@ -20,6 +20,7 @@ private:
     QLabel*       lbl_fps_capture_       = nullptr;
     QLabel*       lbl_fps_tracking_      = nullptr;
     QLabel*       lbl_frame_count_       = nullptr;
+    QLabel*       lbl_backend_           = nullptr;
     QLabel*       lbl_tracking_status_   = nullptr;
     QLabel*       lbl_icp_error_         = nullptr;
     QLabel*       lbl_icp_overlap_       = nullptr;

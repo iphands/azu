@@ -62,6 +62,11 @@ void MetricsPanel::setupUI() {
     g_perf->addWidget(new QLabel("Frames:", this),       2, 0);
     lbl_frame_count_  = makeLabel("0");
     g_perf->addWidget(lbl_frame_count_, 2, 1);
+
+    g_perf->addWidget(new QLabel("Backend:", this),      3, 0);
+    lbl_backend_ = makeLabel("--");
+    lbl_backend_->setWordWrap(true);
+    g_perf->addWidget(lbl_backend_, 3, 1);
     root->addWidget(grp_perf);
 
     // Tracking group
@@ -148,6 +153,7 @@ void MetricsPanel::update(const app::PipelineMetrics& m) {
     lbl_fps_capture_->setText(QString::number(m.capture_fps, 'f', 1) + " fps");
     lbl_fps_tracking_->setText(QString::number(m.tracking_fps, 'f', 1) + " fps");
     lbl_frame_count_->setText(QString::number(m.frame_count));
+    lbl_backend_->setText(QString::fromStdString(m.backend));
     lbl_integrated_frames_->setText(QString::number(m.integrated_frames));
     lbl_volume_usage_->setText(QString::number(m.volume_usage_pct, 'f', 1) + " %");
     lbl_mesh_triangles_->setText(QString::number(m.mesh_triangles));

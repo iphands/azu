@@ -56,6 +56,10 @@ struct PipelineMetrics {
     // little. -1 = not measured yet.
     int      icp_valid_model    = -1;
     float    volume_usage_pct   = 0.0f;
+    // Which backend this session actually runs on, and why (e.g. "CUDA dev1
+    // NVIDIA GeForce RTX 4060 (7721 MB free, 1090 MB needed)" or "CPU: no CUDA
+    // device fits: ..."). Set once per start().
+    std::string backend = "CPU";
     size_t   mesh_triangles     = 0;
     float    mesh_extract_pct   = 0.0f;
     float    export_pct         = 0.0f;
@@ -328,6 +332,10 @@ private:
     // stopping never discards a GPU scan and export after stop still works. They
     // are released only by reset() and the destructor. Guarded by control_mutex_.
     bool                                  gpu_resources_ready_ = false;
+    // CUDA device chosen at the first GPU start; every thread that touches the
+    // GPU makes it current first (the CUDA current device is per host thread).
+    int                                   gpu_device_ = -1;
+    void bindGpuDevice() const noexcept;
     mutable std::mutex                    control_mutex_;
 
     bool startInternal(bool engage_sensor);

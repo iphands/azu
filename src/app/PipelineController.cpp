@@ -1,4 +1,5 @@
 #include "app/PipelineController.h"
+#include "app/GpuSelect.h"
 #include "export/GLBExporter.h"
 #include "export/PLYExporter.h"
 #include "utils/Logger.h"
@@ -115,11 +116,30 @@ bool PipelineController::startInternal(bool engage_sensor) {
         return false;
     }
 
+    std::string backend_label = "CPU";
 #ifdef CUDA_ENABLED
+    if (!gpu_resources_ready_ &&
+        preferred_backend_ != sensor::PreprocessBackend::CPU &&
+        preferred_backend_ != sensor::PreprocessBackend::HIP) {
+        // Choose once per allocation of GPU resources; a restart after stop()
+        // keeps the device that holds the scan.
+        const GpuChoice choice =
+            selectCudaDevice(cudaBudgetBytes(hyperparamsSnapshot().tsdf.resolution));
+        gpu_device_ = choice.device;
+        backend_label = (choice.device >= 0 ? "CUDA " : "CPU: ") + choice.description;
+    } else if (gpu_resources_ready_) {
+        bindGpuDevice();
+        backend_label = "CUDA dev" + std::to_string(gpu_device_);
+    }
     if (preferred_backend_ == sensor::PreprocessBackend::CPU || preferred_backend_ == sensor::PreprocessBackend::HIP) {
         use_gpu_ = false;
         tsdf_->setGPUEnabled(false);
+        backend_label = "CPU (requested)";
         KFLOG_INFO("Pipeline", "Using CPU-only path (User explicitly requested or incompatible backend).");
+    } else if (gpu_device_ < 0) {
+        use_gpu_ = false;
+        tsdf_->setGPUEnabled(false);
+        KFLOGF_WARN("Pipeline", "CUDA not used: %s", backend_label.c_str());
     } else {
         try {
             // initGPU() is idempotent; it re-allocates only after freeGPU()
@@ -140,11 +160,12 @@ bool PipelineController::startInternal(bool engage_sensor) {
             }
             use_gpu_ = true;
             tsdf_->setGPUEnabled(true);
-            KFLOG_INFO("Pipeline", "CUDA hardware acceleration ENABLED (NVIDIA GPU detected).");
+            KFLOGF_INFO("Pipeline", "Backend: %s", backend_label.c_str());
         } catch (const std::exception& e) {
             releaseGpuResources();
             use_gpu_ = false;
             tsdf_->setGPUEnabled(false);
+            backend_label = std::string("CPU: CUDA init failed: ") + e.what();
             KFLOGF_WARN("Pipeline", "CUDA initialization FAILED: %s. Falling back to CPU mode.", e.what());
         }
     }
@@ -173,6 +194,7 @@ bool PipelineController::startInternal(bool engage_sensor) {
             }
             use_gpu_ = true;
             tsdf_->setGPUEnabled(true);
+            backend_label = "HIP";
             KFLOG_INFO("Pipeline", "HIP/ROCm hardware acceleration ENABLED (AMD iGPU detected).");
         } catch (const std::exception& e) {
             releaseGpuResources();
@@ -242,6 +264,11 @@ bool PipelineController::startInternal(bool engage_sensor) {
         mesh_requests_.cv.notify_all();
     }
     last_mesh_request_ = std::chrono::microseconds::zero();
+
+    {
+        std::lock_guard<std::mutex> lk(metrics_mutex_);
+        metrics_.backend = backend_label;
+    }
 
     // Launch pipeline threads
     tracking_thread_    = std::thread(&PipelineController::trackingLoop, this);
@@ -449,6 +476,7 @@ void PipelineController::stop() {
 
 #ifdef CUDA_ENABLED
   if (use_gpu_.load()) {
+      bindGpuDevice();
       (void)cudaDeviceSynchronize();
   }
 #elif defined(HIP_ENABLED)
@@ -465,7 +493,14 @@ void PipelineController::stop() {
   KFLOG_INFO("Pipeline", "Pipeline shutdown complete.");
 }
 
+void PipelineController::bindGpuDevice() const noexcept {
+#ifdef CUDA_ENABLED
+    if (gpu_device_ >= 0) (void)cudaSetDevice(gpu_device_);
+#endif
+}
+
 void PipelineController::releaseGpuResources() noexcept {
+    bindGpuDevice();
 #ifdef CUDA_ENABLED
     if (cuda_stream_) {
         (void)cudaStreamDestroy(cuda_stream_);
@@ -729,6 +764,7 @@ void PipelineController::enqueueForIntegration(
 }
 
 void PipelineController::trackingLoop() {
+  bindGpuDevice();
   try {
     trackingLoopBody();
   } catch (const std::exception& e) {
@@ -1065,6 +1101,7 @@ void PipelineController::trackingLoopBody() {
 }
 
 void PipelineController::integrationLoop() {
+  bindGpuDevice();
   try {
     integrationLoopBody();
   } catch (const std::exception& e) {
@@ -1351,6 +1388,7 @@ void PipelineController::integrationLoopBody() {
 }
 
 void PipelineController::meshingLoop() {
+  bindGpuDevice();
   try {
     meshingLoopBody();
   } catch (const std::exception& e) {

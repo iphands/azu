@@ -364,7 +364,10 @@ void SignalConditioner::buildSuperResolutionGuidance(const std::vector<uint8_t>&
     // Keep guidance at original resolution for depth filtering
     // Apply RCAS sharpening for guidance quality
     sr_rgb_ = rgb;
-    sr::applyCAS(sr_rgb_, FRAME_W, FRAME_H, 0.5f);
+    // The CPU conditioner uses the CPU pass explicitly. sr::applyCAS() dispatches
+    // to CUDA in CUDA builds, which made this CPU stage allocate device memory
+    // every frame (and fail every frame when no device was usable).
+    sr::applyCAS_CPU(sr_rgb_, FRAME_W, FRAME_H, 0.5f);
 
     // Build guidance luma from the sharpened image (original resolution)
     guidance_luma_.resize(FRAME_W * FRAME_H);
@@ -408,16 +411,9 @@ void SignalConditioner::applySuperResolutionToRgb(const std::vector<uint8_t>& rg
         // made "an upscale" of a rejected scale indistinguishable from a real one.
         return;
     }
-#ifdef CUDA_ENABLED
-    static const bool sr_warned = [] {
-        KFLOG_WARN("SR", "EASU upscaling falls back to CPU on the CUDA backend (GPU EASU exists only on HIP)");
-        return true;
-    }();
-    (void)sr_warned;
-#endif
     // EASU upscaling
     std::vector<uint8_t> upscaled;
-    sr::applyEASU(rgb, upscaled, FRAME_W, FRAME_H, sr_scale_);
+    sr::applyEASU_CPU(rgb, upscaled, FRAME_W, FRAME_H, sr_scale_);
 
     const size_t expected = upscaledBytes(sr_scale_);
     // applyEASU_CPU returns early on an empty source and leaves dst empty; a
@@ -427,7 +423,7 @@ void SignalConditioner::applySuperResolutionToRgb(const std::vector<uint8_t>& rg
     // RCAS sharpening on upscaled image
     const int sr_w = FRAME_W * sr_scale_;
     const int sr_h = FRAME_H * sr_scale_;
-    sr::applyCAS(upscaled, sr_w, sr_h, 0.5f);
+    sr::applyCAS_CPU(upscaled, sr_w, sr_h, 0.5f);
     if (upscaled.size() != expected) return;
 
     sr_rgb_upscaled_ = std::move(upscaled);
