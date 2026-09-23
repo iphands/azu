@@ -87,6 +87,7 @@ ICPResult ICPTracker::trackLevel(const sensor::FrameData& live_level,
 
         if (inlier_count < kMinInliersForIteration) break;
 
+        result.information = A;
         A += Eigen::Matrix<float, 6, 6>::Identity() * dampingForHessian(A, level);
         Eigen::Matrix<float, 6, 1> x = A.ldlt().solve(b);
 

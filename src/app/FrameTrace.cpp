@@ -23,7 +23,7 @@ bool FrameTrace::open(const std::string& path) {
         out_ << "kind,frame_id,t_ms,quality,relocalizing,queued,"
                 "tx,ty,tz,qw,qx,qy,qz,ptx,pty,ptz,pqw,pqx,pqy,pqz,"
                 "inliers,valid_live,projected,valid_model,dist_filtered,angle_filtered,"
-                "rms_m,final_step,converged,model_frame_id,outside_volume,"
+                "rms_m,final_step,converged,model_frame_id,outside_volume,degenerate_dofs,"
                 "ms_preprocess,ms_icp,ms_track,ms_integrate,ms_raycast\n";
     }
     return open_;
@@ -39,7 +39,7 @@ void FrameTrace::write(const FrameTraceRow& r) {
     out_ << ',' << r.inliers << ',' << r.valid_live << ',' << r.projected << ','
          << r.valid_model << ',' << r.dist_filtered << ',' << r.angle_filtered << ','
          << r.rms_m << ',' << r.final_step << ',' << int(r.converged) << ','
-         << r.model_frame_id << ',' << r.outside_volume << ','
+         << r.model_frame_id << ',' << r.outside_volume << ',' << r.degenerate_dofs << ','
          << r.ms_preprocess << ',' << r.ms_icp << ',' << r.ms_track << ','
          << r.ms_integrate << ',' << r.ms_raycast << '\n';
     if (++unflushed_ >= 30) {

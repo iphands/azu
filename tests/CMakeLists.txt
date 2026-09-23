@@ -417,6 +417,15 @@ else()
     message(STATUS "smoke_fakenect: libfakenect not found, test not registered")
 endif()
 
+# Rotation: a full 360 degree turn in place in the synthetic room, lockstep,
+# through the real controller.
+add_executable(pipeline_spin_contract pipeline_spin_contract.cpp)
+target_compile_definitions(pipeline_spin_contract PRIVATE ${AZU_TEST_DEFS})
+target_include_directories(pipeline_spin_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(pipeline_spin_contract PRIVATE azu_test_pipeline)
+add_test(NAME pipeline_spin_contract COMMAND pipeline_spin_contract)
+set_tests_properties(pipeline_spin_contract PROPERTIES LABELS cpu TIMEOUT 300)
+
 add_executable(tsdf_integration_race_contract tsdf_integration_race_contract.cpp)
 target_compile_definitions(tsdf_integration_race_contract PRIVATE ${AZU_TEST_DEFS})
 target_link_libraries(tsdf_integration_race_contract PRIVATE azu_test_core)

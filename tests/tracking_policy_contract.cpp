@@ -1,6 +1,7 @@
-// tracking_policy_contract (big-fix-two T0.12): the frame grading used by the
-// pipeline (include/tracking/TrackingPolicy.h). Good integrates, Poor only moves
-// the pose, Failed keeps the old pose; convergence is not an input.
+// tracking_policy_contract (big-fix-two T0.12, policy v2): the frame grading used
+// by the pipeline (include/tracking/TrackingPolicy.h). Good integrates, Poor only
+// moves the pose, Failed keeps the old pose; convergence is not an input, and the
+// fit ratio is taken over model correspondences, not over all live points.
 #include "tracking/TrackingPolicy.h"
 
 #include <cmath>
@@ -32,10 +33,12 @@ Eigen::Matrix4f move(float tx, float yaw_rad) {
     return T;
 }
 
-ICPResult fit(const Eigen::Matrix4f& pose, int inliers, int valid_live, float error) {
+ICPResult fit(const Eigen::Matrix4f& pose, int inliers, int valid_model, float error,
+              int valid_live = 300000) {
     ICPResult r;
     r.pose = pose;
     r.inliers = inliers;
+    r.valid_model_points = valid_model;
     r.valid_live_points = valid_live;
     r.error = error;
     r.converged = false;       // deliberately: convergence must not matter
@@ -52,7 +55,14 @@ int main() {
     CHECK(classifyTracking(fit(near, 150000, 200000, 4e-6f), prev) == TrackQuality::Good,
           "non-converged solve with a tight fit and small motion is Good");
     CHECK(classifyTracking(fit(near, 30000, 200000, 4e-6f), prev) == TrackQuality::Poor,
-          "inlier ratio 0.15 < 0.30 is Poor");
+          "fit ratio 0.15 of the model correspondences < 0.40 is Poor");
+    // v2: turning toward new geometry leaves most LIVE points off the model.
+    // 40k inliers of 45k model correspondences out of 300k live points is a
+    // tight fit that must integrate (v1 graded it Poor: 40k/300k < 0.30).
+    CHECK(classifyTracking(fit(near, 40000, 45000, 4e-6f, 300000), prev) == TrackQuality::Good,
+          "a tight fit on a small overlap (new geometry in view) is Good");
+    CHECK(classifyTracking(fit(near, 1500, 1600, 4e-6f), prev) == TrackQuality::Poor,
+          "fewer than 2000 inliers cannot be Good");
     CHECK(classifyTracking(fit(near, 150000, 200000, 9e-4f), prev) == TrackQuality::Poor,
           "RMS 3 cm > 1.5 cm is Poor");
     CHECK(classifyTracking(fit(prev * move(0.2f, 0.0f), 150000, 200000, 4e-6f), prev) ==

@@ -32,6 +32,7 @@ struct FrameTraceRow {
     bool     converged = false;
     uint64_t model_frame_id = 0;     // frame the model image was raycast from
     float    outside_volume = 0.0f;  // fraction of live points outside the TSDF box
+    int      degenerate_dofs = 0;    // unobservable directions held at the previous pose
     float    ms_preprocess = 0.0f, ms_icp = 0.0f, ms_track = 0.0f;
     // integration
     float    ms_integrate = 0.0f, ms_raycast = 0.0f;

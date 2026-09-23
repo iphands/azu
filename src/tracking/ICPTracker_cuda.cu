@@ -426,6 +426,7 @@ ICPResult ICPTracker::trackLevelGPU(const float3*            d_v_live,
         result.angle_filtered     = (int)h_hessian[33];
 
         if (inliers < 10) break;
+        result.information = A;
 
         // Solve update with adaptive Tikhonov regularization (Levenberg-Marquardt style)
         float damping = 0.1f;

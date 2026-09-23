@@ -32,6 +32,12 @@ struct ICPResult {
     bool            tracking_ok = false;
     float           final_step = std::numeric_limits<float>::infinity();
 
+    // Undamped point-to-plane information matrix (J^T W J) of the last linear
+    // system built at the finest level solved, in the increment coordinates
+    // [t; omega] of the live camera. Its small eigen-directions are the motions
+    // the scene cannot observe (e.g. sliding along a single wall).
+    Eigen::Matrix<float, 6, 6> information = Eigen::Matrix<float, 6, 6>::Zero();
+
     // Diagnostic counters
     int             valid_live_points  = 0;
     int             valid_model_points = 0;

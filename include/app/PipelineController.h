@@ -375,6 +375,8 @@ private:
     std::condition_variable               idle_cv_;
     int64_t                               in_flight_ = 0;
     std::string                           trace_path_;
+    // keepObservableMotion() threshold (eigenvalue ratio); 0 disables.
+    float                                 degeneracy_rel_ = 5e-3f;
     FrameTrace                            trace_;
     void bindGpuDevice() const noexcept;
     mutable std::mutex                    control_mutex_;

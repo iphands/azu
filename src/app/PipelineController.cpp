@@ -48,6 +48,7 @@ PipelineController::PipelineController(sensor::PreprocessBackend preferred_backe
     }
 
     if (const char* trace = std::getenv("AZU_TRACE")) trace_path_ = trace;
+    if (const char* rel = std::getenv("AZU_DEGENERACY_REL")) degeneracy_rel_ = std::strtof(rel, nullptr);
 }
 
 PipelineController::~PipelineController() {
@@ -1186,6 +1187,18 @@ void PipelineController::trackingLoopBody() {
     // Grade the solve (tracking/TrackingPolicy.h): Good integrates, Poor only
     // moves the pose, Failed keeps the old pose and counts toward Lost. The
     // per-frame motion gate lives in the policy.
+    // Motion the scene cannot observe keeps the previous pose instead of the
+    // prediction plus noise (not while relocalizing: the previous pose is then
+    // the stale last good one). AZU_DEGENERACY_REL=<ratio> overrides the
+    // threshold for experiments; 0 disables.
+    int degenerate_dofs = 0;
+    if (!is_lost && degeneracy_rel_ > 0.0f) {
+        const tracking::ObservableMotion om = tracking::keepObservableMotion(
+            prev_pose, icp_result.pose, icp_result.information, degeneracy_rel_);
+        icp_result.pose = om.pose;
+        degenerate_dofs = om.degenerate_dofs;
+    }
+
     const tracking::TrackQuality quality = tracking::classifyTracking(icp_result, prev_pose);
 
     if (trace_.isOpen()) {
@@ -1208,6 +1221,7 @@ void PipelineController::trackingLoopBody() {
         row.converged = icp_result.converged;
         row.model_frame_id = model_ref->source_frame_id;
         row.outside_volume = outsideVolumeFraction(*frame, icp_result.pose, hp.tsdf);
+        row.degenerate_dofs = degenerate_dofs;
         row.ms_preprocess = ms_preprocess;
         row.ms_icp = ms_icp;
         row.ms_track = duration<float, std::milli>(steady_clock::now() - t_frame).count();
