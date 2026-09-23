@@ -4,6 +4,7 @@ build-hip/
 build-cpu/
 build-cuda/
 build-cpu-big-fix/
+build-*/
 
 # Compiled objects
 *.o
