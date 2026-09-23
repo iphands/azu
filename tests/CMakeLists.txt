@@ -1572,4 +1572,14 @@ if(NOT AZU_TEST_CORE_HAS_GLDIAG_TU)
         "replica instead of the product GL diagnostics.")
 endif()
 
+# Tests that sphere-trace tests/support/SyntheticScene.h render hundreds of
+# 640x480 frames in the test binary itself; at -O0 that alone exceeds their
+# timeouts. Same -O2 Debug harness tuning as azu_test_core/azu_test_pipeline.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    foreach(_azu_scene_test icp_refpose_contract pipeline_trajectory_contract
+                            pipeline_relocalization_contract pipeline_spin_contract)
+        target_compile_options(${_azu_scene_test} PRIVATE -O2)
+    endforeach()
+endif()
+
 message(STATUS "azu big-fix CPU test harness: cpu_smoke_harness + pipeline_test_seam_smoke + pipeline_stop_contract + pipeline_hyperparams_contract + pipeline_state_contract + pipeline_mesh_cadence_contract + pipeline_export_mesh_contract + camera_basis_contract + fusion_ui_validation_contract + ply_writer_contract + glb_writer_contract + logger_timer_contract + stats_denominator_contract + gl_diagnostics_contract registered (label=cpu)")
