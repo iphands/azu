@@ -25,9 +25,10 @@ FAILED=0
 run_lane() {   # name build_type backend run_tests
     local name="$1" type="$2" backend="$3" tests="$4"
     local dir="${ROOT}/build-gate-${name}"
-    local log="${dir}.log"
+    local log="${dir}/gate.log"
     local testing=OFF
     [ "${tests}" = yes ] && testing=ON
+    mkdir -p "${dir}"
     echo "== ${name}: configure/build (${type}, GPU_BACKEND=${backend})"
     if ! { cmake -S "${ROOT}" -B "${dir}" -G Ninja -DCMAKE_BUILD_TYPE="${type}" \
                -DGPU_BACKEND="${backend}" -DBUILD_TESTING="${testing}" \
