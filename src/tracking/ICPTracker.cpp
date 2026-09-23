@@ -46,6 +46,9 @@ ICPResult ICPTracker::track(const sensor::FramePyramid& live,
     float last_final_step = std::numeric_limits<float>::infinity();
 
     for (int level = sensor::FramePyramid::LEVELS - 1; level >= 0; --level) {
+        // A level with no iterations is skipped, so a coarse-only solve (finer
+        // levels at 0, as relocalization scoring uses) keeps its result.
+        if (params_.max_iterations[level] <= 0) continue;
         ICPResult level_result = trackLevel(live.levels[level], model, result.pose, ref_pose, level,
                                            params_.max_iterations[level]);
         if (std::isfinite(level_result.final_step)) {

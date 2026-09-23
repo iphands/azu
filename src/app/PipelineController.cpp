@@ -773,6 +773,39 @@ void PipelineController::onRawFrame(std::shared_ptr<sensor::RawFrame> raw) {
   }
 }
 
+void PipelineController::emitLivePreview(const sensor::FrameData& f,
+                                         const Eigen::Matrix4f& pose) {
+  const auto now = steady_clock::now();
+  if (now - last_live_preview_ < std::chrono::milliseconds(100) || !hasFrameReadyCallback())
+    return;
+  last_live_preview_ = now;
+
+  constexpr int step = 2;
+  auto ui = std::make_shared<sensor::FrameData>();
+  ui->width  = f.width / step;
+  ui->height = f.height / step;
+  const size_t n = static_cast<size_t>(ui->width) * ui->height;
+  ui->vertices.assign(n, Eigen::Vector3f::Zero());
+  ui->rgb.assign(n * 3, 160);
+  ui->depth_meters.assign(n, 0.0f);
+  ui->pose = Eigen::Matrix4f::Identity();
+  const Eigen::Matrix3f R = pose.block<3,3>(0,0);
+  const Eigen::Vector3f t = pose.block<3,1>(0,3);
+  for (int y = 0; y < ui->height; ++y) {
+    for (int x = 0; x < ui->width; ++x) {
+      const size_t src = static_cast<size_t>(y * step) * f.width + x * step;
+      const size_t dst = static_cast<size_t>(y) * ui->width + x;
+      if (!(f.depth_meters[src] > 0.0f)) continue;
+      ui->vertices[dst] = R * f.vertices[src] + t;
+      ui->depth_meters[dst] = 1.0f;
+      if (f.rgb_valid) {
+        for (int c = 0; c < 3; ++c) ui->rgb[dst * 3 + c] = f.rgb[src * 3 + c];
+      }
+    }
+  }
+  dispatchUiFrame(std::move(ui));
+}
+
 void PipelineController::enqueueForIntegration(
     std::shared_ptr<sensor::FrameData> frame) {
   std::shared_ptr<sensor::FrameData> displaced;
@@ -983,57 +1016,59 @@ void PipelineController::trackingLoopBody() {
     std::unique_lock<std::mutex> tracker_lk(tracker_mutex_);
 
     if (is_lost) {
-      // RELOCALIZATION MODE: Multi-hypothesis search. Params come from this
-      // frame's snapshot, never from an unsynchronized hyperparams_ read.
-      tracking::ICPParams recovery_params = hp.icp;
-      recovery_params.dist_threshold *= 2.5f; 
-      recovery_params.angle_threshold = 45.0f;
-      
-      // Increase iterations for recovery
-      for (int l = 0; l < sensor::FramePyramid::LEVELS; ++l) {
-          recovery_params.max_iterations[l] *= 2;
-      }
-
+      // RELOCALIZATION: score many starting poses cheaply at the coarsest
+      // pyramid level, then refine the best one with the normal parameters.
+      // Params come from this frame's snapshot.
+      constexpr int kLevels = sensor::FramePyramid::LEVELS;
+      tracking::ICPParams coarse = hp.icp;
+      coarse.dist_threshold *= 2.5f;
+      coarse.angle_threshold = 45.0f;
+      for (int l = 0; l < kLevels - 1; ++l) coarse.max_iterations[l] = 0;
+      coarse.max_iterations[kLevels - 1] = std::max(8, 2 * hp.icp.max_iterations[kLevels - 1]);
       const tracking::ICPParams original_params = tracker_->params();
-      tracker_->setParams(recovery_params);
 
-      // Hypothesis 1: Last known pose
-      Eigen::Matrix4f h1_pose = prev_pose;
-      
-      // Hypothesis 2: Small forward motion (assuming user is moving towards object)
-      Eigen::Matrix4f h2_pose = prev_pose;
-      h2_pose(2,3) += 0.05f; 
-
-      // Hypothesis 3: Zero velocity (if predicted_pose was used but failed)
-      Eigen::Matrix4f h3_pose = prev_pose;
-
-      std::vector<Eigen::Matrix4f> hypotheses = {h1_pose, h2_pose, h3_pose};
-      tracking::ICPResult best_result;
-      best_result.tracking_ok = false;
-      best_result.inliers = 0;
+      // Last good pose, the motion prediction, the pose the model was rendered
+      // at, and a +-10 deg yaw/pitch grid around the last good pose (the old
+      // set was prev_pose twice plus a 5 cm step along WORLD z).
+      std::vector<Eigen::Matrix4f> hypotheses = {prev_pose, predicted_pose, model_ref->pose};
+      constexpr float kStep = 10.0f * static_cast<float>(M_PI) / 180.0f;
+      for (int yi = -1; yi <= 1; ++yi) {
+          for (int pi = -1; pi <= 1; ++pi) {
+              if (yi == 0 && pi == 0) continue;
+              Eigen::Matrix4f d = Eigen::Matrix4f::Identity();
+              d.block<3,3>(0,0) =
+                  (Eigen::AngleAxisf(yi * kStep, Eigen::Vector3f::UnitY()) *
+                   Eigen::AngleAxisf(pi * kStep, Eigen::Vector3f::UnitX())).toRotationMatrix();
+              hypotheses.push_back(prev_pose * d);
+          }
+      }
 
       sensor::FramePyramid pyramid;
       if (!use_gpu_.load()) {
           sensor::buildFramePyramid(*frame, pyramid);
       }
+      auto solve = [&](const Eigen::Matrix4f& h) {
+          return use_gpu_.load() ? solve_gpu(h) : solve_cpu(pyramid, h);
+      };
 
+      tracker_->setParams(coarse);
+      tracking::ICPResult best_coarse;
+      bool best_graded = false;
       for (const auto& h_pose : hypotheses) {
-          tracking::ICPResult res = use_gpu_.load() ? solve_gpu(h_pose)
-                                                   : solve_cpu(pyramid, h_pose);
-
-          // Always track the best-inlier hypothesis so diagnostics are
-          // meaningful even when every hypothesis fails (tracking_ok==false).
-          if (res.inliers > best_result.inliers) {
-              best_result = res;
+          const tracking::ICPResult res = solve(h_pose);
+          const bool graded =
+              tracking::classifyTracking(res, prev_pose) != tracking::TrackQuality::Failed;
+          // Prefer any gradable result; among equals, the most inliers.
+          if ((graded && !best_graded) ||
+              (graded == best_graded && res.inliers > best_coarse.inliers)) {
+              best_coarse = res;
+              best_graded = graded;
           }
-          if (best_result.tracking_ok && best_result.inliers > 5000) break; // Good enough
       }
-      
-      icp_result = best_result;
-      // Restored under the same lock the swap happened under, so the tracker can
-      // never be left holding recovery params, and a concurrent setHyperparams()
-      // cannot land between the swap and the restore.
       tracker_->setParams(original_params);
+      icp_result = solve(best_coarse.pose);
+      // Restored under the same lock the swap happened under, so the tracker can
+      // never be left holding recovery params.
     } else {
       // Retry from the previous pose only when the prediction's result grades
       // Failed; a non-converged solve with a good fit is kept (TRACK-17).
@@ -1098,6 +1133,14 @@ void PipelineController::trackingLoopBody() {
                 KFLOGF_INFO("Pipeline", "Tracking STABLE: avg_inliers=%d, avg_residual=%.6f", 
                            icp_result.inliers, icp_result.error);
             }
+        }
+
+        // A frame that will not be integrated never reaches the raycast
+        // preview, so while lost (or on a Poor fit) the screen used to freeze
+        // and looked like a hang. Show the live depth at the current pose.
+        if (quality != tracking::TrackQuality::Good) {
+            emitLivePreview(*frame, quality == tracking::TrackQuality::Failed ? prev_pose
+                                                                              : icp_result.pose);
         }
 
         if (quality != tracking::TrackQuality::Failed) {

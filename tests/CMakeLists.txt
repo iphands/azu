@@ -377,6 +377,15 @@ target_link_libraries(tracking_policy_contract PRIVATE azu_test_core)
 add_test(NAME tracking_policy_contract COMMAND tracking_policy_contract)
 set_tests_properties(tracking_policy_contract PROPERTIES LABELS cpu TIMEOUT 60)
 
+# big-fix-two T0.13: loss -> relocalization -> recovery, with a live preview
+# while lost.
+add_executable(pipeline_relocalization_contract pipeline_relocalization_contract.cpp)
+target_compile_definitions(pipeline_relocalization_contract PRIVATE ${AZU_TEST_DEFS})
+target_include_directories(pipeline_relocalization_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(pipeline_relocalization_contract PRIVATE azu_test_pipeline)
+add_test(NAME pipeline_relocalization_contract COMMAND pipeline_relocalization_contract)
+set_tests_properties(pipeline_relocalization_contract PROPERTIES LABELS cpu TIMEOUT 180)
+
 add_executable(tsdf_integration_race_contract tsdf_integration_race_contract.cpp)
 target_compile_definitions(tsdf_integration_race_contract PRIVATE ${AZU_TEST_DEFS})
 target_link_libraries(tsdf_integration_race_contract PRIVATE azu_test_core)

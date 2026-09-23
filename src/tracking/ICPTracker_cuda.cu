@@ -334,6 +334,9 @@ ICPResult ICPTracker::trackGPU(const float*                d_depth,
     // 3. Track levels
     bool converged = false;
     for (int level = sensor::FramePyramid::LEVELS - 1; level >= 0; --level) {
+        // A level with no iterations is skipped, not run: running it would
+        // replace a coarse-level solve with an empty result.
+        if (params_.max_iterations[level] <= 0) continue;
         result = trackLevelGPU(
             d_pyramid_v[level].get(), d_pyramid_n[level].get(),
             width >> level, height >> level,

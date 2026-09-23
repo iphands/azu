@@ -371,6 +371,10 @@ private:
      * queue lock; the eviction is counted under metrics_mutex_.
      */
     void enqueueForIntegration(std::shared_ptr<sensor::FrameData> frame);
+    /** Live depth at `pose` for the viewport, <= 10 Hz; used while frames are
+     *  not being integrated (lost / poor fit), when no raycast preview flows. */
+    void emitLivePreview(const sensor::FrameData& frame, const Eigen::Matrix4f& pose);
+    std::chrono::steady_clock::time_point last_live_preview_{};   // tracking thread only
     /** Bump mesh_requests_.requested and wake the worker. Never blocks, never waits. */
     uint64_t requestMesh();
     /**
