@@ -30,7 +30,7 @@ namespace kfusion {
 namespace tsdf {
 
 // -------------------------------------------------------------------
-// Integration kernel: Image-Centric (Pixel Parallel)
+// Integration kernel: voxel-parallel (one thread per voxel)
 // -------------------------------------------------------------------
 __global__ void integrationKernel_VoxelParallel(
     VoxelGPU* voxels, int resolution, float voxel_size, float3 origin, float truncation, float max_weight,
@@ -46,58 +46,47 @@ __global__ void integrationKernel_VoxelParallel(
 
     if (x >= resolution || y >= resolution || z >= resolution) return;
 
-    int vidx = z * resolution * resolution + y * resolution + x;
+    const size_t vidx = (static_cast<size_t>(z) * resolution + y) * resolution + x;
     VoxelGPU& vox = voxels[vidx];
 
-    float3 world_pos = {
+    // CPU canonical integration (src/tsdf/TSDFVolume.cpp integrateCPU,
+    // docs/CANONICAL_SEMANTICS.md): the voxel CORNER origin + i*vs projects to
+    // pixel floor(p + 0.5); the measured depth must lie in the configured band;
+    // free space in front of the surface is observed too (tsdf 1), which the
+    // raycast's observed-only sampling relies on; colour within |sdf| < trunc/2.
+    const float3 world_pos = {
         origin.x + x * voxel_size,
         origin.y + y * voxel_size,
         origin.z + z * voxel_size
     };
+    const float cx_c = rwc00 * world_pos.x + rwc01 * world_pos.y + rwc02 * world_pos.z + twc_x;
+    const float cy_c = rwc10 * world_pos.x + rwc11 * world_pos.y + rwc12 * world_pos.z + twc_y;
+    const float cz_c = rwc20 * world_pos.x + rwc21 * world_pos.y + rwc22 * world_pos.z + twc_z;
+    if (cz_c <= 0.0f) return;
 
-    // Project world point back into camera
-    float cx_c = rwc00 * world_pos.x + rwc01 * world_pos.y + rwc02 * world_pos.z + twc_x;
-    float cy_c = rwc10 * world_pos.x + rwc11 * world_pos.y + rwc12 * world_pos.z + twc_y;
-    float cz_c = rwc20 * world_pos.x + rwc21 * world_pos.y + rwc22 * world_pos.z + twc_z;
+    const float uf = floorf(fx * cx_c / cz_c + cx + 0.5f);
+    const float vf = floorf(fy * cy_c / cz_c + cy + 0.5f);
+    if (!(uf >= 0.0f && uf < (float)width && vf >= 0.0f && vf < (float)height)) return;
+    const int pix = (int)vf * width + (int)uf;
 
-    if (cz_c <= 0.1f) return;
+    const float d_meas = depth[pix];
+    if (!(d_meas >= min_depth && d_meas <= max_depth)) return;   // also rejects NaN
 
-    int u = __float2int_rn(fx * cx_c / cz_c + cx);
-    int v = __float2int_rn(fy * cy_c / cz_c + cy);
-
-    if (u < 0 || u >= width || v < 0 || v >= height) return;
-
-    float d_meas = depth[v * width + u];
-    // Filter invalid depths: too close, too far, or NaN/inf
-    if (d_meas < 0.1f || d_meas > max_depth || isnan(d_meas) || isinf(d_meas)) return;
-
-    float sdf = d_meas - cz_c;
+    const float sdf = d_meas - cz_c;
     if (sdf < -truncation) return;
-    if (sdf > truncation) return;
+    const float tsdf_new = fminf(1.0f, sdf / truncation);
 
-    float tsdf_new = fminf(1.0f, sdf / truncation);
-    if (isnan(tsdf_new) || isinf(tsdf_new)) return;
-    
-    float w_old = vox.weight;
-    float w_new = 1.0f;
-    float w_sum = fminf(w_old + w_new, max_weight);
+    const float w_old = vox.weight;
+    vox.tsdf   = (vox.tsdf * w_old + tsdf_new) / (w_old + 1.0f);
+    vox.weight = fminf(w_old + 1.0f, max_weight);
 
-    float new_tsdf = (vox.tsdf * w_old + tsdf_new * w_new) / (w_old + w_new + 1e-6f);
-    if (isnan(new_tsdf) || isinf(new_tsdf)) return;
-
-    vox.tsdf   = new_tsdf;
-    vox.weight = w_sum;
-
-    if (rgb && sdf > -truncation * 0.5f) {
-        int pidx = (v * width + u) * 3;
-        // Store colors directly in 0-255 range (no normalization)
-        float r_meas = (float)rgb[pidx + 0];
-        float g_meas = (float)rgb[pidx + 1];
-        float b_meas = (float)rgb[pidx + 2];
-        
-        vox.r = (vox.r * w_old + r_meas) / (w_old + 1.0f + 1e-6f);
-        vox.g = (vox.g * w_old + g_meas) / (w_old + 1.0f + 1e-6f);
-        vox.b = (vox.b * w_old + b_meas) / (w_old + 1.0f + 1e-6f);
+    if (rgb && fabsf(sdf) < 0.5f * truncation) {
+        // Device colour is sRGB [0,255] (host: [0,1]).
+        const uint8_t* px = rgb + pix * 3;
+        const float inv = 1.0f / (w_old + 1.0f);
+        vox.r = (vox.r * w_old + (float)px[0]) * inv;
+        vox.g = (vox.g * w_old + (float)px[1]) * inv;
+        vox.b = (vox.b * w_old + (float)px[2]) * inv;
     }
 }
 
@@ -208,72 +197,61 @@ void TSDFVolume::integrateGPU(const float*           d_depth,
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-__device__ float get_tsdf_trilinear(VoxelGPU* voxels, int resolution, float voxel_size, float3 origin, float3 p) {
-    float3 v = make_float3((p.x - origin.x) / voxel_size, (p.y - origin.y) / voxel_size, (p.z - origin.z) / voxel_size);
-    
-    int x0 = __float2int_rd(v.x);
-    int y0 = __float2int_rd(v.y);
-    int z0 = __float2int_rd(v.z);
 
-    if (x0 < 0 || x0 >= resolution - 1 || y0 < 0 || y0 >= resolution - 1 || z0 < 0 || z0 >= resolution - 1) {
-        if (x0 >= 0 && x0 < resolution && y0 >= 0 && y0 < resolution && z0 >= 0 && z0 < resolution) {
-            VoxelGPU& vox = voxels[z0 * resolution * resolution + y0 * resolution + x0];
-            return (vox.weight > 0.0f) ? vox.tsdf : 1.0f;
-        }
-        return 1.0f;
+// Trilinear sample valid only when all 8 cell corners are observed (weight > 0),
+// as the CPU sampleTSDF(): blending observed values with the unobserved +1
+// sentinel manufactures zero crossings, i.e. phantom surfaces.
+__device__ bool sample_observed(const VoxelGPU* voxels, int res, float vs, float3 origin,
+                                float3 p, float* f_out) {
+    const float vx = (p.x - origin.x) / vs, vy = (p.y - origin.y) / vs, vz = (p.z - origin.z) / vs;
+    const float fx0 = floorf(vx), fy0 = floorf(vy), fz0 = floorf(vz);
+    if (!(fx0 >= 0.0f && fy0 >= 0.0f && fz0 >= 0.0f &&
+          fx0 < (float)(res - 1) && fy0 < (float)(res - 1) && fz0 < (float)(res - 1))) {
+        return false;
     }
-
-    float tx = v.x - x0;
-    float ty = v.y - y0;
-    float tz = v.z - z0;
-
-    auto getV = [&](int x, int y, int z) {
-        VoxelGPU& vox = voxels[z * resolution * resolution + y * resolution + x];
-        return (vox.weight > 0.0f) ? vox.tsdf : 1.0f;
-    };
-
-    float v000 = getV(x0, y0, z0);
-    float v100 = getV(x0+1, y0, z0);
-    float v010 = getV(x0, y0+1, z0);
-    float v110 = getV(x0+1, y0+1, z0);
-    float v001 = getV(x0, y0, z0+1);
-    float v101 = getV(x0+1, y0, z0+1);
-    float v011 = getV(x0, y0+1, z0+1);
-    float v111 = getV(x0+1, y0+1, z0+1);
-
-    float v00 = v000 * (1 - tx) + v100 * tx;
-    float v01 = v001 * (1 - tx) + v101 * tx;
-    float v10 = v010 * (1 - tx) + v110 * tx;
-    float v11 = v011 * (1 - tx) + v111 * tx;
-
-    float v0 = v00 * (1 - ty) + v10 * ty;
-    float v1 = v01 * (1 - ty) + v11 * ty;
-
-    return v0 * (1 - tz) + v1 * tz;
+    const int x0 = (int)fx0, y0 = (int)fy0, z0 = (int)fz0;
+    const float tx = vx - fx0, ty = vy - fy0, tz = vz - fz0;
+    const size_t sy = (size_t)res, sz = (size_t)res * res;
+    const VoxelGPU* b = voxels + (size_t)z0 * sz + (size_t)y0 * sy + x0;
+    const VoxelGPU* c[8] = {b, b + 1, b + sy, b + sy + 1, b + sz, b + sz + 1, b + sz + sy, b + sz + sy + 1};
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (!(c[k]->weight > 0.0f)) return false;
+    }
+    const float v00 = c[0]->tsdf * (1 - tx) + c[1]->tsdf * tx;
+    const float v10 = c[2]->tsdf * (1 - tx) + c[3]->tsdf * tx;
+    const float v01 = c[4]->tsdf * (1 - tx) + c[5]->tsdf * tx;
+    const float v11 = c[6]->tsdf * (1 - tx) + c[7]->tsdf * tx;
+    const float v0 = v00 * (1 - ty) + v10 * ty;
+    const float v1 = v01 * (1 - ty) + v11 * ty;
+    *f_out = v0 * (1 - tz) + v1 * tz;
+    return true;
 }
 
-__device__ float3 computeNormalGPU(void* voxels_void, int resolution, float voxel_size, float3 origin, float3 p) {
-    VoxelGPU* voxels = (VoxelGPU*)voxels_void;
-
-    float3 n;
-    n.x = get_tsdf_trilinear(voxels, resolution, voxel_size, origin, make_float3(p.x + voxel_size, p.y, p.z)) -
-          get_tsdf_trilinear(voxels, resolution, voxel_size, origin, make_float3(p.x - voxel_size, p.y, p.z));
-    n.y = get_tsdf_trilinear(voxels, resolution, voxel_size, origin, make_float3(p.x, p.y + voxel_size, p.z)) -
-          get_tsdf_trilinear(voxels, resolution, voxel_size, origin, make_float3(p.x, p.y - voxel_size, p.z));
-    n.z = get_tsdf_trilinear(voxels, resolution, voxel_size, origin, make_float3(p.x, p.y, p.z + voxel_size)) -
-          get_tsdf_trilinear(voxels, resolution, voxel_size, origin, make_float3(p.x, p.y, p.z - voxel_size));
-
-    float len = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
-    if (len > 1e-6f) {
-        n.x /= len; n.y /= len; n.z /= len;
-    } else {
-        n = make_float3(0, 0, 0);
+__device__ bool normal_observed(const VoxelGPU* voxels, int res, float vs, float3 origin,
+                                float3 p, float3* n_out) {
+    float s[6];
+    const float3 q[6] = {make_float3(p.x + vs, p.y, p.z), make_float3(p.x - vs, p.y, p.z),
+                         make_float3(p.x, p.y + vs, p.z), make_float3(p.x, p.y - vs, p.z),
+                         make_float3(p.x, p.y, p.z + vs), make_float3(p.x, p.y, p.z - vs)};
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) {
+        if (!sample_observed(voxels, res, vs, origin, q[k], &s[k])) return false;
     }
-    return n;
+    const float3 n = make_float3(s[0] - s[1], s[2] - s[3], s[4] - s[5]);
+    const float len = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
+    if (!(len > 1e-6f) || !isfinite(len)) return false;
+    *n_out = make_float3(n.x / len, n.y / len, n.z / len);
+    return true;
 }
 
+// CPU canonical raycast (src/tsdf/TSDFVolume.cpp raycast): slab clip to the
+// volume inside the Z-depth band, adaptive step, FRONT faces only (first +->-
+// bracket between observed samples, one secant step), normals from observed
+// samples only. Every output is written on every path.
 __global__ void raycastKernel(
     void* voxels_void, int resolution, float voxel_size, float3 origin,
+    float truncation, float min_depth, float max_depth,
     float fx, float fy, float cx, float cy,
     float r00, float r01, float r02, float tx,
     float r10, float r11, float r12, float ty,
@@ -281,83 +259,105 @@ __global__ void raycastKernel(
     int width, int height,
     float3* out_v, float3* out_n, uchar3* out_c)
 {
-    int px = blockIdx.x * blockDim.x + threadIdx.x;
-    int py = blockIdx.y * blockDim.y + threadIdx.y;
-
+    const int px = blockIdx.x * blockDim.x + threadIdx.x;
+    const int py = blockIdx.y * blockDim.y + threadIdx.y;
     if (px >= width || py >= height) return;
+    const int out_idx = py * width + px;
+    out_v[out_idx] = make_float3(0, 0, 0);
+    out_n[out_idx] = make_float3(0, 0, 0);
+    if (out_c) out_c[out_idx] = make_uchar3(0, 0, 0);
 
-    VoxelGPU* voxels = (VoxelGPU*)voxels_void;
+    const VoxelGPU* voxels = (const VoxelGPU*)voxels_void;
 
+    const float3 rc = make_float3((px - cx) / fx, (py - cy) / fy, 1.0f);
+    const float rnorm = sqrtf(rc.x * rc.x + rc.y * rc.y + 1.0f);
+    const float3 dir = make_float3((r00 * rc.x + r01 * rc.y + r02) / rnorm,
+                                   (r10 * rc.x + r11 * rc.y + r12) / rnorm,
+                                   (r20 * rc.x + r21 * rc.y + r22) / rnorm);
+    const float3 o = make_float3(tx, ty, tz);
 
-
-    // Ray in camera space
-    float3 ray_c = make_float3((px - cx) / fx, (py - cy) / fy, 1.0f);
-    float rlen = sqrtf(ray_c.x*ray_c.x + ray_c.y*ray_c.y + 1.0f);
-    ray_c.x /= rlen; ray_c.y /= rlen; ray_c.z /= rlen;
-
-    // Ray in world space
-    float3 ray_w;
-    ray_w.x = r00 * ray_c.x + r01 * ray_c.y + r02 * ray_c.z;
-    ray_w.y = r10 * ray_c.x + r11 * ray_c.y + r12 * ray_c.z;
-    ray_w.z = r20 * ray_c.x + r21 * ray_c.y + r22 * ray_c.z;
-
-    float3 pos_w = make_float3(tx, ty, tz);
-    float t = 0.3f; // min depth for Kinect v1
-    float prev_tsdf = 1.0f;
-    float step = voxel_size;
-
-    while (t < 5.0f) {
-        float3 p = make_float3(pos_w.x + ray_w.x * t, pos_w.y + ray_w.y * t, pos_w.z + ray_w.z * t);
-        float tsdf = get_tsdf_trilinear(voxels, resolution, voxel_size, origin, p);
-
-        if (tsdf < 1.0f) {
-            if (prev_tsdf > 0.0f && tsdf <= 0.0f) {
-                // Surface zero-crossing found
-                float t_hit = t - step * tsdf / (tsdf - prev_tsdf + 1e-6f);
-                if (isnan(t_hit) || isinf(t_hit)) {
-                    out_v[py * width + px] = make_float3(0,0,0);
-                    return;
-                }
-                float3 pf = make_float3(pos_w.x + ray_w.x * t_hit, pos_w.y + ray_w.y * t_hit, pos_w.z + ray_w.z * t_hit);
-
-                if (isnan(pf.x) || isnan(pf.y) || isnan(pf.z)) {
-                    out_v[py * width + px] = make_float3(0,0,0);
-                    return;
-                }
-
-                out_v[py * width + px] = pf;
-                out_n[py * width + px] = computeNormalGPU(voxels_void, resolution, voxel_size, origin, pf);
-
-                if (out_c) {
-                    int vx = __float2int_rd((pf.x - origin.x) / voxel_size);
-                    int vy = __float2int_rd((pf.y - origin.y) / voxel_size);
-                    int vz = __float2int_rd((pf.z - origin.z) / voxel_size);
-                    if (vx >= 0 && vx < resolution && vy >= 0 && vy < resolution && vz >= 0 && vz < resolution) {
-                        VoxelGPU& v = voxels[vz * resolution * resolution + vy * resolution + vx];
-                        // Device sRGB [0,255], rounded to nearest byte.
-                        out_c[py * width + px] = make_uchar3(
-                            (uint8_t)__float2int_rn(fminf(255.0f, fmaxf(0.0f, v.r))),
-                            (uint8_t)__float2int_rn(fminf(255.0f, fmaxf(0.0f, v.g))),
-                            (uint8_t)__float2int_rn(fminf(255.0f, fmaxf(0.0f, v.b)))
-                        );
-                    }
-                }
-                return;
-            }
-
-            prev_tsdf = tsdf;
-            step = voxel_size * 0.5f; // Small steps near surface
-        } else {
-            // Unknown or empty space
-            prev_tsdf = 1.0f;
-            step = voxel_size; 
+    float t_near = min_depth * rnorm;
+    float t_far  = max_depth * rnorm;
+    const float lo[3] = {origin.x, origin.y, origin.z};
+    const float ext = (float)(resolution - 1) * voxel_size;
+    const float oo[3] = {o.x, o.y, o.z};
+    const float dd[3] = {dir.x, dir.y, dir.z};
+    #pragma unroll
+    for (int a = 0; a < 3; ++a) {
+        const float inv = 1.0f / dd[a];
+        float t0 = (lo[a] - oo[a]) * inv;
+        float t1 = (lo[a] + ext - oo[a]) * inv;
+        if (t0 > t1) { const float tmp = t0; t0 = t1; t1 = tmp; }
+        if (isnan(t0) || isnan(t1)) {
+            if (oo[a] < lo[a] || oo[a] > lo[a] + ext) t_far = -1.0f;
+            continue;
         }
-        t += step;
+        t_near = fmaxf(t_near, t0);
+        t_far  = fminf(t_far, t1);
     }
-    
-    out_v[py * width + px] = make_float3(0,0,0);
-    out_n[py * width + px] = make_float3(0,0,0);
-    if (out_c) out_c[py * width + px] = make_uchar3(0,0,0);
+    if (!(t_near < t_far)) return;
+
+    const float min_step = 0.5f * voxel_size;
+    const float far_step = fmaxf(min_step, 0.8f * truncation);
+
+    float t_prev = t_near;
+    float f_prev = 1.0f;
+    bool prev_valid = sample_observed(voxels, resolution, voxel_size, origin,
+                                      make_float3(o.x + dir.x * t_prev, o.y + dir.y * t_prev, o.z + dir.z * t_prev),
+                                      &f_prev);
+    if (prev_valid && (!isfinite(f_prev) || f_prev < 0.0f)) return;
+
+    float t_hit = 0.0f;
+    bool found = false;
+    for (int guard = 0; guard < 8192 && t_prev < t_far; ++guard) {
+        const float step = (!prev_valid || f_prev >= 0.999f) ? far_step
+                                                             : fmaxf(min_step, 0.8f * f_prev * truncation);
+        const float t = fminf(t_prev + step, t_far);
+        float f = 1.0f;
+        const bool valid = sample_observed(voxels, resolution, voxel_size, origin,
+                                           make_float3(o.x + dir.x * t, o.y + dir.y * t, o.z + dir.z * t), &f);
+        if (valid && !isfinite(f)) return;
+        if (valid && prev_valid) {
+            if (f_prev > 0.0f && f <= 0.0f) {
+                t_hit = t_prev + (t - t_prev) * (f_prev / (f_prev - f));
+                found = true;
+                break;
+            }
+            if (f_prev < 0.0f && f >= 0.0f) return;   // exiting a back face
+        } else if (valid && f < 0.0f) {
+            return;                                    // unobserved -> inside material
+        }
+        t_prev = t;
+        f_prev = f;
+        prev_valid = valid;
+        if (t >= t_far) break;
+    }
+    if (!found) return;
+
+    const float3 hit = make_float3(o.x + dir.x * t_hit, o.y + dir.y * t_hit, o.z + dir.z * t_hit);
+    float3 n;
+    if (!normal_observed(voxels, resolution, voxel_size, origin, hit, &n)) return;
+    if (!isfinite(hit.x) || !isfinite(hit.y) || !isfinite(hit.z)) return;
+
+    uchar3 col = make_uchar3(0, 0, 0);
+    if (out_c) {
+        const float vxf = floorf((hit.x - origin.x) / voxel_size);
+        const float vyf = floorf((hit.y - origin.y) / voxel_size);
+        const float vzf = floorf((hit.z - origin.z) / voxel_size);
+        if (vxf >= 0.0f && vyf >= 0.0f && vzf >= 0.0f && vxf < (float)resolution &&
+            vyf < (float)resolution && vzf < (float)resolution) {
+            const VoxelGPU& v = voxels[((size_t)vzf * resolution + (size_t)vyf) * resolution + (size_t)vxf];
+            if (v.weight > 0.0f) {
+                if (!isfinite(v.r) || !isfinite(v.g) || !isfinite(v.b)) return;
+                col = make_uchar3((uint8_t)__float2int_rn(fminf(255.0f, fmaxf(0.0f, v.r))),
+                                  (uint8_t)__float2int_rn(fminf(255.0f, fmaxf(0.0f, v.g))),
+                                  (uint8_t)__float2int_rn(fminf(255.0f, fmaxf(0.0f, v.b))));
+            }
+        }
+    }
+    out_v[out_idx] = hit;
+    out_n[out_idx] = n;
+    if (out_c) out_c[out_idx] = col;
 }
 
 void TSDFVolume::raycastGPU(const Eigen::Matrix4f& pose,
@@ -377,6 +377,7 @@ void TSDFVolume::raycastGPU(const Eigen::Matrix4f& pose,
 
     raycastKernel<<<grid, block>>>(
         d_voxels_.get(), params_.resolution, params_.voxel_size, f_origin,
+        params_.truncation, params_.min_depth, params_.max_depth,
         fx, fy, cx, cy,
         R(0,0), R(0,1), R(0,2), t.x(),
         R(1,0), R(1,1), R(1,2), t.y(),
