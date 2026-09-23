@@ -386,6 +386,31 @@ target_link_libraries(pipeline_relocalization_contract PRIVATE azu_test_pipeline
 add_test(NAME pipeline_relocalization_contract COMMAND pipeline_relocalization_contract)
 set_tests_properties(pipeline_relocalization_contract PROPERTIES LABELS cpu TIMEOUT 180)
 
+# big-fix-two T0.4: end-to-end smoke through the REAL sensor path, with
+# libfakenect preloaded replaying a dump generated from the synthetic room.
+add_executable(make_fake_dump make_fake_dump.cpp)
+target_include_directories(make_fake_dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(make_fake_dump PRIVATE azu_test_core)
+add_executable(smoke_fakenect smoke_fakenect.cpp)
+target_link_libraries(smoke_fakenect PRIVATE azu_test_pipeline)
+find_library(AZU_FAKENECT_LIB NAMES fakenect
+    PATHS ${FREENECT_LIBRARY_DIRS} /usr/local/lib /usr/local/lib64 /usr/lib64 /usr/lib
+    PATH_SUFFIXES fakenect NO_DEFAULT_PATH)
+if(FREENECT_FOUND AND AZU_FAKENECT_LIB)
+    set(AZU_FAKE_DUMP_DIR "${CMAKE_CURRENT_BINARY_DIR}/fake_dump")
+    add_test(NAME make_fake_dump COMMAND make_fake_dump ${AZU_FAKE_DUMP_DIR} 60)
+    set_tests_properties(make_fake_dump PROPERTIES LABELS cpu FIXTURES_SETUP fake_dump TIMEOUT 60)
+    add_test(NAME smoke_fakenect COMMAND smoke_fakenect ${CMAKE_CURRENT_BINARY_DIR}/smoke_fakenect.ply)
+    set_tests_properties(smoke_fakenect PROPERTIES
+        LABELS cpu FIXTURES_REQUIRED fake_dump TIMEOUT 60 SKIP_RETURN_CODE 77
+        # Throughput thresholds: never share the CPU with other OpenMP tests.
+        RUN_SERIAL TRUE
+        ENVIRONMENT "LD_PRELOAD=${AZU_FAKENECT_LIB};FAKENECT_PATH=${AZU_FAKE_DUMP_DIR}")
+    message(STATUS "smoke_fakenect: using ${AZU_FAKENECT_LIB}")
+else()
+    message(STATUS "smoke_fakenect: libfakenect not found, test not registered")
+endif()
+
 add_executable(tsdf_integration_race_contract tsdf_integration_race_contract.cpp)
 target_compile_definitions(tsdf_integration_race_contract PRIVATE ${AZU_TEST_DEFS})
 target_link_libraries(tsdf_integration_race_contract PRIVATE azu_test_core)
