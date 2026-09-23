@@ -779,30 +779,36 @@ silent no-op on GPU. Deferred as `cross-backend:B2`.
 
 ## Sensor pairing and latest-frame semantics
 
-Canonical timestamp unit: libfreenect delivers `uint32_t` microseconds, and the
-sensor converts once — `timestamp / 1000.0` — so `RawFrame::timestamp_depth` and
-`RawFrame::timestamp_rgb` are milliseconds and nothing downstream re-scales them.
+Canonical timestamp unit (**corrected by big-fix-two T0.2**): libfreenect
+stamps each callback with the Kinect's **60 MHz hardware counter**, a `uint32_t`
+that wraps every 71.58 s. The earlier "microseconds, `/1000`" rule was wrong and
+turned the 50 ms window into 0.83 ms; with depth (2,002,155 ticks/frame) and RGB
+(2,000,287 ticks/frame) slipping phase every ~35.7 s, pairs only formed in short
+bursts and the pipeline starved — the "few frames then hangs" bug.
+`KinectSensor::kTicksPerMs = 60000`. `RawFrame::depth_ticks` / `rgb_ticks` keep
+the raw stamps; `timestamp_depth` / `timestamp_rgb` are milliseconds unwrapped
+per stream. Deltas are always `KinectSensor::tickDeltaMs(a, b)`, i.e.
+`int32_t(a - b) / kTicksPerMs`, which is correct across the wrap.
 
-Canonical temporal pairing, **fixed by big-fix Todo 23** (`sensor:S-08`): a depth
-packet and an RGB packet are paired iff both timestamps are finite AND
+Canonical temporal pairing (**big-fix-two T0.2**): depth-led nearest-neighbour.
 
-```cpp
-std::fabs(timestamp_depth - timestamp_rgb) < kMaxFrameSyncDeltaMs   // 50.0 ms
-```
+- A depth frame takes the held (newest) RGB sample when `|d| <= kMaxColorSkewMs`
+  (17 ms, half a 30 Hz period; the boundary is inclusive).
+- If the held RGB is more than 17 ms older, the depth frame waits for the next
+  RGB sample, which is then the nearer one.
+- A depth frame that finds no RGB within 17 ms is published **depth-only**
+  (`rgb_valid == false`): either when the next RGB is also too far, or when the
+  next depth frame arrives first. Geometry never waits on, and is never dropped
+  for, colour.
+- A consumed or superseded RGB buffer returns to the pool; RGB is moved into the
+  depth frame by a buffer swap, not a copy.
+- Frame ids are assigned at publication, sequential in capture order.
+- `stop()` discards held pairing state so a restart never pairs across it.
 
-The comparison is strict, so an **exactly-50 ms delta is stale** and is rejected.
-`kMaxFrameSyncDeltaMs` lives in `include/sensor/KinectSensor.h`; the threshold is
-not a magic number at the call site. uint32 microsecond wraparound (about every
-71.6 minutes of device uptime) is outside this policy: the delta is taken on the
-raw converted values, so a wrapped sample reads as stale and is dropped rather
-than mispaired.
-
-Canonical stale-pair policy (`src/sensor/KinectSensor.cpp:218-254`): a rejected
-pair publishes nothing, **consumes no frame id**, and copies no RGB. The
-older-timestamped side is recycled to the pool and the newer side is retained for
-the next sample on the stale stream, so one lagging stream degrades to a delay
-instead of a permanent stall. Depth-led and RGB-led arrival orders run through
-the same helper — the policy is symmetric, not two hand-written copies.
+Tests: `tests/kinect_pairing_contract.cpp` (policy, boundary, wrap, latest slot,
+pool) and `tests/kinect_pairing_realtrace_contract.cpp` (a real device trace in
+`tests/data/kinect_ts_trace.txt`, synthetic real-period streams across a full
+slip cycle and a wrap, and an RGB outage).
 
 Canonical latest-frame semantics, **fixed by Todo 23** (`sensor:S-09`):
 `getLatestFrame()` is a newest-wins consumer, so the ready side is a single slot
@@ -817,14 +823,14 @@ backpressured pipeline was reconstructing a frame it had already superseded.
 
 Canonical lock discipline, **fixed by Todo 23** (`sensor:S-15`,
 `src/sensor/KinectSensor.cpp:141-216`): the pairing lock covers the pending
-slots, the staleness decision, the RGB copy, the frame-id assignment and the copy
+slots, the pairing decision, the RGB buffer swap, the frame-id assignment and the copy
 of `frame_callback_`. The product callback itself is invoked **after**
 `sync_mutex_` is released, and so is the throttled synchronization log. A callback
 that observes `sync_mutex_` held can block the sibling capture stream.
 `tests/kinect_pairing_contract.cpp` asserts `syncMutexIsFreeForTests()` from
 inside every callback, which is the mechanical form of this rule.
 
-Temporal pairing is **not** spatial registration. Meeting the 50 ms window makes
+Temporal pairing is **not** spatial registration. Meeting the 17 ms window makes
 the two packets contemporaneous in time; it does not put a depth pixel and an RGB
 pixel on the same ray. The combined frame is depth-owned with the RGB blitted in
 full-frame (`sensor:S-07`), and this run records the depth-to-color registration

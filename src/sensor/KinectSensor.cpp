@@ -107,6 +107,14 @@ void KinectSensor::stop() {
     if (capture_thread_.joinable())
         capture_thread_.join();
 #endif
+    // A restart must not pair against samples from before the stop.
+    std::shared_ptr<RawFrame> rgb, depth;
+    {
+        std::lock_guard<std::mutex> lk(sync_mutex_);
+        rgb   = std::move(rgb_held_);
+        depth = std::move(depth_waiting_);
+        have_depth_ticks_ = have_rgb_ticks_ = false;
+    }
 }
 
 void KinectSensor::captureLoop() {
@@ -138,119 +146,134 @@ void KinectSensor::depthCallback(freenect_device*, void*, uint32_t) {}
 void KinectSensor::rgbCallback(freenect_device*, void*, uint32_t) {}
 #endif
 
+namespace {
+// Unwrap one stream's uint32 60 MHz counter into milliseconds. A backwards step
+// of more than half the range is a wrap; anything smaller is jitter/reordering.
+double unwrapTicksMs(uint32_t ts, uint32_t& last, uint64_t& wraps, bool& have) {
+    if (have && ts < last && (last - ts) > 0x80000000u) {
+        ++wraps;
+    }
+    last = ts;
+    have = true;
+    return static_cast<double>((wraps << 32) + ts) / KinectSensor::kTicksPerMs;
+}
+} // namespace
+
+void KinectSensor::attachRgbLocked(RawFrame& depth, RawFrame& rgb) {
+    // Swap, not memcpy: both buffers are pool-owned and equally sized, and the
+    // RGB frame goes straight back to the pool with depth's stale buffer.
+    std::swap(depth.rgb, rgb.rgb);
+    depth.rgb_ticks     = rgb.rgb_ticks;
+    depth.timestamp_rgb = rgb.timestamp_rgb;
+    depth.rgb_valid     = true;
+    depth.frame_id      = ++frame_counter_;
+}
+
+void KinectSensor::markDepthOnlyLocked(RawFrame& depth) {
+    depth.rgb_valid = false;
+    depth.frame_id  = ++frame_counter_;
+}
+
+void KinectSensor::deliver(std::shared_ptr<RawFrame> frame, FrameCallback& callback) {
+    if (++pair_log_ % 150 == 0) {
+        KFLOGF_DEBUG("Sensor", "Frame %lu published (rgb %s, depth-rgb %.2f ms)",
+                     frame->frame_id, frame->rgb_valid ? "paired" : "missing",
+                     frame->rgb_valid ? tickDeltaMs(frame->depth_ticks, frame->rgb_ticks) : 0.0);
+    }
+    if (callback) {
+        callback(std::move(frame));
+    } else {
+        publishLatest(std::move(frame));
+    }
+}
+
 void KinectSensor::onDepth(const void* data, uint32_t timestamp) {
     FrameCallback callback;
+    std::shared_ptr<RawFrame> overdue;
     std::shared_ptr<RawFrame> publish;
-    bool log_pair = false;
 
     {
         std::lock_guard<std::mutex> lk(sync_mutex_);
 
-        if (!depth_pending_) {
-            depth_pending_ = acquireFreeFrame();
-            if (!depth_pending_) return; // Pool exhausted
+        std::shared_ptr<RawFrame> frame = acquireFreeFrame();
+        if (!frame) return; // Pool exhausted: consumers are holding every buffer.
+
+        std::memcpy(frame->depth.data(), data, DEPTH_WIDTH * DEPTH_HEIGHT * 2);
+        frame->depth_ticks     = timestamp;
+        frame->timestamp_depth = unwrapTicksMs(timestamp, last_depth_ticks_, depth_wraps_,
+                                               have_depth_ticks_);
+        frame->depth_valid     = true;
+
+        // A parked depth frame that never got a closer RGB sample goes out now,
+        // depth-only, ahead of this one so ids stay in capture order.
+        if (depth_waiting_) {
+            markDepthOnlyLocked(*depth_waiting_);
+            overdue = std::move(depth_waiting_);
         }
 
-        std::memcpy(depth_pending_->depth.data(), data, DEPTH_WIDTH * DEPTH_HEIGHT * 2);
-        depth_pending_->timestamp_depth = timestamp / 1000.0;
-        depth_pending_->depth_valid = true;
-
-        publish = pairPendingLocked();
-        if (publish) {
-            callback = frame_callback_;
-            log_pair = (++pair_log_ % 150 == 0);
+        if (!rgb_held_) {
+            depth_waiting_ = std::move(frame);
+        } else {
+            const double d = tickDeltaMs(timestamp, rgb_held_->rgb_ticks);
+            if (std::fabs(d) <= kMaxColorSkewMs) {
+                attachRgbLocked(*frame, *rgb_held_);
+                rgb_held_.reset();
+                publish = std::move(frame);
+            } else if (d > 0.0) {
+                // Newest RGB is too old; the next one will be nearer.
+                depth_waiting_ = std::move(frame);
+            } else {
+                markDepthOnlyLocked(*frame);
+                publish = std::move(frame);
+            }
         }
+        if (overdue || publish) callback = frame_callback_;
     }
 
-    if (!publish) return;
-
-    // Throttled synchronization telemetry and product publication both run with
-    // sync_mutex_ released: the callback is pipeline code, and calling it under
-    // the pairing lock lets a slow consumer block the capture thread's sibling.
-    if (log_pair) {
-        KFLOGF_DEBUG("Sensor", "Frames synchronized (depth-led): ID=%lu", publish->frame_id);
-    }
-
-    if (callback) {
-        callback(std::move(publish));
-    } else {
-        publishLatest(std::move(publish));
-    }
+    // Publication runs with sync_mutex_ released: the callback is pipeline code.
+    if (overdue) deliver(std::move(overdue), callback);
+    if (publish) deliver(std::move(publish), callback);
 }
 
 void KinectSensor::onRgb(const void* data, uint32_t timestamp) {
     FrameCallback callback;
     std::shared_ptr<RawFrame> publish;
-    bool log_pair = false;
+    std::shared_ptr<RawFrame> spent;
+    std::shared_ptr<RawFrame> superseded;
 
     {
         std::lock_guard<std::mutex> lk(sync_mutex_);
 
-        if (!rgb_pending_) {
-            rgb_pending_ = acquireFreeFrame();
-            if (!rgb_pending_) return;
-        }
+        std::shared_ptr<RawFrame> frame = acquireFreeFrame();
+        if (!frame) return;
 
-        std::memcpy(rgb_pending_->rgb.data(), data, RGB_WIDTH * RGB_HEIGHT * 3);
-        rgb_pending_->timestamp_rgb = timestamp / 1000.0;
-        rgb_pending_->rgb_valid = true;
+        std::memcpy(frame->rgb.data(), data, RGB_WIDTH * RGB_HEIGHT * 3);
+        frame->rgb_ticks     = timestamp;
+        frame->timestamp_rgb = unwrapTicksMs(timestamp, last_rgb_ticks_, rgb_wraps_,
+                                             have_rgb_ticks_);
+        frame->rgb_valid     = true;
 
-        publish = pairPendingLocked();
-        if (publish) {
+        if (depth_waiting_) {
+            const double d = tickDeltaMs(depth_waiting_->depth_ticks, timestamp);
+            if (std::fabs(d) <= kMaxColorSkewMs) {
+                attachRgbLocked(*depth_waiting_, *frame);
+                spent = std::move(frame);
+            } else {
+                markDepthOnlyLocked(*depth_waiting_);
+            }
+            publish = std::move(depth_waiting_);
             callback = frame_callback_;
-            log_pair = (++pair_log_ % 150 == 0);
         }
+        // Any older held sample is now useless: this one is nearer to every
+        // future depth frame.
+        superseded = std::move(rgb_held_);
+        if (frame) rgb_held_ = std::move(frame);
     }
 
-    if (!publish) return;
-
-    if (log_pair) {
-        KFLOGF_DEBUG("Sensor", "Frames synchronized (rgb-led): ID=%lu", publish->frame_id);
-    }
-
-    if (callback) {
-        callback(std::move(publish));
-    } else {
-        publishLatest(std::move(publish));
-    }
-}
-
-std::shared_ptr<RawFrame> KinectSensor::pairPendingLocked() {
-    if (!depth_pending_ || !depth_pending_->depth_valid ||
-        !rgb_pending_ || !rgb_pending_->rgb_valid) {
-        return nullptr;
-    }
-
-    const double depth_ms = depth_pending_->timestamp_depth;
-    const double rgb_ms   = rgb_pending_->timestamp_rgb;
-
-    // A non-finite timestamp can only come from a corrupt conversion, and it
-    // compares false everywhere, so it lands in the stale branch and the
-    // non-finite side is the one dropped.
-    const bool fresh = std::isfinite(depth_ms) && std::isfinite(rgb_ms) &&
-                       std::fabs(depth_ms - rgb_ms) < kMaxFrameSyncDeltaMs;
-
-    if (!fresh) {
-        // Stale pair: nothing is published, no frame id is consumed and no RGB
-        // is copied. The older-timestamped side is recycled; the newer side is
-        // retained so the next sample on the stale stream can pair with it.
-        const bool depth_is_stale = !(depth_ms > rgb_ms);
-        if (depth_is_stale) {
-            depth_pending_.reset();
-        } else {
-            rgb_pending_.reset();
-        }
-        return nullptr;
-    }
-
-    std::memcpy(depth_pending_->rgb.data(), rgb_pending_->rgb.data(), RGB_WIDTH * RGB_HEIGHT * 3);
-    depth_pending_->timestamp_rgb = rgb_ms;
-    depth_pending_->rgb_valid = true;
-    depth_pending_->frame_id = ++frame_counter_;
-
-    std::shared_ptr<RawFrame> combined = std::move(depth_pending_);
-    rgb_pending_.reset();
-    return combined;
+    // Consumed/superseded RGB buffers recycle here, past the lock.
+    spent.reset();
+    superseded.reset();
+    if (publish) deliver(std::move(publish), callback);
 }
 
 void KinectSensor::publishLatest(std::shared_ptr<RawFrame> frame) {

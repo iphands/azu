@@ -37,9 +37,16 @@ static constexpr int RGB_HEIGHT   = 480;
 struct RawFrame {
     std::vector<uint16_t> depth;
     std::vector<uint8_t>  rgb;
+    // Milliseconds on the Kinect's own 60 MHz clock, unwrapped per stream
+    // (see kTicksPerMs). Only differences between them are meaningful.
     double timestamp_depth = 0.0;
     double timestamp_rgb   = 0.0;
+    // Raw libfreenect timestamps (60 MHz ticks, uint32, wraps every ~71.6 s).
+    uint32_t depth_ticks   = 0;
+    uint32_t rgb_ticks     = 0;
     bool   depth_valid     = false;
+    // false for a depth-only frame: no RGB sample was close enough in time.
+    // Geometry never waits on colour.
     bool   rgb_valid       = false;
     uint64_t frame_id      = 0;
 
@@ -53,18 +60,21 @@ using FrameCallback = std::function<void(std::shared_ptr<RawFrame>)>;
 
 class KinectSensor {
 public:
-    // Canonical depth/RGB sync window, in the SAME milliseconds that
-    // RawFrame::timestamp_depth / timestamp_rgb carry (libfreenect reports
-    // uint32 microseconds; onDepth()/onRgb() convert with timestamp / 1000.0 and
-    // nothing else changes the unit). A pair is accepted iff both timestamps are
-    // finite AND |timestamp_depth - timestamp_rgb| is STRICTLY below this value:
-    // an exactly-50 ms delta is stale and is rejected. See
-    // docs/CANONICAL_SEMANTICS.md ("Sensor pairing and latest-frame semantics").
-    // uint32 microsecond wraparound (every ~71.6 minutes of device uptime) is
-    // outside this policy: the delta is computed on raw converted values, so a
-    // wrapped sample looks stale and is dropped rather than mispaired. big-fix
-    // Todo 23.
-    static constexpr double kMaxFrameSyncDeltaMs = 50.0;
+    // libfreenect stamps frames with the Kinect's 60 MHz hardware counter, NOT
+    // microseconds (OpenNI2-FreenectDriver VideoStream.hpp; measured 2,002,155
+    // ticks per 33.37 ms depth frame). The uint32 counter wraps every 71.58 s, so
+    // deltas are always taken as int32_t(a - b).
+    static constexpr double kTicksPerMs = 60000.0;
+
+    // Depth-led pairing: each depth frame takes the nearest RGB sample whose
+    // |delta| <= this (half a 30 Hz frame period), else it is published
+    // depth-only with rgb_valid == false. See docs/CANONICAL_SEMANTICS.md.
+    static constexpr double kMaxColorSkewMs = 17.0;
+
+    // Signed depth - rgb delta in ms, correct across a counter wrap.
+    static double tickDeltaMs(uint32_t depth_ticks, uint32_t rgb_ticks) {
+        return static_cast<int32_t>(depth_ticks - rgb_ticks) / kTicksPerMs;
+    }
 
     KinectSensor();
     ~KinectSensor();
@@ -107,10 +117,20 @@ private:
     };
     std::shared_ptr<PoolState> pool_state_;
     
-    // Pairing state
+    // Pairing state (guarded by sync_mutex_). rgb_held_ is the newest RGB
+    // sample not yet consumed; depth_waiting_ is a depth frame whose newest RGB
+    // was too old, parked until the next RGB arrives (or the next depth frame
+    // flushes it depth-only).
     std::mutex              sync_mutex_;
-    std::shared_ptr<RawFrame> depth_pending_;
-    std::shared_ptr<RawFrame> rgb_pending_;
+    std::shared_ptr<RawFrame> rgb_held_;
+    std::shared_ptr<RawFrame> depth_waiting_;
+    // Per-stream unwrap state for RawFrame::timestamp_* (60 MHz tick counters).
+    uint32_t last_depth_ticks_ = 0;
+    uint32_t last_rgb_ticks_   = 0;
+    uint64_t depth_wraps_      = 0;
+    uint64_t rgb_wraps_        = 0;
+    bool     have_depth_ticks_ = false;
+    bool     have_rgb_ticks_   = false;
 
     uint64_t frame_counter_ = 0;
     uint64_t pair_log_      = 0;
@@ -129,11 +149,14 @@ private:
     void onDepth(const void* data, uint32_t timestamp);
     void onRgb(const void* data, uint32_t timestamp);
 
-    // Pair depth_pending_ with rgb_pending_ under sync_mutex_. Returns the
-    // combined depth-owned frame (both pendings consumed, id assigned) when the
-    // pair is inside kMaxFrameSyncDeltaMs, else nullptr with the stale side
-    // dropped and the newer side retained. Caller publishes outside the lock.
-    std::shared_ptr<RawFrame> pairPendingLocked();
+    // Move the RGB sample `rgb` into depth frame `depth` (buffer swap, no copy),
+    // stamp it, and assign the next frame id. Caller holds sync_mutex_.
+    void attachRgbLocked(RawFrame& depth, RawFrame& rgb);
+    // Assign the next frame id to a depth-only frame. Caller holds sync_mutex_.
+    void markDepthOnlyLocked(RawFrame& depth);
+
+    // Deliver a finished frame outside sync_mutex_ (callback, else latest slot).
+    void deliver(std::shared_ptr<RawFrame> frame, FrameCallback& callback);
 
     // Install `frame` as the single ready frame, dropping whatever it replaces.
     // The displaced frame is destructed outside pool_state_->mutex: its pooled

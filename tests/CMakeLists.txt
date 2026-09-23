@@ -570,6 +570,15 @@ target_link_libraries(kinect_pairing_contract PRIVATE azu_test_core)
 add_test(NAME kinect_pairing_contract COMMAND kinect_pairing_contract)
 set_tests_properties(kinect_pairing_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# Regression for the c311c69 hang: real-device timestamp trace plus synthetic
+# 60 MHz streams across a full depth/RGB phase-slip cycle and a counter wrap.
+add_executable(kinect_pairing_realtrace_contract kinect_pairing_realtrace_contract.cpp)
+target_compile_definitions(kinect_pairing_realtrace_contract PRIVATE ${AZU_TEST_DEFS}
+    AZU_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_link_libraries(kinect_pairing_realtrace_contract PRIVATE azu_test_core)
+add_test(NAME kinect_pairing_realtrace_contract COMMAND kinect_pairing_realtrace_contract)
+set_tests_properties(kinect_pairing_realtrace_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 add_test(NAME glb_linear_color_contract COMMAND glb_linear_color_contract)
 set_tests_properties(glb_linear_color_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
