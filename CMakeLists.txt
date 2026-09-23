@@ -152,6 +152,8 @@ file(GLOB_RECURSE MESHING_SOURCES   CONFIGURE_DEPENDS "src/meshing/*.cpp")
 file(GLOB_RECURSE RENDERING_SOURCES CONFIGURE_DEPENDS "src/rendering/*.cpp")
 file(GLOB_RECURSE EXPORT_SOURCES    CONFIGURE_DEPENDS "src/export/*.cpp")
 file(GLOB_RECURSE GUI_SOURCES       CONFIGURE_DEPENDS "src/gui/*.cpp")
+# The fusion UI model (presets, validation) is Qt-free and used by the tools too.
+list(REMOVE_ITEM GUI_SOURCES "${CMAKE_SOURCE_DIR}/src/gui/FusionUiModel.cpp")
 file(GLOB_RECURSE APP_SOURCES       CONFIGURE_DEPENDS "src/app/*.cpp")
 file(GLOB_RECURSE UTILS_SOURCES     CONFIGURE_DEPENDS "src/utils/*.cpp")
 file(GLOB_RECURSE HEADERS           CONFIGURE_DEPENDS "include/*.h")
@@ -167,6 +169,7 @@ set(CORE_SOURCES
     ${EXPORT_SOURCES}
     ${APP_SOURCES}
     ${UTILS_SOURCES}
+    src/gui/FusionUiModel.cpp
 )
 
 if(CUDA_AVAILABLE)

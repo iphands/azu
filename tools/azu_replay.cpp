@@ -18,12 +18,15 @@
 // last frame registered against a model fused from only the first frames).
 //
 // usage: azu_replay <recording_dir> [--out DIR] [--backend auto|cpu|cuda]
+//                   [--preset helmet|chair|room|human]
 //                   [--volume front|centred] [--res N] [--voxel M]
 //                   [--min-depth M] [--max-depth M] [--max-frames N] [--quiet]
 #include "app/PipelineController.h"
+#include "gui/FusionUiModel.h"
 #include "sensor/FrameData.h"
 #include "sensor/KinectSensor.h"
 #include "tracking/ICPTracker.h"
+#include "tracking/TrackingPolicy.h"
 #include "tsdf/TSDFVolume.h"
 
 #include <Eigen/Geometry>
@@ -49,10 +52,11 @@ constexpr double kCountsPerG = 819.0;   // Kinect v1 accelerometer (libfreenect)
 constexpr double kGravity    = 9.80665;
 
 struct Options {
-    std::string dir, out = "replay-out", backend = "auto", volume = "front";
+    std::string dir, out = "replay-out", backend = "auto", volume = "front", preset;
     int res = 0, max_frames = 0;
     float voxel = 0.0f, min_depth = 0.0f, max_depth = 0.0f;
     bool quiet = false;
+    bool volume_set = false;
 };
 
 bool parseArgs(int argc, char** argv, Options& o) {
@@ -67,7 +71,8 @@ bool parseArgs(int argc, char** argv, Options& o) {
         };
         if (a == "--out") o.out = next("--out");
         else if (a == "--backend") o.backend = next("--backend");
-        else if (a == "--volume") o.volume = next("--volume");
+        else if (a == "--volume") { o.volume = next("--volume"); o.volume_set = true; }
+        else if (a == "--preset") o.preset = next("--preset");
         else if (a == "--res") o.res = std::atoi(next("--res"));
         else if (a == "--voxel") o.voxel = std::strtof(next("--voxel"), nullptr);
         else if (a == "--min-depth") o.min_depth = std::strtof(next("--min-depth"), nullptr);
@@ -124,6 +129,7 @@ int main(int argc, char** argv) {
     if (!parseArgs(argc, argv, opt)) {
         std::fprintf(stderr,
                      "usage: azu_replay <recording_dir> [--out DIR] [--backend auto|cpu|cuda]\n"
+                     "                  [--preset helmet|chair|room|human]\n"
                      "                  [--volume front|centred] [--res N] [--voxel M]\n"
                      "                  [--min-depth M] [--max-depth M] [--max-frames N] [--quiet]\n");
         return 2;
@@ -140,15 +146,40 @@ int main(int argc, char** argv) {
     const sensor::PreprocessBackend backend = sensor::parseBackendName(opt.backend);
     app::PipelineController pc(backend);
     app::FusionHyperparams hp = pc.hyperparamsSnapshot();
+    // --preset applies the GUI preset (volume placement included); --volume,
+    // --res, --voxel and the depth band then override it only when given.
+    bool placed_by_preset = false;
+    if (!opt.preset.empty()) {
+        const std::pair<const char*, gui::FusionPreset> names[] = {
+            {"helmet", gui::FusionPreset::kHelmet}, {"chair", gui::FusionPreset::kChair},
+            {"room", gui::FusionPreset::kRoom}, {"human", gui::FusionPreset::kHuman}};
+        bool found = false;
+        for (const auto& n : names) {
+            if (opt.preset == n.first) {
+                hp = gui::applyFusionPreset(hp, n.second);
+                found = placed_by_preset = true;
+            }
+        }
+        if (!found) {
+            std::fprintf(stderr, "unknown --preset %s (helmet|chair|room|human)\n", opt.preset.c_str());
+            return 2;
+        }
+    }
     if (opt.min_depth > 0.0f) hp.min_depth = opt.min_depth;
     if (opt.max_depth > 0.0f) hp.max_depth = opt.max_depth;
     if (opt.res > 0) hp.tsdf.resolution = opt.res;
     if (opt.voxel > 0.0f) hp.tsdf.voxel_size = opt.voxel;
     const float extent = hp.tsdf.voxel_size * static_cast<float>(hp.tsdf.resolution);
-    if (opt.volume == "centred") {
-        hp.tsdf.origin = Eigen::Vector3f::Constant(-0.5f * extent);
-    } else {
-        hp.tsdf.origin = Eigen::Vector3f(-0.5f * extent, -0.5f * extent, 0.0f);
+    const bool volume_given = opt.volume_set || opt.res > 0 || opt.voxel > 0.0f;
+    if (!placed_by_preset || volume_given) {
+        if (opt.volume == "centred") {
+            hp.tsdf.origin = Eigen::Vector3f::Constant(-0.5f * extent);
+        } else {
+            hp.tsdf.origin = Eigen::Vector3f(-0.5f * extent, -0.5f * extent, 0.0f);
+        }
+    }
+    if (placed_by_preset && !volume_given) {
+        opt.volume = hp.tsdf.origin.z() < 0.0f ? "centred" : "front";
     }
     pc.setHyperparams(hp);
     pc.setTracePath(opt.out + "/trace.csv");
@@ -350,10 +381,21 @@ int main(int argc, char** argv) {
     sensor::buildFramePyramid(fd, pyr);
     tracking::ICPTracker icp;
     const tracking::ICPResult loop = icp.track(pyr, model, end_pose, model.pose);
-    const Eigen::Matrix4f corr = end_pose.inverse() * loop.pose;
+    // Only the observable part of the correction: facing bare walls, the solve's
+    // answer along unobservable directions is arbitrary (same projection the
+    // tracker applies every frame).
+    const tracking::ObservableMotion loop_obs =
+        tracking::keepObservableMotion(end_pose, loop.pose, loop.information);
+    const Eigen::Matrix4f corr = end_pose.inverse() * loop_obs.pose;
     const double loop_t = corr.block<3,1>(0,3).norm();
     const double loop_r = Eigen::AngleAxisd(corr.block<3,3>(0,0).cast<double>()).angle() * 180.0 / M_PI;
     const bool loop_valid = loop.inliers > 5000 && loop.pose.allFinite();
+    // Where the camera ended relative to where it started (world = first
+    // camera). For a spin that returns to the starting view this is drift plus
+    // however far the person was from the exact start; for a synthetic spin
+    // it is the drift.
+    const double end_t = end_pose.block<3,1>(0,3).norm();
+    const double end_r = Eigen::AngleAxisd(end_pose.block<3,3>(0,0).cast<double>()).angle() * 180.0 / M_PI;
 
     const double yaw_deg = yaw_total * 180.0 / M_PI;
     std::printf("\nframes %zu (%.1f s, %.1f fps): good %d, poor %d, failed %d, lost frames %d "
@@ -363,9 +405,11 @@ int main(int argc, char** argv) {
     std::printf("yaw tracked about gravity: %.1f deg\n", yaw_deg);
     std::printf("tilt vs accelerometer: mean %.2f deg, max %.2f deg (axis signs %+.0f %+.0f %+.0f)\n",
                 tilt_n ? tilt_sum / tilt_n : 0.0, tilt_max, best_sign.x(), best_sign.y(), best_sign.z());
-    std::printf("loop closure (last frame vs first-%zu-frame model): %s %.1f mm / %.2f deg "
-                "(inliers %d)\n",
-                first_depth.size(), loop_valid ? "" : "[UNRELIABLE]", loop_t * 1e3, loop_r, loop.inliers);
+    std::printf("loop closure (last frame vs first-%zu-frame model): %s%.1f mm / %.2f deg "
+                "(inliers %d, %d unobservable dofs ignored)\n",
+                first_depth.size(), loop_valid ? "" : "[UNRELIABLE] ", loop_t * 1e3, loop_r, loop.inliers,
+                loop_obs.degenerate_dofs);
+    std::printf("end pose vs start pose: %.1f mm / %.2f deg\n", end_t * 1e3, end_r);
     std::printf("outputs: %s/{trace.csv,frames.csv,summary.json%s}\n", opt.out.c_str(),
                 mesh_ok ? ",mesh.ply" : "");
 
@@ -373,6 +417,7 @@ int main(int argc, char** argv) {
     js << "{\n"
        << "  \"recording\": \"" << opt.dir << "\",\n"
        << "  \"backend\": \"" << backend_label << "\",\n"
+       << "  \"preset\": \"" << opt.preset << "\",\n"
        << "  \"volume\": \"" << opt.volume << "\", \"resolution\": " << hp.tsdf.resolution
        << ", \"voxel_size\": " << hp.tsdf.voxel_size << ",\n"
        << "  \"frames\": " << records.size() << ", \"good\": " << good << ", \"poor\": " << poor
@@ -384,6 +429,8 @@ int main(int argc, char** argv) {
        << ",\n"
        << "  \"loop_trans_mm\": " << loop_t * 1e3 << ", \"loop_rot_deg\": " << loop_r
        << ", \"loop_inliers\": " << loop.inliers << ", \"loop_reliable\": " << (loop_valid ? "true" : "false")
+       << ", \"loop_unobservable_dofs\": " << loop_obs.degenerate_dofs << ",\n"
+       << "  \"end_vs_start_mm\": " << end_t * 1e3 << ", \"end_vs_start_deg\": " << end_r
        << "\n}\n";
     return 0;
 }
