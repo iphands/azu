@@ -1322,13 +1322,13 @@ void PipelineController::integrationLoopBody() {
     }
 
     {
+      // O(1) counter maintained by CPU integration (the full-volume scan cost
+      // 15 ms at 256^3 and 173 ms at 512^3 here, under metrics_mutex_, which the
+      // sensor callback also takes). The GPU volume is not counted yet.
+      const float usage_pct = use_gpu_.load() ? 0.0f : tsdf_->observedFraction() * 100.0f;
       std::lock_guard<std::mutex> lk(metrics_mutex_);
       metrics_.integrated_frames = integrated_count;
-      // GPU path: usageFraction() iterates 2M CPU voxels that are stale/empty
-      // when the volume lives on the GPU. Skip this expensive CPU loop.
-      if (!use_gpu_.load()) {
-          metrics_.volume_usage_pct = tsdf_->usageFraction() * 100.0f;
-      }
+      metrics_.volume_usage_pct  = usage_pct;
     }
 
     if (integrated_count % 50 == 0 && integrated_count > 0) {

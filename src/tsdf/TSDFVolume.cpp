@@ -118,6 +118,7 @@ void TSDFVolume::unlocked_reset() {
     std::fill(voxels_.begin(), voxels_.end(),
               Voxel{EMPTY_TSDF, EMPTY_WEIGHT, EMPTY_COLOR, EMPTY_COLOR, EMPTY_COLOR});
     integrated_frames_.store(0);
+    observed_voxels_.store(0);
 }
 
 void TSDFVolume::setParams(const TSDFParams& p) {
@@ -277,7 +278,8 @@ void TSDFVolume::integrateCPU(const float*           depth_meters,
     const Eigen::Vector3f step_x = R_wc.col(0) * vs;
     const float color_band = 0.5f * trunc;
 
-    #pragma omp parallel for collapse(2) schedule(dynamic, 16)
+    int64_t newly_observed = 0;   // integer reduction: deterministic
+    #pragma omp parallel for collapse(2) schedule(dynamic, 16) reduction(+:newly_observed)
     for (int z = z0; z <= z1; ++z) {
         for (int y = y0; y <= y1; ++y) {
             RowStats rs;
@@ -299,6 +301,7 @@ void TSDFVolume::integrateCPU(const float*           depth_meters,
 
                 Voxel& vox = voxels_[idx(x, y, z)];
                 const float w_old = vox.weight;
+                newly_observed += (w_old == 0.0f) ? 1 : 0;
                 vox.tsdf   = (vox.tsdf * w_old + tsdf_new) / (w_old + 1.0f);
                 vox.weight = std::min(w_old + 1.0f, max_w);
 
@@ -324,6 +327,8 @@ void TSDFVolume::integrateCPU(const float*           depth_meters,
             if (logging) row_stats[static_cast<size_t>((z - z0) * ny + (y - y0))] = rs;
         }
     }
+
+    observed_voxels_.fetch_add(newly_observed, std::memory_order_relaxed);
 
     if (logging) {
         for (int i = 0; i < width * height; ++i) {

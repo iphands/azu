@@ -11,6 +11,8 @@
 //   B  weight counts frames: after N identical frames every observed voxel has
 //      weight min(N, max_weight)
 //   C  byte-identical volume for OpenMP thread counts 1, 4 and 16
+// and the O(1) observedFraction() counter agrees with the full-scan
+// usageFraction() after integration.
 #include "meshing/MarchingCubes.h"
 #include "meshing/MeshData.h"
 #include "sensor/FrameData.h"
@@ -122,6 +124,8 @@ void sectionWeights() {
             ++observed;
             if (v.weight != want) ++wrong;
         }
+        CHECK(std::fabs(vol.observedFraction() - vol.usageFraction()) < 1e-9f,
+              "B: O(1) observedFraction() equals the full-scan usageFraction()");
         CHECK(observed > 0 && wrong == 0,
               "B: after " + std::to_string(n) + " frames every observed voxel has weight " +
                   std::to_string(want) + " (" + std::to_string(wrong) + " of " +

@@ -117,8 +117,15 @@ public:
     const Voxel& voxelAt(int x, int y, int z) const;
     Voxel&       voxelAt(int x, int y, int z);
 
-    // Volume usage: fraction of voxels with weight > 0
+    // Volume usage: fraction of voxels with weight > 0. Exact full scan, O(volume):
+    // tests and offline use only, never per frame.
     float usageFraction() const;
+    // O(1) fraction of voxels first observed by integrate() (CPU path) since the
+    // last reset. Voxels written directly through voxelAt() are not counted.
+    float observedFraction() const {
+        return static_cast<float>(observed_voxels_.load(std::memory_order_relaxed)) /
+               static_cast<float>(voxels_.size());
+    }
 
     // integrated frame count
     int integratedFrames() const { return integrated_frames_.load(); }
@@ -213,6 +220,7 @@ private:
     TSDFParams           params_;
     std::vector<Voxel>   voxels_;
     std::atomic<int>     integrated_frames_{0};
+    std::atomic<int64_t> observed_voxels_{0};
     Stats                stats_;
     int                  stats_frame_{0};
     mutable std::shared_mutex mutex_;
