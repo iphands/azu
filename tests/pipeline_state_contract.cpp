@@ -161,7 +161,10 @@ int main() {
           }),
           "session 2 produced its first prediction");
     {
-        const auto m = controller.lastMotionModelForTests();
+        // The FIRST prediction of the session, not the latest: with working
+        // tracking a second prediction can land before this check, and its
+        // delta is real motion, not a jump across the restart.
+        const auto m = controller.firstMotionModelOfSessionForTests();
         CHECK(m.valid, "motion observation is valid");
         CHECK(isIdentity(m.last_pose_before),
               "the FIRST prediction of the new session saw a cleared motion "

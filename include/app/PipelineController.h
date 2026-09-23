@@ -450,6 +450,8 @@ public:
         bool            valid = false;
     };
     MotionModelObservation lastMotionModelForTests();
+    /** The first prediction recorded since the latest start() (invalid if none). */
+    MotionModelObservation firstMotionModelOfSessionForTests();
     /** frame_id of the last RawFrame the tracking worker popped off the queue. */
     uint64_t lastPoppedFrameIdForTests();
     Eigen::Matrix4f lastPoseForTests();
@@ -502,6 +504,7 @@ private:
         int applied_threads  = 0;
         int applied_sr_scale = 0;
         MotionModelObservation motion;
+        MotionModelObservation first_motion_of_session;
         uint64_t last_popped_frame_id = 0;
         uint64_t mesh_extractions = 0;
         uint64_t mesh_publishes = 0;

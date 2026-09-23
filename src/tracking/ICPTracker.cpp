@@ -150,11 +150,7 @@ bool ICPTracker::buildLinearSystem(const sensor::FrameData& live,
     const Eigen::Matrix3f R_cw = pose.block<3,3>(0,0);
     const Eigen::Vector3f t_cw = pose.block<3,1>(0,3);
 
-    // Reference Camera (Model) to World
-    const Eigen::Matrix3f R_ref = ref_pose.block<3,3>(0,0);
-    const Eigen::Vector3f t_ref = ref_pose.block<3,1>(0,3);
-
-    // World to Reference Camera
+    // World to Reference Camera (the pose the model image was raycast at)
     const Eigen::Matrix4f ref_inv = ref_pose.inverse();
     const Eigen::Matrix3f R_rc = ref_inv.block<3,3>(0,0);
     const Eigen::Vector3f t_rc = ref_inv.block<3,1>(0,3);
@@ -162,7 +158,6 @@ bool ICPTracker::buildLinearSystem(const sensor::FrameData& live,
     // Relative transform: Live Cam -> World -> Ref Cam
     const Eigen::Matrix3f R_rel = R_rc * R_cw;
     const Eigen::Vector3f t_rel = R_rc * t_cw + t_rc;
-    const Eigen::Matrix3f R_rel_T = R_rel.transpose();
 
     int num_threads = num_threads_.load();
     if (num_threads <= 0) {

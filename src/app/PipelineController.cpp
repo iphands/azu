@@ -203,6 +203,7 @@ bool PipelineController::startInternal(bool engage_sensor) {
     {
         std::lock_guard<std::mutex> obs_lk(seam_obs_.mtx);
         seam_obs_.applied_sr_scale = preprocessor_ ? start_sr_scale : 0;
+        seam_obs_.first_motion_of_session = MotionModelObservation{};
     }
 #endif
 
@@ -525,6 +526,8 @@ void PipelineController::reset() {
             auto& mf = *model_buffers_.buffers[i];
             std::fill(mf.vertices.begin(), mf.vertices.end(), Eigen::Vector3f::Zero());
             std::fill(mf.normals.begin(), mf.normals.end(), Eigen::Vector3f::Zero());
+            mf.pose = Eigen::Matrix4f::Identity();
+            mf.source_frame_id = 0;
         }
         model_buffers_.front_idx.store(0);
         model_buffers_.back_idx.store(1);
@@ -868,7 +871,7 @@ void PipelineController::trackingLoopBody() {
     // several calls without a self-deadlock.
     auto solve_cpu = [&](const sensor::FramePyramid& pyramid,
                          const Eigen::Matrix4f& estimate) -> tracking::ICPResult {
-        return tracker_->track(pyramid, *model_ref, estimate, prev_pose);
+        return tracker_->track(pyramid, *model_ref, estimate, model_ref->pose);
     };
     auto solve_gpu = [&](const Eigen::Matrix4f& estimate) -> tracking::ICPResult {
         tracking::ICPResult res;
@@ -877,14 +880,14 @@ void PipelineController::trackingLoopBody() {
             preprocessor_->getGPUDepthMeters(),
             preprocessor_->getGPURgb(),
             frame->width, frame->height,
-            *model_ref, estimate, prev_pose
+            *model_ref, estimate, model_ref->pose
         );
 #elif defined(HIP_ENABLED)
         res = tracker_->trackGPU(
             preprocessor_->getGPUDepthMeters(),
             preprocessor_->getGPURgb(),
             frame->width, frame->height,
-            *model_ref, estimate, prev_pose
+            *model_ref, estimate, model_ref->pose
         );
 #else
         (void)estimate;
@@ -1310,6 +1313,9 @@ void PipelineController::integrationLoopBody() {
 #else
       emitCpuPreview();  // KIN-FORK(cpu-preview): was `goto cpu_raycast` + label
 #endif
+      // The pose the model image was raycast at: ICP's reference pose.
+      model_back.pose            = frame->pose;
+      model_back.source_frame_id = frame->frame_id;
       model_buffers_.swap();
       // Signal trackingLoop that at least one valid model frame exists.
       model_ready_.store(true);
@@ -1685,6 +1691,13 @@ void PipelineController::recordMotionModelForTests(
   m.predicted_pose  = predicted;
   m.last_pose_before = last_pose_before;
   m.valid           = true;
+  if (!seam_obs_.first_motion_of_session.valid) seam_obs_.first_motion_of_session = m;
+}
+
+PipelineController::MotionModelObservation
+PipelineController::firstMotionModelOfSessionForTests() {
+  std::lock_guard<std::mutex> lk(seam_obs_.mtx);
+  return seam_obs_.first_motion_of_session;
 }
 
 PipelineController::MotionModelObservation

@@ -59,6 +59,13 @@ struct ModelFrame {
     int width  = sensor::FRAME_W;
     int height = sensor::FRAME_H;
 
+    // World-from-camera pose this model image was raycast at. ICP must use it as
+    // the reference pose: the model lags the live camera by at least one
+    // integrated frame, and projecting live points with any other pose looks
+    // them up at the wrong model pixels.
+    Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
+    uint64_t        source_frame_id = 0;
+
     ModelFrame() {
         vertices.assign(width * height, Eigen::Vector3f::Zero());
         normals.assign(width * height, Eigen::Vector3f::Zero());

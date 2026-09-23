@@ -345,6 +345,15 @@ target_link_libraries(raycast_accuracy_contract PRIVATE azu_test_core)
 add_test(NAME raycast_accuracy_contract COMMAND raycast_accuracy_contract)
 set_tests_properties(raycast_accuracy_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# big-fix-two T0.11: ICP projects into the model image with the pose the model
+# was raycast at (ModelFrame::pose), not the latest tracked pose.
+add_executable(icp_refpose_contract icp_refpose_contract.cpp)
+target_compile_definitions(icp_refpose_contract PRIVATE ${AZU_TEST_DEFS})
+target_include_directories(icp_refpose_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(icp_refpose_contract PRIVATE azu_test_core)
+add_test(NAME icp_refpose_contract COMMAND icp_refpose_contract)
+set_tests_properties(icp_refpose_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 add_executable(tsdf_integration_race_contract tsdf_integration_race_contract.cpp)
 target_compile_definitions(tsdf_integration_race_contract PRIVATE ${AZU_TEST_DEFS})
 target_link_libraries(tsdf_integration_race_contract PRIVATE azu_test_core)
