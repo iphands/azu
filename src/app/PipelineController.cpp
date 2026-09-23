@@ -45,7 +45,11 @@ PipelineController::PipelineController(sensor::PreprocessBackend preferred_backe
     }
 }
 
-PipelineController::~PipelineController() { stop(); }
+PipelineController::~PipelineController() {
+    stop();
+    std::lock_guard<std::mutex> ctrl_lk(control_mutex_);
+    releaseGpuResources();
+}
 
 bool PipelineController::start() {
     return startInternal(true);
@@ -118,32 +122,30 @@ bool PipelineController::startInternal(bool engage_sensor) {
         KFLOG_INFO("Pipeline", "Using CPU-only path (User explicitly requested or incompatible backend).");
     } else {
         try {
+            // initGPU() is idempotent; it re-allocates only after freeGPU()
+            // (reset or a volume-resolution change).
             tsdf_->initGPU();
-            tracker_->initGPU();
-            cudaError_t stream_err = cudaStreamCreate(&cuda_stream_);
-            if (stream_err != cudaSuccess) {
-                throw std::runtime_error(cudaGetErrorString(stream_err));
-            }
-            for (int i = 0; i < 3; ++i) {
-                model_buffers_.buffers[i]->d_vertices = utils::make_cuda_unique<float3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
-                model_buffers_.buffers[i]->d_normals = utils::make_cuda_unique<float3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
-                model_buffers_.buffers[i]->d_colors = utils::make_cuda_unique<uchar3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
+            if (!gpu_resources_ready_) {
+                tracker_->initGPU();
+                cudaError_t stream_err = cudaStreamCreate(&cuda_stream_);
+                if (stream_err != cudaSuccess) {
+                    throw std::runtime_error(cudaGetErrorString(stream_err));
+                }
+                for (int i = 0; i < 3; ++i) {
+                    model_buffers_.buffers[i]->d_vertices = utils::make_cuda_unique<float3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
+                    model_buffers_.buffers[i]->d_normals = utils::make_cuda_unique<float3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
+                    model_buffers_.buffers[i]->d_colors = utils::make_cuda_unique<uchar3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
+                }
+                gpu_resources_ready_ = true;
             }
             use_gpu_ = true;
             tsdf_->setGPUEnabled(true);
             KFLOG_INFO("Pipeline", "CUDA hardware acceleration ENABLED (NVIDIA GPU detected).");
         } catch (const std::exception& e) {
-            if (cuda_stream_) {
-                cudaStreamDestroy(cuda_stream_);
-                cuda_stream_ = nullptr;
-            }
+            releaseGpuResources();
             use_gpu_ = false;
             tsdf_->setGPUEnabled(false);
-            if (preferred_backend_ == sensor::PreprocessBackend::CUDA) {
-                KFLOGF_WARN("Pipeline", "CUDA initialization FAILED: %s. Falling back to CPU mode.", e.what());
-            } else {
-                KFLOGF_WARN("Pipeline", "CUDA initialization FAILED: %s. Falling back to CPU mode.", e.what());
-            }
+            KFLOGF_WARN("Pipeline", "CUDA initialization FAILED: %s. Falling back to CPU mode.", e.what());
         }
     }
 #elif defined(HIP_ENABLED)
@@ -153,25 +155,27 @@ bool PipelineController::startInternal(bool engage_sensor) {
         KFLOG_INFO("Pipeline", "Using CPU-only path (User explicitly requested or incompatible backend).");
     } else {
         try {
+            // initGPU() is idempotent; it re-allocates only after freeGPU()
+            // (reset or a volume-resolution change).
             tsdf_->initGPU();
-            tracker_->initGPU();
-            hipError_t stream_err = hipStreamCreate(&cuda_stream_);
-            if (stream_err != hipSuccess) {
-                throw std::runtime_error(hipGetErrorString(stream_err));
-            }
-            for (int i = 0; i < 3; ++i) {
-                model_buffers_.buffers[i]->d_vertices = utils::make_hip_unique<float3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
-                model_buffers_.buffers[i]->d_normals = utils::make_hip_unique<float3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
-                model_buffers_.buffers[i]->d_colors = utils::make_hip_unique<uchar3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
+            if (!gpu_resources_ready_) {
+                tracker_->initGPU();
+                hipError_t stream_err = hipStreamCreate(&cuda_stream_);
+                if (stream_err != hipSuccess) {
+                    throw std::runtime_error(hipGetErrorString(stream_err));
+                }
+                for (int i = 0; i < 3; ++i) {
+                    model_buffers_.buffers[i]->d_vertices = utils::make_hip_unique<float3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
+                    model_buffers_.buffers[i]->d_normals = utils::make_hip_unique<float3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
+                    model_buffers_.buffers[i]->d_colors = utils::make_hip_unique<uchar3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
+                }
+                gpu_resources_ready_ = true;
             }
             use_gpu_ = true;
             tsdf_->setGPUEnabled(true);
             KFLOG_INFO("Pipeline", "HIP/ROCm hardware acceleration ENABLED (AMD iGPU detected).");
         } catch (const std::exception& e) {
-            if (cuda_stream_) {
-                (void)hipStreamDestroy(cuda_stream_);
-                cuda_stream_ = nullptr;
-            }
+            releaseGpuResources();
             use_gpu_ = false;
             tsdf_->setGPUEnabled(false);
             KFLOGF_WARN("Pipeline", "HIP initialization FAILED: %s. Falling back to CPU mode.", e.what());
@@ -444,49 +448,35 @@ void PipelineController::stop() {
 
 #ifdef CUDA_ENABLED
   if (use_gpu_.load()) {
-      cudaDeviceSynchronize();
+      (void)cudaDeviceSynchronize();
   }
 #elif defined(HIP_ENABLED)
   if (use_gpu_.load()) {
       (void)hipDeviceSynchronize();
   }
 #endif
+  // No stop-time full-volume point-cloud extraction: it cost O(volume) on the
+  // caller's thread, delivered the frame callback synchronously (GL off the GUI
+  // thread when stop() came from a worker), and on CUDA its cudaMalloc could
+  // throw out of stop() and abort the process. The last published mesh and
+  // preview stay on screen; GPU resources stay allocated so a stopped scan can
+  // still be meshed, exported, or resumed.
+  KFLOG_INFO("Pipeline", "Pipeline shutdown complete.");
+}
 
-  // FINAL EXTRACTION: Collect all voxels for a "Full Model" point cloud view
-  KFLOG_INFO("Pipeline", "Extracting full model point cloud for final view...");
-  auto global_frame = std::make_shared<sensor::FrameData>();
-  {
-    std::shared_lock<std::shared_mutex> tsdf_lk(tsdf_mutex_);
-    tsdf_->extractGlobalPointCloud(global_frame->vertices, global_frame->rgb);
-  }
-  global_frame->width = 1;
-  global_frame->height = static_cast<int>(global_frame->vertices.size());
-  global_frame->depth_meters.assign(global_frame->height, 1.0f);
-  global_frame->pose = Eigen::Matrix4f::Identity();
-
-  // Copy, then invoke outside callback_mutex_: the final-view subscriber is
-  // arbitrary UI code and may legitimately call back into the controller.
-  if (FrameReadyCallback on_frame = frameReadyCallbackCopy()) {
-    on_frame(*global_frame);
-  }
-
+void PipelineController::releaseGpuResources() noexcept {
 #ifdef CUDA_ENABLED
     if (cuda_stream_) {
-        cudaStreamDestroy(cuda_stream_);
+        (void)cudaStreamDestroy(cuda_stream_);
         cuda_stream_ = nullptr;
-    }
-    tsdf_->freeGPU();
-    tracker_->freeGPU();
-    for (int i = 0; i < 3; ++i) {
-        model_buffers_.buffers[i]->d_vertices.reset();
-        model_buffers_.buffers[i]->d_normals.reset();
-        model_buffers_.buffers[i]->d_colors.reset();
     }
 #elif defined(HIP_ENABLED)
     if (cuda_stream_) {
         (void)hipStreamDestroy(cuda_stream_);
         cuda_stream_ = nullptr;
     }
+#endif
+#if defined(CUDA_ENABLED) || defined(HIP_ENABLED)
     tsdf_->freeGPU();
     tracker_->freeGPU();
     for (int i = 0; i < 3; ++i) {
@@ -495,7 +485,13 @@ void PipelineController::stop() {
         model_buffers_.buffers[i]->d_colors.reset();
     }
 #endif
-  KFLOG_INFO("Pipeline", "Pipeline shutdown complete.");
+    gpu_resources_ready_ = false;
+}
+
+void PipelineController::onWorkerFault(const char* worker, const char* what) noexcept {
+    KFLOGF_ERROR("Pipeline", "%s worker FAILED: %s. Pipeline halted; press Stop, then Reset.",
+                 worker, what);
+    state_.store(PipelineState::Error);
 }
 
 void PipelineController::reset() {
@@ -506,6 +502,9 @@ void PipelineController::reset() {
     // control is ever needed, merge stop() body inline here under one lock.
     stop();
     std::lock_guard<std::mutex> ctrl_lk(control_mutex_);
+    // The GPU volume is the scan on GPU builds; reset discards it. start()
+    // re-allocates and uploads the cleared CPU volume.
+    releaseGpuResources();
 
     // Clear queues
     {
@@ -727,6 +726,16 @@ void PipelineController::enqueueForIntegration(
 }
 
 void PipelineController::trackingLoop() {
+  try {
+    trackingLoopBody();
+  } catch (const std::exception& e) {
+    onWorkerFault("Tracking", e.what());
+  } catch (...) {
+    onWorkerFault("Tracking", "unknown exception");
+  }
+}
+
+void PipelineController::trackingLoopBody() {
   while (running_.load()) {
 #ifdef AZU_PIPELINE_TEST_SEAM
     waitForWorkerGate(tracking_gate_);
@@ -1052,6 +1061,16 @@ void PipelineController::trackingLoop() {
 }
 
 void PipelineController::integrationLoop() {
+  try {
+    integrationLoopBody();
+  } catch (const std::exception& e) {
+    onWorkerFault("Integration", e.what());
+  } catch (...) {
+    onWorkerFault("Integration", "unknown exception");
+  }
+}
+
+void PipelineController::integrationLoopBody() {
   while (running_.load()) {
 #ifdef AZU_PIPELINE_TEST_SEAM
     waitForWorkerGate(integration_gate_);
@@ -1323,6 +1342,16 @@ void PipelineController::integrationLoop() {
 }
 
 void PipelineController::meshingLoop() {
+  try {
+    meshingLoopBody();
+  } catch (const std::exception& e) {
+    onWorkerFault("Meshing", e.what());
+  } catch (...) {
+    onWorkerFault("Meshing", "unknown exception");
+  }
+}
+
+void PipelineController::meshingLoopBody() {
   for (;;) {
     // Claim a version under the request lock. A request can no longer be lost
     // the way a boolean flag was: clearing the flag between reading it and

@@ -324,6 +324,10 @@ private:
     // Prevents trackingLoop from running ICP against an empty model buffer.
     std::atomic<bool>                     model_ready_{false};
     sensor::cudaStream_t                  cuda_stream_ = nullptr;
+    // GPU volume/model buffers are allocated once and survive stop()/start(), so
+    // stopping never discards a GPU scan and export after stop still works. They
+    // are released only by reset() and the destructor. Guarded by control_mutex_.
+    bool                                  gpu_resources_ready_ = false;
     mutable std::mutex                    control_mutex_;
 
     bool startInternal(bool engage_sensor);
@@ -359,9 +363,18 @@ private:
      * qApp is never dereferenced.
      */
     void dispatchUiFrame(std::shared_ptr<sensor::FrameData> ui_frame);
+    // Worker thread entry points. Each wraps its *Body() so an exception (e.g. a
+    // failed cudaMalloc) is logged and turns the pipeline to Error instead of
+    // escaping the std::thread and terminating the process.
     void trackingLoop();
     void integrationLoop();
     void meshingLoop();
+    void trackingLoopBody();
+    void integrationLoopBody();
+    void meshingLoopBody();
+    void onWorkerFault(const char* worker, const char* what) noexcept;
+    /** Free GPU volume, tracker and model buffers. Caller holds control_mutex_. */
+    void releaseGpuResources() noexcept;
 
     /** Push a thread count into the tracker under tracker_mutex_. Callers hold no other lock. */
     void applyThreadCount(int n);

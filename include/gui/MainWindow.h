@@ -76,7 +76,7 @@ private:
     // posted through QMetaObject::invokeMethod(this, ..., Qt::QueuedConnection)
     // can never run on a destroyed window (Qt drops the queued functor when
     // its context object dies first, and the join orders that destruction).
-    enum class BackgroundOp { None, ExportPly, ExportGlb, Reset };
+    enum class BackgroundOp { None, ExportPly, ExportGlb, Reset, Stop };
 
     /** Launch `work` on a worker thread; its bool result is delivered to
      *  finishBackgroundOp() on the GUI thread. Refuses overlapping ops. */

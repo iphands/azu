@@ -112,6 +112,10 @@ void TSDFVolume::freeGPU() {
 }
 
 void TSDFVolume::initGPU() {
+    // Idempotent: an allocated device volume IS the scan (the host copy is stale
+    // while the GPU integrates), so a restart must not re-upload over it.
+    // freeGPU() (reset, resolution change) is what forces a fresh upload.
+    if (gpu_valid_ && d_voxels_) return;
     const int res = params_.resolution;
     size_t n = static_cast<size_t>(res) * static_cast<size_t>(res) * static_cast<size_t>(res);
     d_voxels_ = utils::make_hip_unique<VoxelGPU>(n);

@@ -155,9 +155,16 @@ void MainWindow::onStartClicked() {
 }
 
 void MainWindow::onStopClicked() {
-    pipeline_->stop();
-    control_panel_->onPipelineStopped();
-    statusBar()->showMessage("Stopped.");
+    if (busy_op_ != BackgroundOp::None) return;
+    // stop() joins three worker threads and drains the GPU; it must not block
+    // the GUI thread while it does.
+    control_panel_->setBusy(true);
+    statusBar()->showMessage("Stopping...");
+    app::PipelineController* pipeline = pipeline_.get();
+    startBackgroundOp(BackgroundOp::Stop, [pipeline]() {
+        pipeline->stop();
+        return true;
+    });
 }
 
 void MainWindow::joinBackgroundWorkers() {
@@ -297,6 +304,13 @@ void MainWindow::finishBackgroundOp(BackgroundOp op, bool ok) {
         if (metrics_panel_) metrics_panel_->update(pipeline_->metricsSnapshot());
         break;
     }
+    case BackgroundOp::Stop:
+        control_panel_->setBusy(false);
+        control_panel_->onPipelineStopped();
+        control_panel_->setExportEnabled(mesh_available_);
+        statusBar()->showMessage("Stopped.");
+        if (metrics_panel_) metrics_panel_->update(pipeline_->metricsSnapshot());
+        break;
     case BackgroundOp::None:
         break;
     }

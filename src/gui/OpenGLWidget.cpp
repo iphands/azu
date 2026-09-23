@@ -1,4 +1,5 @@
 #include "gui/OpenGLWidget.h"
+#include <QThread>
 #include <QMouseEvent>
 #include <QWheelEvent>
 #include <QOpenGLContext>
@@ -52,6 +53,8 @@ void OpenGLWidget::setRenderMode(rendering::RenderMode mode) {
 }
 
 void OpenGLWidget::updatePointCloud(const sensor::FrameData& frame) {
+    // GL context work is GUI-thread only; pipeline workers must marshal here.
+    Q_ASSERT(QThread::currentThread() == thread());
     makeCurrent();
     if (renderer_) renderer_->uploadPointCloud(frame);
     doneCurrent();
@@ -59,6 +62,8 @@ void OpenGLWidget::updatePointCloud(const sensor::FrameData& frame) {
 }
 
 void OpenGLWidget::updateMesh(const meshing::MeshData& mesh) {
+    // GL context work is GUI-thread only; pipeline workers must marshal here.
+    Q_ASSERT(QThread::currentThread() == thread());
     makeCurrent();
     if (renderer_) renderer_->uploadMesh(mesh);
     doneCurrent();
@@ -66,6 +71,8 @@ void OpenGLWidget::updateMesh(const meshing::MeshData& mesh) {
 }
 
 void OpenGLWidget::clearGeometry() {
+    // GL context work is GUI-thread only; pipeline workers must marshal here.
+    Q_ASSERT(QThread::currentThread() == thread());
     makeCurrent();
     if (renderer_) renderer_->clearGeometry();
     doneCurrent();
