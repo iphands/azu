@@ -49,6 +49,7 @@ PipelineController::PipelineController(sensor::PreprocessBackend preferred_backe
 
     if (const char* trace = std::getenv("AZU_TRACE")) trace_path_ = trace;
     if (const char* rel = std::getenv("AZU_DEGENERACY_REL")) degeneracy_rel_ = std::strtof(rel, nullptr);
+    if (const char* mm = std::getenv("AZU_MOTION_MODEL")) velocity_motion_model_ = std::string(mm) == "velocity";
 }
 
 PipelineController::~PipelineController() {
@@ -98,6 +99,8 @@ bool PipelineController::startInternal(bool engage_sensor) {
         std::lock_guard<std::mutex> lk(pose_mutex_);
         current_pose_ = Eigen::Matrix4f::Identity();
         last_pose_    = Eigen::Matrix4f::Identity();
+        velocity_     = Eigen::Matrix4f::Identity();
+        frames_since_tracked_ = 0;
     }
     // Set frame callback before starting capture
     sensor_->setFrameCallback([this](std::shared_ptr<sensor::RawFrame> raw) {
@@ -648,6 +651,8 @@ void PipelineController::reset() {
         std::lock_guard<std::mutex> lk(pose_mutex_);
         current_pose_ = Eigen::Matrix4f::Identity();
         last_pose_ = Eigen::Matrix4f::Identity();
+        velocity_ = Eigen::Matrix4f::Identity();
+        frames_since_tracked_ = 0;
     }
     first_frame_          = true;
     lost_log_counter_     = 0;
@@ -1070,11 +1075,21 @@ void PipelineController::trackingLoopBody() {
       std::lock_guard<std::mutex> lk(pose_mutex_);
       prev_pose = current_pose_;
 
-      // Motion Model: predicted = current * (last_delta)
-      // last_delta = last_pose.inv * current_pose
+      // Constant-velocity motion model: predicted = current * (last^-1 *
+      // current). After a Failed frame the pose stays put, so the next
+      // prediction is zero motion. AZU_MOTION_MODEL=velocity instead keeps
+      // the last tracked frame-to-frame motion (velocity_) and extrapolates
+      // one step per frame since the last tracked one (capped at 3). It is
+      // opt-in: on the synthetic spin with glitches it did not measurably
+      // beat the default; real recordings decide.
       const Eigen::Matrix4f motion_source = last_pose_;
-      Eigen::Matrix4f delta = motion_source.inverse() * current_pose_;
-      predicted_pose = current_pose_ * delta;
+      if (!velocity_motion_model_) {
+          predicted_pose = current_pose_ * (motion_source.inverse() * current_pose_);
+      } else {
+          predicted_pose = current_pose_;
+          const int steps = std::min(1 + frames_since_tracked_, 3);
+          for (int k = 0; k < steps; ++k) predicted_pose = predicted_pose * velocity_;
+      }
       last_pose_ = current_pose_;
 #ifdef AZU_PIPELINE_TEST_SEAM
       recordMotionModelForTests(prev_pose, predicted_pose, motion_source);
@@ -1297,6 +1312,22 @@ void PipelineController::trackingLoopBody() {
                 std::lock_guard<std::mutex> lk(pose_mutex_);
                 current_pose_ = icp_result.pose;
             }
+            // Velocity from this tracked frame (per-frame average if frames
+            // failed in between). A relocalization jump is not a velocity.
+            if (is_lost) {
+                velocity_ = Eigen::Matrix4f::Identity();
+            } else {
+                // prev_pose is the last TRACKED pose, so after n failed frames
+                // this step spans n + 1 frames; keep the per-frame share.
+                const Eigen::Matrix4f step = prev_pose.inverse() * icp_result.pose;
+                const float share = 1.0f / static_cast<float>(frames_since_tracked_ + 1);
+                const Eigen::AngleAxisf aa(Eigen::Matrix3f(step.block<3,3>(0,0)));
+                velocity_ = Eigen::Matrix4f::Identity();
+                velocity_.block<3,3>(0,0) =
+                    Eigen::AngleAxisf(aa.angle() * share, aa.axis()).toRotationMatrix();
+                velocity_.block<3,1>(0,3) = step.block<3,1>(0,3) * share;
+            }
+            frames_since_tracked_ = 0;
             frame->pose = icp_result.pose;
             state_.store(PipelineState::Running);
 
@@ -1312,6 +1343,7 @@ void PipelineController::trackingLoopBody() {
             // One failed frame is not a lost track: keep the previous pose and
             // wait; only a run of failures enters relocalization.
             ++consecutive_failures_;
+            ++frames_since_tracked_;
             if (!is_lost && consecutive_failures_ >= tracking::TrackingPolicy{}.failures_before_lost) {
                 KFLOG_WARN("Pipeline", "Tracking lost! Suspension of TSDF integration. Entering relocalization mode...");
                 if (preprocessor_) {

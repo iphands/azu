@@ -35,6 +35,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <algorithm>
 
 #ifndef AZU_PIPELINE_TEST_SEAM
 #error "pipeline_spin_contract needs AZU_PIPELINE_TEST_SEAM"
@@ -122,19 +123,29 @@ int main() {
     pc.setHyperparams(hp);
     CHECK(pc.startWithoutSensorForTests(), "seam start");
 
-    constexpr int   kTurnFrames = 240;
+    // AZU_SPIN_GLITCH=<start>,<count>: that many frames with no depth at all
+    // mid-turn (the camera keeps turning), e.g. a USB hiccup.
+    int glitch_start = -1, glitch_count = 0;
+    if (const char* g = std::getenv("AZU_SPIN_GLITCH")) std::sscanf(g, "%d,%d", &glitch_start, &glitch_count);
+    // AZU_SPIN_STEP_DEG: turn rate per frame (default 1.5).
+    float step_deg = 1.5f;
+    if (const char* st = std::getenv("AZU_SPIN_STEP_DEG")) step_deg = std::strtof(st, nullptr);
     constexpr int   kHoldFrames = 10;
-    constexpr float kStepRad    = 1.5f * 3.14159265f / 180.0f;
+    const float     kStepRad    = step_deg * 3.14159265f / 180.0f;
+    const int       turn_frames = static_cast<int>(std::lround(360.0f / step_deg));
     int lost_frames = 0, good = 0, graded = 0, first_lost = -1, timeouts = 0;
     Eigen::Matrix4f truth = Eigen::Matrix4f::Identity();
     float worst_trans = 0.0f, worst_rot = 0.0f;
-    for (int i = 0; i < kTurnFrames + kHoldFrames; ++i) {
-        const float yaw = kStepRad * static_cast<float>(std::min(i, kTurnFrames));
+    for (int i = 0; i < turn_frames + kHoldFrames; ++i) {
+        const float yaw = kStepRad * static_cast<float>(std::min(i, turn_frames));
         truth = azu_test::makePose({0.0f, yaw, 0.0f}, {0.0f, 0.0f, 0.0f});
         const uint64_t tracked_before = pc.trackedFrameCountForTests();
         const int integrated_before = pc.metricsSnapshot().integrated_frames;
-        pc.injectRawFrameForTests(
-            rawFrom(scene.renderDepth(room_from_start * truth), static_cast<uint64_t>(i + 1)));
+        std::vector<float> depth = scene.renderDepth(room_from_start * truth);
+        if (i >= glitch_start && i < glitch_start + glitch_count) {
+            std::fill(depth.begin(), depth.end(), 0.0f);   // sensor glitch: no depth
+        }
+        pc.injectRawFrameForTests(rawFrom(depth, static_cast<uint64_t>(i + 1)));
         if (i == 0) {
             waitFor([&] { return pc.metricsSnapshot().integrated_frames > integrated_before; }, 3s);
             continue;
@@ -171,12 +182,12 @@ int main() {
     pc.stop();
 
     std::printf("  spin: first lost at frame %d (%.1f deg), lost frames %d, good %d/%d, timeouts %d\n",
-                first_lost, first_lost < 0 ? 0.0f : 1.5f * first_lost, lost_frames, good, graded,
+                first_lost, first_lost < 0 ? 0.0f : step_deg * first_lost, lost_frames, good, graded,
                 timeouts);
     std::printf("  final error %.1f mm / %.2f deg, worst %.1f mm / %.2f deg\n", fin.trans_m * 1e3,
                 fin.rot_deg, worst_trans * 1e3, worst_rot);
     CHECK(timeouts == 0, "every frame was tracked");
-    CHECK(lost_frames == 0, "A: tracking is never lost during a 360 degree turn");
+    CHECK(lost_frames == 0 || glitch_count >= 3, "A: tracking is never lost during a 360 degree turn");
     CHECK(good * 10 >= graded * 9, "B: >= 90% of frames graded Good");
     CHECK(fin.trans_m < 0.05f && fin.rot_deg < 2.0f, "C: back at the start within 5 cm / 2 deg");
 

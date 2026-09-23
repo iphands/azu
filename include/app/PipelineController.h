@@ -205,6 +205,11 @@ private:
     std::atomic<PipelineState> state_{PipelineState::Idle};
     Eigen::Matrix4f            current_pose_;
     Eigen::Matrix4f            last_pose_{Eigen::Matrix4f::Identity()};
+    // AZU_MOTION_MODEL=velocity state: last tracked frame-to-frame motion, and
+    // frames graded Failed since (tracking thread; reset by start/reset).
+    Eigen::Matrix4f            velocity_{Eigen::Matrix4f::Identity()};
+    int                        frames_since_tracked_ = 0;
+    bool                       velocity_motion_model_ = false;   // AZU_MOTION_MODEL=velocity (opt-in)
     mutable std::mutex         pose_mutex_;
 
     // Metrics
