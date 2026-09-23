@@ -177,6 +177,16 @@ Each target has a Phase gate, and a harness that measures it (Phase 1).
    - Inject depth only, or RGB at +100 ms skew.
    - Asserts: within 1.5 s, `SensorStalled` or `rgb_valid=false` depth-only publishing is observed; `pair_rejects` or `depth_only_published > 0`; `capture_fps == 0` after 1.5 s with no frames at all.
 
+## Phase 0 status (2026-09-22)
+
+`[x]` done, `[~]` partial (what is left is named on the todo line). Measured
+after Phase 0 with libfakenect replaying the recorded dump through the real
+controller: CUDA 29-30 integrated fps (both GPUs, device auto-selected), CPU
+13-16 fps (was ~2, and 0 paired frames before T0.2); stop() 1-76 ms with no
+abort; synthetic closed-loop trajectory ATE 4.3 mm; relocalization recovers a
+12 deg / 3 cm offset on the first frame. `scripts/gate.sh`: CPU Release 47/47,
+CPU Debug 47/47, CUDA builds.
+
 ## Execution rules
 
 - **Git (repo and `/home/iphands/prog/slop/CLAUDE.md`)**
@@ -203,7 +213,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
 
 ### Phase 0: hang, crash and core correctness (ship as one release)
 
-- [ ] **T0.1. Unblock the test gate: delete the regex source gates, add shared synthetic-scene support, run the gate in Release and Debug**
+- [~] **T0.1. Unblock the test gate: delete the regex source gates, add shared synthetic-scene support, run the gate in Release and Debug** — done in 7051315, 40c8eaf (SyntheticScene); partial: gate.sh (CPU Release+Debug ctest, CUDA build) and tests/support/SyntheticScene.h done; configure-time source-text gates NOT removed (needs maintainer go-ahead), Metrics lib and GPU ctest lane open
   - Why: the 74 configure-time `FATAL_ERROR` greps (for example "must literally call `startWithoutSensorForTests(`") fail any refactor. There is no ground-truth scene helper. The gate ran Debug only.
   - Sources: critic §2 "configure-time gates", REVIEW-13, GAP-07 (Release part), HANG-13 (flake context).
   - Files: `tests/CMakeLists.txt` (≈ `:719-1465`), new `tests/support/SyntheticScene.{h,cpp}`, `tests/support/Metrics.{h,cpp}`, `scripts/test-cpu-big-fix.sh` → `scripts/gate.sh`.
@@ -224,7 +234,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
     - A metrics self-test: ATE of GT vs GT is 0; GT + 3 mm noise gives ATE = 3 mm ± 5%.
   - Effort: M. Depends on: none.
 
-- [ ] **T0.2. Fix the timestamp unit and make pairing depth-led, nearest-neighbour and wrap-safe**
+- [x] **T0.2. Fix the timestamp unit and make pairing depth-led, nearest-neighbour and wrap-safe** — done in 07e0cdf
   - Sources: HANG-01, SENSOR-01, SENSOR-02, REVIEW-01, HANG-18 (header comment), SENSOR-19 (RGB double copy).
   - Files: `include/sensor/KinectSensor.h`, `src/sensor/KinectSensor.cpp`, `include/sensor/FrameData.h` (`RawFrame`), `tests/kinect_pairing_contract.cpp`, new `tests/kinect_pairing_realtrace_contract.cpp`, `tests/data/kinect_ts_trace.txt` (about 300 lines).
   - Notes:
@@ -247,7 +257,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
     - Removing RGB samples 100–200 still publishes 100% of depth frames, and exactly those frames have `rgb_valid=false`.
   - Effort: S. Depends on: none.
 
-- [ ] **T0.3. Make starvation and stalls visible**
+- [x] **T0.3. Make starvation and stalls visible** — done in a7693e2; metric flag `sensor_stalled` instead of a new PipelineState
   - Sources: HANG-02, GAP-03.
   - Files: `KinectSensor.{h,cpp}`, `include/app/PipelineMetrics.h` (or equivalent), `PipelineController.cpp`, `src/gui/MetricsPanel.cpp`.
   - Notes:
@@ -259,7 +269,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
   - Acceptance: regression test 5.
   - Effort: S. Depends on: T0.2.
 
-- [ ] **T0.4. End-to-end fakenect smoke test in both lanes (real binaries)**
+- [x] **T0.4. End-to-end fakenect smoke test in both lanes (real binaries)** — done in 589a122
   - Sources: GAP-07, SENSOR-17(d), HANG test suite #4, REVIEW-01 (fakenect replay test).
   - Files: new `tools/make_fake_dump.cpp` (uses `SyntheticScene`), `tests/smoke_fakenect.cpp` (template: `CRITIC/e2e_gpu.cpp`, `HANG/e2e.cpp`), `tests/CMakeLists.txt`.
   - Notes:
@@ -278,7 +288,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
     - The test fails on `de83ab5` + the harness (0 paired frames) and passes after T0.2.
   - Effort: S–M. Depends on: T0.1, T0.2.
 
-- [ ] **T0.5. Make `usageFraction` O(1) and take the metrics path off mutexes**
+- [~] **T0.5. Make `usageFraction` O(1) and take the metrics path off mutexes** — done in 8ad7ed1; partial: O(1) usage counter outside metrics_mutex_; lock-free metrics/seqlock open
   - Sources: HANG-08, PERF-06, FUSE-07, REVIEW-09 (race part), critic HANG-08 (use-after-free via `setParams`).
   - Files: `src/tsdf/TSDFVolume.cpp:588-594`, `include/tsdf/TSDFVolume.h`, `PipelineController.cpp:680-693`, `:1296-1304`, `:1396-1400`.
   - Notes:
@@ -291,7 +301,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
     - TSan (noomp preset) runs `setHyperparams` while running and reports nothing.
   - Effort: S. Depends on: none.
 
-- [ ] **T0.6. Never touch GL off the GUI thread**
+- [x] **T0.6. Never touch GL off the GUI thread** — done in c148a56
   - Sources: HANG-10, REVIEW-03.
   - Files: `PipelineController.cpp:469-471` (the synchronous `on_frame` in `stop()`), `dispatchUiFrame` (`:595-609`), `src/gui/MainWindow.cpp:212-218`, `:308-312`, `src/gui/OpenGLWidget.cpp:54-58`.
   - Notes:
@@ -302,7 +312,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
   - Acceptance: a seam test calls `reset()` from a `std::thread` while running (with a `QCoreApplication`); the recorded hook thread id is never that thread.
   - Effort: S. Depends on: none.
 
-- [ ] **T0.7. `stop()` never throws or blocks the GUI; drop the final full-volume point cloud**
+- [x] **T0.7. `stop()` never throws or blocks the GUI; drop the final full-volume point cloud** — done in c148a56
   - Sources: GAP-02, HANG-15, GPU-07 (stop part), GPU-03 (worker-thread throws).
   - Files: `PipelineController.cpp:445-497`, `:459-463`, `TSDFVolume.cpp:600-642` (`extractGlobalPointCloud*`), `include/utils/CudaUniquePtr.h:40`, `MainWindow.cpp:158`, `:355`.
   - Notes:
@@ -318,7 +328,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
     - GAP-02's reproduction (4060, 290 frames, Stop) exits with rc 0.
   - Effort: S. Depends on: none.
 
-- [ ] **T0.8. Fix `KinectSensor` lifecycle hygiene**
+- [x] **T0.8. Fix `KinectSensor` lifecycle hygiene** — done in a7693e2; getLatestFrame()/releaseFrame() kept: a configure-time source gate requires them
   - Sources: HANG-11 (P2, per critic), SENSOR-14, REVIEW-17, HANG-19 (`setFrameCallback` lock, ignored return values, `releaseFrame` no-op), SENSOR-19 (dead APIs, `stats_.median_filtered` double count).
   - Files: `KinectSensor.cpp:45-108`, `:293`, `KinectSensor.h:83`.
   - Notes:
@@ -331,7 +341,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
   - Acceptance: regression test 4 (200 cycles, each < 300 ms); 50 cycles on the real device, if attached.
   - Effort: S. Depends on: T0.4.
 
-- [ ] **T0.9. Voxel-projective TSDF integration (CPU canonical)**
+- [x] **T0.9. Voxel-projective TSDF integration (CPU canonical)** — done in 450901f, eff9464
   - Sources: PERF-01, PERF-04, HANG-04, HANG-12, FUSE-01, FUSE-02, FUSE-03, TRACK-02, GPU-05 (CPU side), SOTA-01, SOTA-02, REVIEW-05.
   - Files: `src/tsdf/TSDFVolume.cpp:213-398` (`integrateCPU`), `include/tsdf/TSDFVolume.h`, tests `tsdf_integration_race_contract`, `tsdf_integration_min_depth_contract`, `color_convergence_contract` (K6), new `fusion_bias_contract`, `fusion_drift_contract`.
   - Notes:
@@ -359,7 +369,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
     - `bench_integrate` (perf label): 256³ p50 ≤ 15 ms at 16 threads, idle.
   - Effort: M. Depends on: T0.1.
 
-- [ ] **T0.10. Raycast: AABB clip, space skipping, front-face only, one shared validity rule**
+- [~] **T0.10. Raycast: AABB clip, space skipping, front-face only, one shared validity rule** — done in eea2cb1; partial: no brick space skipping yet (adaptive step only); MC still samples unobserved as +1 (shared SdfSampler open); raycast <= 15 ms needs T2.8
   - Sources: PERF-02 (a, b, d), PERF-16, HANG-05 (with the critic's correction that `t_far` is 2.5 m at defaults), FUSE-06, FUSE-11, SOTA-03 (stage 1), SOTA-04, TRACK-08 (1–4), SOTA-19 (default band), FUSE-09 (min-weight in the sampler).
   - Files: `TSDFVolume.cpp:400-499` (raycast, `computeNormal`), `:509-549` (`getTSDF`), `src/meshing/MarchingCubes.cpp:62,81-85,217-258` (`sampleCorner`), new `include/tsdf/SdfSampler.h`, tests `tsdf_raycast_contract` D, `tsdf_subvoxel_thin_feature_contract` A/D, new `tsdf_raycast_backside_contract` (from `SOTA/phantom.cpp`), `raycast_mc_consistency`.
   - Notes:
@@ -378,7 +388,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
     - `bench_raycast`: 256³ p50 ≤ 45 ms at 16 threads idle (the ≤ 15 ms target needs T2.8).
   - Effort: M. Depends on: T0.9.
 
-- [ ] **T0.11. `ModelFrame::pose` becomes the ICP reference pose**
+- [x] **T0.11. `ModelFrame::pose` becomes the ICP reference pose** — done in 40c8eaf
   - Sources: TRACK-01, PERF-03, REVIEW-04.
   - Files: `include/tracking/ICPTracker.h:44-69`, `src/tracking/ICPTracker.cpp:154-166` (dead `R_ref`, `t_ref`, `R_rel_T`), `PipelineController.cpp:838`, `:861`, `:1147-1154`, `solve_gpu`.
   - Notes:
@@ -389,7 +399,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
   - Acceptance: the `refmismatch` contract (model at P_int, live frame at P_int·Δ with 0.2 s lag at a pan of 0.5 rad/s plus 0.15 m/s) converges within 1 mm / 0.05°. Today it fails with 0 inliers.
   - Effort: S. Depends on: T0.1.
 
-- [ ] **T0.12. Tracking quality tiers, v1**
+- [x] **T0.12. Tracking quality tiers, v1** — done in 02cc7db
   - Sources: REVIEW-02 (PLAUSIBLE, per critic), TRACK-06 (acceptance part), SOTA-10(b) (partial), critic §2.2.
   - Files: `ICPTracker.cpp:48-60`, `:88-91`, `include/tracking/ICPShared.h`, `PipelineController.cpp:975-986`, `:1034-1048`, `icp_numeric_policy_contract`.
   - Notes:
@@ -405,7 +415,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
     - A `plane` scene with 10 cm motion reports POOR or FAILED, never GOOD.
   - Effort: S. Depends on: T0.11.
 
-- [ ] **T0.13. Seed the model from frame 1, add real relocalization hypotheses, show a live preview while lost**
+- [x] **T0.13. Seed the model from frame 1, add real relocalization hypotheses, show a live preview while lost** — done in bb40bcb, 02cc7db; no GUI "LOST" overlay; status label + live preview only
   - Sources: HANG-09, HANG-03, TRACK-01 (fix 3: re-raycast on loss), TRACK-09 (steps 1, 4, 5), SOTA-11 (duplicate hypothesis), PERF-15 (duplicate hypothesis), REVIEW-15 (h1 == h3), HANG-19 (dead hypothesis), TRACK-17 (two ICP runs on failure).
   - Files: `PipelineController.cpp:816-827`, `:892-943`, `:953-956`, `:1143-1186`, `src/gui/OpenGLWidget.cpp`.
   - Notes:
@@ -425,7 +435,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
     - `drop_pre_model == 0`.
   - Effort: M. Depends on: T0.11, T0.12.
 
-- [ ] **T0.14. Remove super-resolution from the per-frame path**
+- [~] **T0.14. Remove super-resolution from the per-frame path** — done in 667692e; partial: upscale opt-in and off in the pipeline; sr_scale/GUI combo/sources not deleted
   - Sources: HANG-06 (SR part), SENSOR-04, REVIEW-06, PERF-07(1), GAP-06 (partial), SOTA-14 (SR claim REFUTED, see appendix).
   - Files: `src/sensor/SignalConditioner_omp.cpp:331-341`, `:367`, `src/sensor/SuperResolution.cpp`, `PipelineController.cpp:773-784`, `include/app/FusionHyperparams.h:16` (`sr_scale`), `src/gui/ControlPanel.cpp:229-234`, `sr_upscaled_contract`.
   - Notes:
@@ -435,7 +445,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
   - Acceptance: preprocessing is ≥ 5 ms faster idle at 32 threads (28.9 → ≤ 24 ms); `grep -r applyEASU src` returns 0.
   - Effort: S. Depends on: none.
 
-- [ ] **T0.15. CUDA device selection, VRAM budget, visible backend, and backend resolved once**
+- [x] **T0.15. CUDA device selection, VRAM budget, visible backend, and backend resolved once** — done in a719dae; no free-memory stub seam test
   - Sources: GAP-01, GPU-03, GAP-06, GPU-21 (context).
   - Files: new `src/gpu/GpuContext.{h,cu}`, `PipelineController.cpp:114-160` (startInternal), `src/main.cpp:361-364` (`--backend`), Preprocessor backend selection, `MetricsPanel.cpp`.
   - Notes:
@@ -455,7 +465,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
     - With default visibility on this host, the app picks the 4060 (or reports why not), and the UI shows the backend.
   - Effort: S–M. Depends on: T0.7.
 
-- [ ] **T0.16. CUDA one-line correctness fixes**
+- [x] **T0.16. CUDA one-line correctness fixes** — done in a4159da; GPU ICP within 0.54 mm of CPU, not the 0.05 mm target (GPU raycast is still the old algorithm)
   - Sources: GPU-01, GPU-02, GPU-04, REVIEW-10 (colour domain), GPU-13 (partial: rounding and domain).
   - Files: `src/meshing/MarchingCubes_cuda.cu:35-327`, `:62`, `:484-486`, `:517-520`; `src/tracking/ICPTracker_cuda.cu:223`, `:230`; `src/tsdf/TSDFVolume_cuda.cu:135-163`, `:334-336`.
   - Notes:
