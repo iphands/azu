@@ -156,28 +156,27 @@ file(GLOB_RECURSE APP_SOURCES       CONFIGURE_DEPENDS "src/app/*.cpp")
 file(GLOB_RECURSE UTILS_SOURCES     CONFIGURE_DEPENDS "src/utils/*.cpp")
 file(GLOB_RECURSE HEADERS           CONFIGURE_DEPENDS "include/*.h")
 
-set(ALL_SOURCES
-    src/main.cpp
-    ${HEADERS}
+# azu_core: everything except the GUI, the renderer and main(). The app and the
+# offline tools (tools/azu_replay) link it, so a recording replays through
+# exactly the code the app runs, on whichever backend this tree is built for.
+set(CORE_SOURCES
     ${SENSOR_SOURCES}
     ${TRACKING_SOURCES}
     ${TSDF_SOURCES}
     ${MESHING_SOURCES}
-    ${RENDERING_SOURCES}
     ${EXPORT_SOURCES}
-    ${GUI_SOURCES}
     ${APP_SOURCES}
     ${UTILS_SOURCES}
 )
 
 if(CUDA_AVAILABLE)
     file(GLOB_RECURSE CUDA_SOURCES CONFIGURE_DEPENDS "src/**/*_cuda.cu")
-    list(APPEND ALL_SOURCES ${CUDA_SOURCES})
+    list(APPEND CORE_SOURCES ${CUDA_SOURCES})
 endif()
 
 if(HIP_AVAILABLE)
     file(GLOB_RECURSE HIP_SOURCES CONFIGURE_DEPENDS "src/**/*_hip.hip")
-    list(APPEND ALL_SOURCES ${HIP_SOURCES})
+    list(APPEND CORE_SOURCES ${HIP_SOURCES})
 endif()
 
 # ---- Signal back-end label (for diagnostics) ----
@@ -188,10 +187,10 @@ elseif(CUDA_AVAILABLE)
     set(SIGNAL_BACKEND "CUDA+OpenMP (NVIDIA)")
 endif()
 
-# ---- Build Target ----
-add_executable(KinectFusionQt ${ALL_SOURCES})
+add_library(azu_core STATIC ${CORE_SOURCES})
+set_target_properties(azu_core PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 
-target_include_directories(KinectFusionQt PRIVATE
+target_include_directories(azu_core PUBLIC
     "${CMAKE_SOURCE_DIR}/include"
     "${CMAKE_SOURCE_DIR}/src"
     "${TINYGLTF_DIR}"
@@ -200,33 +199,29 @@ target_include_directories(KinectFusionQt PRIVATE
 )
 
 if(CUDA_AVAILABLE)
-    target_include_directories(KinectFusionQt PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_include_directories(azu_core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
 endif()
 
 # KIN-BIG-FIX(todo2): back-end macros are target-scoped (not directory-scoped) so
 # the CPU-only test targets (tests/) can never inherit CUDA_ENABLED/HIP_ENABLED.
-# Same effective flags as the previous add_compile_definitions() lines for the
-# production target; KinectFusionQt is the only GPU consumer target.
+# PUBLIC on azu_core: the app and the tools that link it see the same macros.
 if(CUDA_AVAILABLE)
-    target_compile_definitions(KinectFusionQt PRIVATE CUDA_ENABLED)
+    target_compile_definitions(azu_core PUBLIC CUDA_ENABLED)
 endif()
 if(HIP_AVAILABLE)
-    target_compile_definitions(KinectFusionQt PRIVATE HIP_ENABLED __HIP_PLATFORM_AMD__)
+    target_compile_definitions(azu_core PUBLIC HIP_ENABLED __HIP_PLATFORM_AMD__)
 endif()
 
 # ---- Link Libraries ----
-target_link_libraries(KinectFusionQt PRIVATE
-    Qt6::Widgets
-    Qt6::OpenGL
-    Qt6::OpenGLWidgets
-    ${OPENGL_LIBRARIES}
+target_link_libraries(azu_core PUBLIC
+    Qt6::Core
     ${FREENECT_LIBRARIES}
     Threads::Threads
 )
 
 if(CUDA_AVAILABLE)
-    target_link_libraries(KinectFusionQt PRIVATE cuda cudart)
-    target_compile_options(KinectFusionQt PRIVATE
+    target_link_libraries(azu_core PUBLIC cuda cudart)
+    target_compile_options(azu_core PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:
             --expt-relaxed-constexpr
             -diag-suppress=20012
@@ -236,23 +231,45 @@ if(CUDA_AVAILABLE)
 endif()
 
 if(HIP_AVAILABLE)
-    # Force host linker (g++) — HIP device code is embedded in .hip.o objects.
-    # ld.lld cannot resolve CXX-compiled objects (undefined symbol: main).
-    set_target_properties(KinectFusionQt PROPERTIES LINKER_LANGUAGE CXX)
-    target_link_libraries(KinectFusionQt PRIVATE amdhip64)
+    target_link_libraries(azu_core PUBLIC amdhip64)
 endif()
 
 if(OpenMP_CXX_FOUND)
-    target_link_libraries(KinectFusionQt PRIVATE OpenMP::OpenMP_CXX)
+    target_link_libraries(azu_core PUBLIC OpenMP::OpenMP_CXX)
 endif()
 
 if(Eigen3_FOUND)
-    target_link_libraries(KinectFusionQt PRIVATE Eigen3::Eigen)
+    target_link_libraries(azu_core PUBLIC Eigen3::Eigen)
+endif()
+
+# ---- The app ----
+add_executable(KinectFusionQt
+    src/main.cpp
+    ${HEADERS}
+    ${RENDERING_SOURCES}
+    ${GUI_SOURCES}
+)
+
+target_link_libraries(KinectFusionQt PRIVATE
+    azu_core
+    Qt6::Widgets
+    Qt6::OpenGL
+    Qt6::OpenGLWidgets
+    ${OPENGL_LIBRARIES}
+)
+
+if(HIP_AVAILABLE)
+    # Force host linker (g++) — HIP device code is embedded in .hip.o objects.
+    # ld.lld cannot resolve CXX-compiled objects (undefined symbol: main).
+    set_target_properties(KinectFusionQt PROPERTIES LINKER_LANGUAGE CXX)
 endif()
 
 if(WIN32)
     target_link_libraries(KinectFusionQt PRIVATE winmm)
 endif()
+
+# ---- Offline tools ----
+add_subdirectory(tools)
 
 # ---- CPU-only headless test harness (big-fix todo 2) ----
 # Conditionally enabled, CPU-only: enable_testing()/include(CTest) run nowhere
