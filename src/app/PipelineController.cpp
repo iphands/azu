@@ -1,5 +1,6 @@
 #include "app/PipelineController.h"
 #include "app/GpuSelect.h"
+#include "tracking/TrackingPolicy.h"
 #include "export/GLBExporter.h"
 #include "export/PLYExporter.h"
 #include "utils/Logger.h"
@@ -79,6 +80,7 @@ bool PipelineController::startInternal(bool engage_sensor) {
     lost_log_counter_     = 0;
     success_log_counter_  = 0;
     hip_ui_skip_          = 0;
+    consecutive_failures_ = 0;
     {
         // The motion model belongs to ONE session. last_pose_ is the previous
         // frame's pose, and the pose-to-pose predictor forms
@@ -622,6 +624,7 @@ void PipelineController::reset() {
     lost_log_counter_     = 0;
     success_log_counter_  = 0;
     hip_ui_skip_          = 0;
+    consecutive_failures_ = 0;
     // frame_count_ and metrics_ are a pair guarded by metrics_mutex_ everywhere
     // else (onRawFrame writes both under it), so the reset that zeroes them takes
     // the same lock; control_mutex_ does not, because it serialises lifecycle and
@@ -897,16 +900,23 @@ void PipelineController::trackingLoopBody() {
     // Without this, frame 2 would ICP against an empty model and immediately declare
     // tracking lost, locking the pipeline out of ever recovering.
     if (!model_ready_.load()) {
-        // The frame is discarded, not deferred: holding it would only predict
-        // against a model that does not exist yet. That startup loss is real, so
-        // it is counted rather than silent.
-        frame.reset();
-        {
-            std::lock_guard<std::mutex> lk(metrics_mutex_);
-            ++metrics_.dropped_pre_model_frames;
+        // The first model is one integrate + raycast away (tens of ms). Hold
+        // this frame until it exists instead of discarding it: discarding every
+        // frame that arrived meanwhile left a gap right at the start, and with
+        // a moving camera the first tracked frame then started far from the
+        // model. Only a model that never appears drops the frame.
+        const auto deadline = steady_clock::now() + std::chrono::seconds(1);
+        while (!model_ready_.load() && running_.load() && steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        continue;
+        if (!model_ready_.load()) {
+            frame.reset();
+            {
+                std::lock_guard<std::mutex> lk(metrics_mutex_);
+                ++metrics_.dropped_pre_model_frames;
+            }
+            continue;
+        }
     }
 
     // Get model frame safely from TripleBuffer storage (ZERO-COPY)
@@ -1025,16 +1035,21 @@ void PipelineController::trackingLoopBody() {
       // cannot land between the swap and the restore.
       tracker_->setParams(original_params);
     } else {
+      // Retry from the previous pose only when the prediction's result grades
+      // Failed; a non-converged solve with a good fit is kept (TRACK-17).
+      const auto failed = [&](const tracking::ICPResult& r) {
+        return tracking::classifyTracking(r, prev_pose) == tracking::TrackQuality::Failed;
+      };
       if (use_gpu_.load()) {
         icp_result = solve_gpu(predicted_pose);
-        if (!icp_result.tracking_ok) {
+        if (failed(icp_result)) {
           icp_result = solve_gpu(prev_pose);
         }
       } else {
         sensor::FramePyramid pyramid;
         sensor::buildFramePyramid(*frame, pyramid);
         icp_result = solve_cpu(pyramid, predicted_pose);
-        if (!icp_result.tracking_ok) {
+        if (failed(icp_result)) {
           icp_result = solve_cpu(pyramid, prev_pose);
         }
       }
@@ -1045,30 +1060,17 @@ void PipelineController::trackingLoopBody() {
     if (gpu_lk.owns_lock())
         gpu_lk.unlock();
 
-    // Robust Camera Path Detection: Sanity check the pose update
-    if (icp_result.tracking_ok) {
-        Eigen::Matrix4f diff = prev_pose.inverse() * icp_result.pose;
-        float trans_dist = diff.block<3,1>(0,3).norm();
-        
-        // Rodrigues rotation magnitude
-        Eigen::Matrix3f R_diff = diff.block<3,3>(0,0);
-        float trace = R_diff.trace();
-        float angle = std::acos(std::max(-1.0f, std::min(1.0f, (trace - 1.0f) / 2.0f)));
-
-        // If camera "teleported" more than 15cm or rotated more than 30 degrees in 33ms, 
-        // it's almost certainly a tracking artifact/mismatch.
-        if (trans_dist > 0.15f || angle > 0.52f) {
-            KFLOGF_WARN("Pipeline", "Pose Sanity Check FAILED: dist=%.3fm, angle=%.1f deg. Rejecting pose.", 
-                       trans_dist, angle * 180.0f / M_PI);
-            icp_result.tracking_ok = false;
-        }
-    }
+    // Grade the solve (tracking/TrackingPolicy.h): Good integrates, Poor only
+    // moves the pose, Failed keeps the old pose and counts toward Lost. The
+    // per-frame motion gate lives in the policy.
+    const tracking::TrackQuality quality = tracking::classifyTracking(icp_result, prev_pose);
 
     tracked_frames_total_.fetch_add(1, std::memory_order_relaxed);
     {
       std::lock_guard<std::mutex> lk(metrics_mutex_);
       metrics_.icp_error = icp_result.error;
-      metrics_.tracking_ok = icp_result.tracking_ok;
+      metrics_.tracking_ok = (quality != tracking::TrackQuality::Failed);
+      metrics_.tracking_quality = static_cast<int>(quality);
       if (icp_result.valid_live_points > 0) {
           metrics_.icp_overlap_pct = 100.0f * static_cast<float>(icp_result.valid_model_points)
                                            / static_cast<float>(icp_result.valid_live_points);
@@ -1076,7 +1078,7 @@ void PipelineController::trackingLoopBody() {
       }
     }
 
-        if (!icp_result.tracking_ok) {
+        if (quality == tracking::TrackQuality::Failed) {
             // lost_log_counter_ is a member (not static local) to avoid UB on thread restart.
             if (++lost_log_counter_ % 30 == 1) {
                 const char* advice = "Move device slowly or improve scene geometry.";
@@ -1098,32 +1100,39 @@ void PipelineController::trackingLoopBody() {
             }
         }
 
-        if (icp_result.tracking_ok) {
+        if (quality != tracking::TrackQuality::Failed) {
+            consecutive_failures_ = 0;
             {
                 std::lock_guard<std::mutex> lk(pose_mutex_);
                 current_pose_ = icp_result.pose;
             }
-            frame->pose = icp_result.pose; 
+            frame->pose = icp_result.pose;
             state_.store(PipelineState::Running);
 
-            // Enqueue for integration (retain-latest, sole owner moves in).
-            enqueueForIntegration(std::move(frame));
-        } else {
-            // RELOCALIZATION: If tracking lost, don't update state or pose, but don't stop.
-            // We just don't integrate the frame. This keeps the model "clean".
-             if (!is_lost) {
-                 KFLOG_WARN("Pipeline", "Tracking lost! Suspension of TSDF integration. Entering relocalization mode...");
-                 if (preprocessor_) {
-                     std::lock_guard<std::mutex> pp_lk(preprocessor_mutex_);
-                     preprocessor_->resetTemporalState();
-                 }
-
-                 // Clear the integration queue to prevent "garbage" poses from being integrated
-                 std::lock_guard<std::mutex> lk(integration_queue_mutex_);
-                 std::queue<std::shared_ptr<sensor::FrameData>> empty;
-                 std::swap(integration_queue_, empty);
+            if (quality == tracking::TrackQuality::Good) {
+                // Enqueue for integration (retain-latest, sole owner moves in).
+                enqueueForIntegration(std::move(frame));
+            } else {
+                // Poor fit: follow the camera, keep the model clean.
+                frame.reset();
             }
-            state_.store(PipelineState::TrackingLost);
+        } else {
+            // One failed frame is not a lost track: keep the previous pose and
+            // wait; only a run of failures enters relocalization.
+            ++consecutive_failures_;
+            if (!is_lost && consecutive_failures_ >= tracking::TrackingPolicy{}.failures_before_lost) {
+                KFLOG_WARN("Pipeline", "Tracking lost! Suspension of TSDF integration. Entering relocalization mode...");
+                if (preprocessor_) {
+                    std::lock_guard<std::mutex> pp_lk(preprocessor_mutex_);
+                    preprocessor_->resetTemporalState();
+                }
+
+                // Clear the integration queue to prevent "garbage" poses from being integrated
+                std::lock_guard<std::mutex> lk(integration_queue_mutex_);
+                std::queue<std::shared_ptr<sensor::FrameData>> empty;
+                std::swap(integration_queue_, empty);
+                state_.store(PipelineState::TrackingLost);
+            }
             frame.reset();
         }
     }

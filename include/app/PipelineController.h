@@ -41,6 +41,8 @@ struct PipelineMetrics {
     int      integrated_frames  = 0;
     float    icp_error          = 0.0f;
     bool     tracking_ok        = true;
+    // tracking::TrackQuality of the last frame: 0 Good, 1 Poor, 2 Failed.
+    int      tracking_quality   = 0;
     // Fraction of live depth points that found a model correspondence this
     // frame (100*valid_model/valid_live). Range [0,100]; -1 means "ICP has not
     // run yet" — 0 is a real reading once ICP counted >=1 live point. The CPU
@@ -264,6 +266,7 @@ private:
     };
     mutable RateWindow rate_;   // guarded by metrics_mutex_
     int                                   frame_count_    = 0;
+    int                                   consecutive_failures_ = 0;  // tracking thread only
     bool                                  first_frame_    = true;
 
     // Per-instance log throttle counters — replaces static locals in worker threads
@@ -478,6 +481,10 @@ public:
         bool            valid = false;
     };
     MotionModelObservation lastMotionModelForTests();
+    /** Frames the tracking worker has finished grading since construction. */
+    uint64_t trackedFrameCountForTests() const {
+        return tracked_frames_total_.load(std::memory_order_acquire);
+    }
     /** The first prediction recorded since the latest start() (invalid if none). */
     MotionModelObservation firstMotionModelOfSessionForTests();
     /** frame_id of the last RawFrame the tracking worker popped off the queue. */
