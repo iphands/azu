@@ -7,9 +7,9 @@
 //   2. the same three runs produce byte-identical MarchingCubes mesh bytes
 //   3. thread counts 1, 2 and 4 produce bytes identical to each other and to the
 //      canonical (single-thread) fold
-// plus a hand-derived double oracle on a tiny fixture whose target voxel is hit by
-// two march steps, so the exact weight / TSDF / color blend is asserted from first
-// principles (a lost update or a dropped step changes it), never from product output.
+// plus a hand-derived double oracle on a tiny single-ray fixture: every voxel on the
+// ray takes exactly one update per frame, so the exact weight / TSDF / colour fold
+// over two frames is asserted from first principles, never from product output.
 
 #include "tsdf/TSDFVolume.h"
 #include "meshing/MarchingCubes.h"
@@ -229,15 +229,18 @@ void runDeterminismAndThreadEquivalence() {
     }
 }
 
-// ---- Scenario B: hand-derived double oracle on a two-hit voxel -----------------
+// ---- Scenario B: hand-derived double oracle (voxel-projective) -----------------
 //
-// A 4x4 frame with a single valid pixel on the optical axis (cx=px, cy=py so its ray
-// is exactly (0,0,1)). Camera is at the world origin with identity pose, so a march
-// sample at parameter t has world position (0,0,t) and sdf = D - t. origin.z = 0 and
-// the numbers below place march steps 0 and 1 in voxel (32,32,47) and step 2 alone in
-// voxel (32,32,48). The expected voxel is folded by hand in double with the documented
-// formulas; the product's float result is compared to it. weight and color are exact;
-// tsdf is compared within a float-scaled epsilon.
+// A 4x4 frame with one valid pixel on the optical axis (cx=px, cy=py). Camera at
+// the world origin, identity pose. Voxel corners on the axis, world (0,0,k*vs),
+// project exactly onto that pixel; every off-axis voxel within the volume
+// projects outside the 4x4 image (|x|*fx/z >= 0.5 px). So voxel k on the axis
+// gets exactly ONE update per frame with sdf = D - k*vs, and nothing else is
+// touched. Two frames with different depth and colour are folded by hand in
+// double with the documented formulas:
+//   tsdf   <- (tsdf*w + min(1, sdf/trunc)) / (w + 1)   when sdf >= -trunc
+//   weight <- min(w + 1, max_weight)
+//   colour <- (c*w + byte/255) / (w + 1)                when |sdf| < trunc/2
 
 const Voxel& atVoxel(const TSDFVolume& v, int x, int y, int z) {
     const int res = v.params().resolution;
@@ -247,9 +250,7 @@ const Voxel& atVoxel(const TSDFVolume& v, int x, int y, int z) {
 void runHandDerivedOracle() {
     const std::string stage = "hand-oracle";
 
-    // Product geometry constants (must match the derivation below).
     const float vs = 0.01f, trunc = 0.03f;
-    const float D  = 0.5015f;
     TSDFParams p;
     p.resolution = 64;
     p.voxel_size = vs;
@@ -258,86 +259,68 @@ void runHandDerivedOracle() {
     p.origin     = Eigen::Vector3f(-0.32f, -0.32f, 0.0f);
 
     const int W = 4, H = 4, px = 2, py = 2;
-    const int ox = 32, oy = 32;            // floor((0 - (-0.32)) / 0.01) = 32
-    const uint8_t R = 200, G = 100, B = 40;
+    const int ox = 32, oy = 32;             // (0 - (-0.32)) / 0.01 = 32: the axis
+    struct Frame { float D; uint8_t R, G, B; };
+    const Frame frames[2] = {{0.5015f, 200, 100, 40}, {0.5065f, 60, 180, 250}};
 
-    std::vector<float> depth(static_cast<size_t>(W) * H, 0.0f);   // invalid everywhere ...
-    depth[py * W + px] = D;                                       // ... except the axis pixel
-    std::vector<uint8_t> rgb(static_cast<size_t>(W) * H * 3);
-    for (int i = 0; i < W * H; ++i) { rgb[i*3+0]=R; rgb[i*3+1]=G; rgb[i*3+2]=B; }
-
-    // The march sequence is a pure function of the input, so the fold is the same at
-    // any thread count; run at 4 and assert the two derived voxels.
     pinThreads(4);
     TSDFVolume vol(p);
-    vol.integrate(depth.data(), rgb.data(), Eigen::Matrix4f::Identity(),
-                  500.0f, 500.0f, static_cast<float>(px), static_cast<float>(py), W, H, 0.1f, 3.0f);
+    for (const Frame& f : frames) {
+        std::vector<float> depth(static_cast<size_t>(W) * H, 0.0f);
+        depth[py * W + px] = f.D;
+        std::vector<uint8_t> rgb(static_cast<size_t>(W) * H * 3);
+        for (int i = 0; i < W * H; ++i) { rgb[i*3+0]=f.R; rgb[i*3+1]=f.G; rgb[i*3+2]=f.B; }
+        vol.integrate(depth.data(), rgb.data(), Eigen::Matrix4f::Identity(),
+                      500.0f, 500.0f, static_cast<float>(px), static_cast<float>(py),
+                      W, H, 0.1f, 3.0f);
+    }
     restoreThreads();
 
-    // Reference fold in double, applied in canonical (step-ascending) order.
-    const double cap = 128.0, wnew = 1.0, eps = 1e-6;
-    auto blendTsdf = [&](double tsdf_old, double w_old, double v) {
-        return (tsdf_old * w_old + v * wnew) / (w_old + wnew + eps);
+    // Reference fold for axis voxel k.
+    struct Ref { double tsdf, w, r, g, b; };
+    auto fold = [&](int k) {
+        Ref v{EMPTY_TSDF, 0.0, EMPTY_COLOR, EMPTY_COLOR, EMPTY_COLOR};
+        for (const Frame& f : frames) {
+            const double sdf = static_cast<double>(f.D) - static_cast<double>(static_cast<float>(k) * vs);
+            if (sdf < -trunc) continue;
+            const double tn = std::min(1.0, sdf / trunc);
+            const double w  = v.w;
+            v.tsdf = (v.tsdf * w + tn) / (w + 1.0);
+            if (std::fabs(sdf) < 0.5 * trunc) {
+                v.r = (v.r * w + f.R / 255.0) / (w + 1.0);
+                v.g = (v.g * w + f.G / 255.0) / (w + 1.0);
+                v.b = (v.b * w + f.B / 255.0) / (w + 1.0);
+            }
+            v.w = std::min(w + 1.0, 128.0);
+        }
+        return v;
     };
-    auto blendColor = [&](double old_c, double w_old, uint8_t src) -> double {
-        // Canonical CPU color fold (Todo 19): the incoming byte becomes float
-        // sRGB and blends through the same denominator as tsdf, with no
-        // per-update rounding back to a byte.
-        return (old_c * w_old + static_cast<double>(src) / 255.0) / (w_old + wnew + eps);
-    };
-    const double ec = static_cast<double>(EMPTY_COLOR);
 
-    // Two-hit voxel (32,32,47): steps 0 and 1 => tsdf_new = 1.0 then 0.75.
-    const double a = 1.0, b = 0.75;
-    double w1 = std::min(0.0 + wnew, cap);
-    double s1 = blendTsdf(EMPTY_TSDF, 0.0, a);
-    double w2 = std::min(w1 + wnew, cap);
-    double s2 = blendTsdf(s1, w1, b);
-    const double r1 = blendColor(ec, 0.0, R), r2 = blendColor(r1, w1, R);
-    const double g1 = blendColor(ec, 0.0, G), g2 = blendColor(g1, w1, G);
-    const double b1 = blendColor(ec, 0.0, B), b2 = blendColor(b1, w1, B);
+    int surface_checked = 0;
+    for (int k = 1; k < 64; ++k) {
+        const Ref want = fold(k);
+        const Voxel& got = atVoxel(vol, ox, oy, k);
+        const std::string tag = stage + " k=" + std::to_string(k);
+        CHECK(got.weight == static_cast<float>(want.w), tag + ": weight is one per frame");
+        CHECK(std::fabs(got.tsdf - want.tsdf) < 2e-5, tag + ": tsdf matches the double fold");
+        CHECK(std::fabs(got.r - want.r) < 2e-6 && std::fabs(got.g - want.g) < 2e-6 &&
+              std::fabs(got.b - want.b) < 2e-6, tag + ": colour matches the double fold");
+        if (want.w == 2.0 && std::fabs(want.tsdf) < 0.5) ++surface_checked;
+    }
+    CHECK(surface_checked >= 2, stage + ": the fixture exercises blended surface voxels");
 
-    const Voxel& v47 = atVoxel(vol, ox, oy, 47);
-    CHECK(v47.weight == static_cast<float>(w2), stage + ": two-hit voxel weight == 2 (both steps counted, none lost)");
-    CHECK(std::fabs(static_cast<double>(v47.tsdf) - s2) < 2e-6, stage + ": two-hit voxel tsdf matches the double fold");
-    CHECK(std::fabs(static_cast<double>(v47.r) - r2) < 2e-6 &&
-          std::fabs(static_cast<double>(v47.g) - g2) < 2e-6 &&
-          std::fabs(static_cast<double>(v47.b) - b2) < 2e-6,
-          stage + ": two-hit voxel color matches the double fold");
-    // Anti-single-apply discriminators: a lost/undropped step would leave tsdf at one
-    // of the individual candidate values or weight at 1, not the mean of both.
-    CHECK(std::fabs(static_cast<double>(v47.tsdf) - a) > 1e-3 &&
-          std::fabs(static_cast<double>(v47.tsdf) - b) > 1e-3,
-          stage + ": two-hit tsdf is the mean of BOTH steps, not one alone");
-    CHECK(v47.weight != 1.0f, stage + ": two-hit weight is not the single-update value");
+    // Voxel 50 sits 1.5 mm / 6.5 mm in front of the two surfaces: both frames
+    // fold in, colour included, so it is the mean of two distinct updates.
+    const Voxel& v50 = atVoxel(vol, ox, oy, 50);
+    CHECK(v50.weight == 2.0f, stage + ": surface voxel took exactly two updates");
+    CHECK(std::fabs(v50.r - (200.0 / 255.0 + 60.0 / 255.0) / 2.0) < 2e-6,
+          stage + ": surface voxel colour is the mean of both frames");
+    // Voxel 54 is beyond D + trunc for both frames: never touched.
+    CHECK(atVoxel(vol, ox, oy, 54).weight == 0.0f, stage + ": voxel behind the band untouched");
+    CHECK(atVoxel(vol, ox + 1, oy, 50).weight == 0.0f, stage + ": off-axis voxel untouched");
 
-    // Single-hit voxel (32,32,48): step 2 => tsdf_new = 0.5, so the fixture is proven
-    // to distinguish hit counts (it is not "every voxel weight 2").
-    const double c = 0.5;
-    double wSingle = std::min(0.0 + wnew, cap);
-    double sSingle = blendTsdf(EMPTY_TSDF, 0.0, c);
-    const double rSingle = blendColor(ec, 0.0, R);
-    const double gSingle = blendColor(ec, 0.0, G);
-    const double bSingle = blendColor(ec, 0.0, B);
-    const Voxel& v48 = atVoxel(vol, ox, oy, 48);
-    CHECK(v48.weight == static_cast<float>(wSingle) && v48.weight == 1.0f,
-          stage + ": single-hit voxel weight == 1 (fixture distinguishes hit counts)");
-    CHECK(std::fabs(static_cast<double>(v48.tsdf) - sSingle) < 2e-6,
-          stage + ": single-hit voxel tsdf matches the single double fold");
-    CHECK(std::fabs(static_cast<double>(v48.r) - rSingle) < 2e-6 &&
-          std::fabs(static_cast<double>(v48.g) - gSingle) < 2e-6 &&
-          std::fabs(static_cast<double>(v48.b) - bSingle) < 2e-6,
-          stage + ": single-hit voxel color matches the single double fold");
-    // A single update from the neutral EMPTY_COLOR must land exactly on the
-    // normalized input byte, not on the byte value itself (120 would be an
-    // out-of-range sRGB component) and not on a re-rounded byte mean.
-    CHECK(std::fabs(static_cast<double>(v48.r) - static_cast<double>(R) / 255.0) < 1e-6,
-          stage + ": one update equals the normalized input float R/255");
-
-    // Thread-count equivalence for this same code path is locked by the wall scenario.
-
-    std::printf("ORACLE two_hit tsdf=%.9g weight=%.9g rgb=(%.9g,%.9g,%.9g) single_hit tsdf=%.9g weight=%.9g rgb=(%.9g,%.9g,%.9g)\n",
-                v47.tsdf, v47.weight, v47.r, v47.g, v47.b, v48.tsdf, v48.weight, v48.r, v48.g, v48.b);
+    std::printf("ORACLE v50 tsdf=%.9g weight=%.9g rgb=(%.9g,%.9g,%.9g)\n",
+                v50.tsdf, v50.weight, v50.r, v50.g, v50.b);
 }
 
 } // namespace
@@ -348,7 +331,7 @@ int main() {
 
     if (g_failures == 0) {
         std::printf("tsdf_integration_race_contract: PASS (%d checks: 3-run byte-identical "
-                    "volume+mesh, threads 1/2/4 equivalence, hand-derived two-hit blend)\n",
+                    "volume+mesh, threads 1/2/4 equivalence, hand-derived two-frame fold)\n",
                     g_checks);
         return 0;
     }

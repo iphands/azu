@@ -144,12 +144,12 @@ integration only at restart, no longer exists. Locked by
 `cross-backend:A28`.
 
 The band is a camera-plane **Z-depth** bound in meters, on both the integration
-and the raycast side. A ray-cam direction `(u, v, 1)` reaches camera depth `z` at
-Euclidean ray parameter `t = z * ||(u, v, 1)||`, so every march that counts `t`
-must scale the band by that norm: the integration near clamp is
-`max(min_depth * ray_dist_scale, t_meas - truncation)` and the raycast marches
-`[min_depth, max_depth] * ||ray_cam||`. Applying the band as a raw ray parameter
-instead mislocates every off-axis hit by that ratio.
+and the raycast side. Integration gates the *measured* depth of the pixel a voxel
+projects into (`min_depth <= d <= max_depth`). The raycast marches along a
+ray-cam direction `(u, v, 1)`, which reaches camera depth `z` at Euclidean ray
+parameter `t = z * ||(u, v, 1)||`, so it marches `[min_depth, max_depth] *
+||ray_cam||`. Applying the band as a raw ray parameter instead mislocates every
+off-axis hit by that ratio.
 
 The raw band and the min/max band are no longer enforced at different layers on
 CPU: `cpuDepthMeters()` applies the raw predicate and the band in one call, and
@@ -232,21 +232,34 @@ Current CPU behavior:
   section states below as "20 B vs 32 B". The layout translation happens
   in exactly one place per backend. Deferred as `cross-backend:B3`.
 
-Canonical integration gate: `integrate()` honors the band **passed to it** — both as
-the per-pixel validity gate and as the near clamp of the truncation march. The CPU
-hard-coded `0.1f` floor (`d_meas < 0.1f`, `t_min = std::max(0.1f, ...)`) that silently
-overrode the caller's near bound is gone; both sites now use the `min_depth` argument,
-with the march clamp scaled to the ray parameter as described above. `integrateCPU()`
-never reads `TSDFParams::min_depth` / `max_depth`; those fields bound the raycast, and
-the band reaches integration only through the public entry point's arguments.
-**Fixed by big-fix Todo 15**, locked by `tests/tsdf_integration_min_depth_contract.cpp`
-(which drives the band through `integrate()`'s parameters). Deferred backend instance:
-`tsdf:T8`. The snapshot lifecycle that kept the GUI slider stale for integration until
-restart was Todo 24's scope rather than a Todo 15 defect, and Todo 24 closed it on CPU
-(per-frame `hyperparamsSnapshot()` inside `integrationLoop()` at
-`PipelineController.cpp:1075`, locked by
-`tests/pipeline_hyperparams_contract.cpp`); the backend instance stays deferred as
-`cross-backend:A28`.
+Canonical integration (**big-fix-two T0.9**): voxel-projective, KinectFusion
+Alg. 1, the same scheme as the CUDA kernel.
+
+- Voxel `i` stands for its **corner** `origin + i * voxel_size`. The integrator,
+  `getTSDF()` trilinear sampling, marching cubes and the raycast all use this one
+  convention. (The replaced per-pixel ray march stored an SDF sampled somewhere
+  inside the voxel at the corner, biasing a flat wall ~4-7 mm toward the camera.)
+- Only voxels inside the camera frustum's AABB (camera centre + image corners at
+  `max_depth + truncation`, clamped to the volume) are visited.
+- Each visited voxel projects to pixel `(floor(fx*x/z + cx + 0.5),
+  floor(fy*y/z + cy + 0.5))`; it is skipped if `z <= 0`, the pixel is outside
+  the image, or the measured depth `d` is non-finite or outside the band passed
+  to `integrate()`.
+- `sdf = d - z`; skipped if `sdf < -truncation`, otherwise `tsdf_new =
+  min(1, sdf / truncation)` — free space in front of the surface is observed
+  too.
+- **Exactly one update per voxel per frame**: `tsdf = (tsdf*w + tsdf_new) /
+  (w + 1)`, `w = min(w + 1, max_weight)`. `max_weight` therefore counts frames
+  (the ray march added ~20-40 per frame).
+- Colour blends with the same weights only when `rgb != nullptr` and `|sdf| <
+  truncation / 2`.
+- `integrateCPU()` never reads `TSDFParams::min_depth` / `max_depth`; those bound
+  the raycast. No hard-coded near floor exists.
+
+Locked by `tests/fusion_bias_contract.cpp` (tilted plane: mean signed surface
+error < 0.5 mm, weight == frames, identical volume at 1/4/16 threads),
+`tests/tsdf_integration_race_contract.cpp` (hand-derived two-frame fold) and
+`tests/tsdf_integration_min_depth_contract.cpp` (the band gate).
 
 Canonical raycast: the march is bounded by `params_.min_depth` / `params_.max_depth`
 scaled to the ray parameter (`t = depth * norm(ray_cam)`), never by the literals `0.3f`
@@ -1011,26 +1024,14 @@ Canonical CPU determinism: repeated CPU runs over identical input are
 byte-identical where a test asserts it. That is why the EMA race above is a
 correctness defect and not a cosmetic one: it breaks the repeat contract.
 
-CPU TSDF integration determinism is **fixed by big-fix Todo 14**. `integrateCPU()`
-used to run `#pragma omp parallel for` over pixels and read-modify-write
-`voxels_[idx(vx,vy,vz)]` from every thread, so two pixels whose ray marches
-overlapped a voxel raced on `weight` / `tsdf` / color and the fused voxel changed
-run to run. It is now a deterministic two-phase merge: Phase 1 derives each
-candidate (target voxel, `tsdf_new`, color-eligibility, its own RGB) from a single
-(pixel, step) with no shared write, and Phase 2 applies every candidate **serially in
-canonical raster + march order** — increasing `y`, then increasing `x`, then increasing
-march step — through the unchanged weight / TSDF / color formulas (`w_new = 1`, weight
-cap `max_weight`, TSDF blend denominator `w_old + 1 + 1e-6f`, color blend over the same
-denominator, color eligibility `rgb && sdf > -trunc * 0.5f`). Candidates are ordered by
-a lossless `((y*width+x) << 32) | step` sequence key, so the fold is a pure function of
-the input: byte-identical across repeated runs and across OpenMP thread counts 1 / 2 /
-4, and identical to the single-thread fold. Locked by
-`tests/tsdf_integration_race_contract.cpp` (three-run byte-identical volume + mesh and
-a hand-derived double blend oracle). The depth `0.1f` floor, the `vs * 0.75f` march
-step, the `sdf < -trunc` rejection, and the NaN/Inf guards are unchanged; the
-configured `min_depth` is still owned by the later depth-domain todo (Todo 15). The
-CUDA/HIP integration kernels keep the same concurrent read-modify-write and are
-untouched — deferred, not compiled, not runtime-tested (`tsdf:T3`).
+CPU TSDF integration is deterministic by construction (**big-fix-two T0.9**):
+each voxel is written by exactly one thread, once per frame, from inputs that do
+not depend on the schedule, so the volume is byte-identical across repeated runs
+and OpenMP thread counts. (big-fix Todo 14 had made the old per-pixel ray march
+deterministic with a sort and a serial fold, which cost ~150 ms per frame.)
+AZU_TSDF_LOG diagnostics are reduced per voxel row in fixed order, so they are
+deterministic too. Locked by `tests/tsdf_integration_race_contract.cpp` and
+`tests/fusion_bias_contract.cpp`.
 
 GPU is not deterministic in the same sense, and this is documented rather than
 fixed: the Hessian is reduced with `atomicAdd` over ~300 blocks, so the fp32

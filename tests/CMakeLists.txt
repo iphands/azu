@@ -329,6 +329,14 @@ set_tests_properties(icp_numeric_policy_contract PROPERTIES LABELS cpu TIMEOUT 1
 # step changes it — never compared against product output. No device, display, GPU,
 # sensor, thread timing or filesystem. RED against the pre-fix racy integrateCPU
 # (threads 2/4 diverge from threads 1); GREEN once the stateful merge is serial.
+# big-fix-two T0.9: fused plane sits on the true surface (no half-voxel bias),
+# weight counts frames, volume identical across thread counts.
+add_executable(fusion_bias_contract fusion_bias_contract.cpp)
+target_compile_definitions(fusion_bias_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(fusion_bias_contract PRIVATE azu_test_core)
+add_test(NAME fusion_bias_contract COMMAND fusion_bias_contract)
+set_tests_properties(fusion_bias_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 add_executable(tsdf_integration_race_contract tsdf_integration_race_contract.cpp)
 target_compile_definitions(tsdf_integration_race_contract PRIVATE ${AZU_TEST_DEFS})
 target_link_libraries(tsdf_integration_race_contract PRIVATE azu_test_core)

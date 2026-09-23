@@ -251,10 +251,14 @@ Frames makeFrame(uint8_t r, uint8_t g, uint8_t b) {
     return f;
 }
 
+// A fused SURFACE voxel. Voxel-projective integration also observes free space
+// in front of the surface (tsdf == 1, weight > 0), and colour is only fused
+// within half a truncation of the surface, so "first voxel with weight" would
+// pick an uncoloured free-space voxel.
 const Voxel& observedVoxel(const TSDFVolume& vol) {
     const std::vector<Voxel>& all = vol.voxelData();
     for (size_t i = 0; i < all.size(); ++i) {
-        if (all[i].weight > 0.0f) return all[i];
+        if (all[i].weight > 0.0f && std::fabs(all[i].tsdf) < 0.25f) return all[i];
     }
     return all.front();
 }

@@ -6,25 +6,16 @@
 //   A  the configured min_depth is the pixel gate: a frame whose only valid pixel is
 //      nearer than min_depth leaves the volume in the canonical empty state, while the
 //      identical frame with a smaller min_depth integrates
-//   B  the configured min_depth also raises the march's near clamp, so the first march
-//      step moves and the voxel it folds is a different hand-derived number
-//      (the historical hard-coded 0.1f floor gives both volumes the SAME value)
+//   B  an accepted pixel folds hand-derived voxel values (one update per voxel per
+//      frame, SDF at the voxel corner), identical for any min_depth it passes
 //   C  max_depth still gates, and non-finite depth still gates
 //   D  TSDFParams carries the band with the documented defaults, and the single
 //      hyperparameter owner propagates it (no second store)
 //
 // Fixture: 64^3 volume, 10 mm voxels, truncation 25 mm, origin (-0.32,-0.32,0). A 4x4
-// frame whose ONLY valid pixel is (2,2) with cx=cy=2, fx=fy=500, so that pixel's ray is
-// exactly (0,0,1): its march sample at parameter t sits at world (0,0,t) and
-// sdf = D - t. The march step is voxel_size*0.75 = 7.5 mm.
-//   D = 0.50125, trunc = 0.025  ->  t_max = 0.52625
-//   min_depth 0.1    -> t_min = max(0.1,    0.47625) = 0.47625 -> z/vs = 47.625
-//   min_depth 0.4775 -> t_min = max(0.4775, 0.47625) = 0.47750 -> z/vs = 47.750
-// Both first steps land in voxel (32,32,47) (v.x = v.y = 0.32/0.01 = 32) and each voxel
-// 47 gets exactly ONE candidate, so its folded value is the single-candidate blend
-//   tsdf = (EMPTY_TSDF*0 + tsdf_new*1) / (0 + 1 + 1e-6),  weight = min(0+1, 128) = 1
-//   tsdf_new(A) = min(1, (0.50125-0.47625)/0.025) = min(1, 1.0)  = 1.0
-//   tsdf_new(C) =        (0.50125-0.47750)/0.025  = 0.02375/0.025 = 0.95
+// frame whose ONLY valid pixel is (2,2) with cx=cy=2, fx=fy=500, so the axis voxel
+// corners (0,0,k*vs) project exactly onto it and every off-axis voxel falls outside
+// the image. D = 0.50125, trunc = 0.025.
 #include "app/FusionHyperparams.h"
 #include "tsdf/TSDFVolume.h"
 #include "utils/ColorMath.h"
@@ -32,6 +23,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
@@ -168,58 +160,43 @@ void gateA_pixelGate() {
 }
 
 // ---------------------------------------------------------------------------
-// B. the configured min_depth also moves the march's near clamp
+// B. an accepted pixel folds the hand-derived voxel values, whatever min_depth is
 // ---------------------------------------------------------------------------
-// The near clamp is a Z-depth clamp, so it is applied to the derived march interval in
-// the same units the pixel gate uses. Voxel (32,32,47) takes exactly one candidate in
-// each volume; the two candidates differ because the march start differs.
-void gateB_marchNearClamp() {
-    const std::string tag        = "B/march-near-clamp";
-    const double      eps_blend  = 1e-6;      // the documented blend epsilon
+// Voxel-projective integration has no march and no near clamp: min_depth only
+// gates the MEASURED depth. Axis voxel k (world z = k*vs) takes one update with
+// sdf = D - k*vs. Voxel 50 (sdf = +1.25 mm) is a surface voxel inside the colour
+// band |sdf| < trunc/2; voxel 47 (sdf = +31.25 mm > trunc) is free space: tsdf 1,
+// weight 1, colour untouched. Both volumes must agree bit for bit.
+void gateB_acceptedPixelFold() {
+    const std::string tag = "B/accepted-pixel-fold";
 
-    const double tsdf_new_open  = 1.0;                       // min(1, 0.025/0.025)
-    const double expect_open    = (EMPTY_TSDF * 0.0 + tsdf_new_open * 1.0) / (0.0 + 1.0 + eps_blend);
-    const double tsdf_new_clipped = (kDepth - 0.4775) / kTrunc;   // 0.02375/0.025 = 0.95
-    const double expect_clipped   = (EMPTY_TSDF * 0.0 + tsdf_new_clipped * 1.0) / (0.0 + 1.0 + eps_blend);
-
-    TSDFVolume open_vol(fixtureParams()), clipped_vol(fixtureParams());
+    TSDFVolume open_vol(fixtureParams()), tight_vol(fixtureParams());
     integrateOnce(0.10f, 3.0f, kDepth, open_vol);
-    integrateOnce(0.4775f, 3.0f, kDepth, clipped_vol);
+    integrateOnce(0.50f, 3.0f, kDepth, tight_vol);   // 0.50125 still passes
 
-    const Voxel& o = atVoxel(open_vol, 32, 32, 47);
-    const Voxel& c = atVoxel(clipped_vol, 32, 32, 47);
-
-    CHECK(o.weight == 1.0f && c.weight == 1.0f,
-          tag + ": each voxel 47 took exactly one candidate (w=1), got " +
-              std::to_string(o.weight) + " / " + std::to_string(c.weight));
-    CHECK(std::fabs(static_cast<double>(o.tsdf) - expect_open) < 1e-5,
-          tag + ": min_depth=0.10 voxel tsdf == " + std::to_string(expect_open) + ", got " +
-              std::to_string(o.tsdf));
-    CHECK(std::fabs(static_cast<double>(c.tsdf) - expect_clipped) < 1e-5,
-          tag + ": min_depth=0.4775 voxel tsdf == " + std::to_string(expect_clipped) +
-              " (march started at the configured near bound), got " + std::to_string(c.tsdf));
-    // The discriminator, independent of any tolerance: a hard-coded 0.1f floor makes
-    // the two volumes identical.
-    CHECK(std::fabs(static_cast<double>(o.tsdf) - static_cast<double>(c.tsdf)) > 0.04,
-          tag + ": the configured band demonstrably changed the fold, delta=" +
-              std::to_string(std::fabs(o.tsdf - c.tsdf)));
-    // Color gate: both voxels are in the color band (sdf > -trunc/2), and the single
-    // float-sRGB update from EMPTY_COLOR is the hand-derived normalized src value
-    // divided by the same blend denominator (Todo 19) - not the raw byte, which is an
-    // out-of-range sRGB component, and not a re-rounded byte.
-    const double expect_r = colorOracle(kR), expect_g = colorOracle(kG), expect_b = colorOracle(kB);
-    CHECK(nearColor(o.r, expect_r) && nearColor(o.g, expect_g) && nearColor(o.b, expect_b),
-          tag + ": color of the accepted voxel is the frame's RGB, got (" + std::to_string(o.r) +
-              "," + std::to_string(o.g) + "," + std::to_string(o.b) + ")");
-    CHECK(nearColor(c.r, expect_r) && nearColor(c.g, expect_g) && nearColor(c.b, expect_b),
-          tag + ": the clipped voxel keeps the same color");
-    // And the byte an extraction boundary would publish is exactly the input byte.
-    uint8_t qr = 0, qg = 0, qb = 0;
-    CHECK(kfusion::utils::srgbFloatToUint8(o.r, qr) && kfusion::utils::srgbFloatToUint8(o.g, qg) &&
-              kfusion::utils::srgbFloatToUint8(o.b, qb) && qr == kR && qg == kG && qb == kB,
-          tag + ": the float color quantizes back to the frame's exact RGB bytes");
-    std::printf("B tsdf_open=%.9f want=%.9f tsdf_clipped=%.9f want=%.9f w=%.6f/%.6f\n", o.tsdf,
-                expect_open, c.tsdf, expect_clipped, o.weight, c.weight);
+    const double expect_surface = (kDepth - 0.50) / kTrunc;   // 0.05
+    for (const TSDFVolume* vol : {&open_vol, &tight_vol}) {
+        const std::string who = tag + (vol == &open_vol ? " min=0.10" : " min=0.50");
+        const Voxel& s50 = atVoxel(*vol, 32, 32, 50);
+        const Voxel& f47 = atVoxel(*vol, 32, 32, 47);
+        CHECK(s50.weight == 1.0f && std::fabs(static_cast<double>(s50.tsdf) - expect_surface) < 1e-5,
+              who + ": surface voxel tsdf == " + std::to_string(expect_surface) + ", got " +
+                  std::to_string(s50.tsdf));
+        const double er = colorOracle(kR), eg = colorOracle(kG), eb = colorOracle(kB);
+        CHECK(nearColor(s50.r, er) && nearColor(s50.g, eg) && nearColor(s50.b, eb),
+              who + ": surface voxel colour is the frame's RGB");
+        uint8_t qr = 0, qg = 0, qb = 0;
+        CHECK(kfusion::utils::srgbFloatToUint8(s50.r, qr) && kfusion::utils::srgbFloatToUint8(s50.g, qg) &&
+                  kfusion::utils::srgbFloatToUint8(s50.b, qb) && qr == kR && qg == kG && qb == kB,
+              who + ": the float colour quantizes back to the frame's exact RGB bytes");
+        CHECK(f47.weight == 1.0f && f47.tsdf == 1.0f, who + ": free-space voxel observed as tsdf 1");
+        CHECK(f47.r == EMPTY_COLOR && f47.g == EMPTY_COLOR && f47.b == EMPTY_COLOR,
+              who + ": free-space voxel colour untouched (outside the colour band)");
+    }
+    CHECK(std::memcmp(open_vol.voxelData().data(), tight_vol.voxelData().data(),
+                      open_vol.voxelData().size() * sizeof(Voxel)) == 0,
+          tag + ": min_depth below the measured depth does not change the fold");
+    std::printf("B surface tsdf=%.9f want=%.9f\n", atVoxel(open_vol, 32, 32, 50).tsdf, expect_surface);
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +287,7 @@ void gateD_configuration() {
 
 int main() {
     gateA_pixelGate();
-    gateB_marchNearClamp();
+    gateB_acceptedPixelFold();
     gateC_farAndNonFinite();
     gateD_configuration();
 

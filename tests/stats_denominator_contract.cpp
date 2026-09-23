@@ -13,11 +13,11 @@
 // never a snapshot of product output:
 //   * [TSDF] A mean of k non-negative samples with maximum M satisfies M/k <= mean
 //     <= mean*k, i.e. mean * count >= maximum and mean <= maximum. The fixture is a
-//     frame with exactly ONE valid pixel, so the contributor count is the raster
-//     ray traversal (<= resolution voxels) while the raster is 307200 pixels; a
-//     raster-size denominator divides the mean by ~44000 and fails mean*count >= max
-//     by four orders of magnitude. depth_filtered is an independent count of the
-//     fixture's own invalid pixels, and an all-invalid frame must report avg 0.0
+//     frame with one 32x32 valid block, so the contributor count is bounded by that
+//     block while the raster is 307200 pixels; a raster-size denominator divides the
+//     mean by orders of magnitude and fails mean*count >= max. depth_filtered is an
+//     independent count of the fixture's own invalid pixels, and an all-invalid
+//     frame must report avg 0.0
 //     exactly, never NaN.
 //   * [TSDF] Padding invariance: identical valid pixel sets must yield identical
 //     counters and identical means whether the remaining pixels carry the invalid
@@ -204,9 +204,15 @@ void scenarioTsdf() {
     p.voxel_size = 0.02f;
     p.origin     = Eigen::Vector3f(-0.64f, -0.64f, 0.0f);
 
+    // A 32x32 valid block at 1 m. Voxel-projective integration updates the
+    // voxels whose corners project into valid pixels; at 2 cm voxels a single
+    // ~2 mm pixel usually contains no corner at all, so the fixture needs a
+    // small patch to have contributors while staying far below the raster.
+    constexpr int kBx0 = 304, kBy0 = 224, kB = 32;
+    constexpr int kBlockPixels = kB * kB;
     std::vector<float> depth(static_cast<size_t>(kRasters), 0.0f);
-    const int single = 240 * FRAME_W + 320;
-    depth[single] = 1.0f;
+    for (int y = kBy0; y < kBy0 + kB; ++y)
+        for (int x = kBx0; x < kBx0 + kB; ++x) depth[y * FRAME_W + x] = 1.0f;
 
     // One integrate() from a fresh volume: the CSV row is that frame's whole story.
     {
@@ -226,10 +232,10 @@ void scenarioTsdf() {
     const double max_sdf  = field(csv, 0, "max_sdf");
     const double avg_sdf  = field(csv, 0, "avg_sdf");
 
-    CHECK(filtered == kRasters - 1, "depth_filtered counts the fixture's invalid pixels");
-    CHECK(updated >= 1.0, "a valid pixel updates at least one voxel");
-    CHECK(updated <= p.resolution,
-          "one pixel cannot update more voxels than one ray traversal");
+    CHECK(filtered == kRasters - kBlockPixels, "depth_filtered counts the fixture's invalid pixels");
+    CHECK(updated >= 1.0, "the valid block updates at least one voxel");
+    CHECK(updated <= static_cast<double>(kBlockPixels) * p.resolution,
+          "contributors are bounded by the valid block, not the raster");
     // The decisive pair. With a raster-size denominator avg_sdf is smaller than
     // this by ~44000/updated, so the inequality fails loudly.
     checkMeanBounds(avg_sdf, max_sdf, updated, "TSDF avg_sdf is a mean over updated voxels");
@@ -238,7 +244,8 @@ void scenarioTsdf() {
     // Padding invariance: same valid set, the rest out-of-band instead of the
     // invalid sentinel. Every counter and the mean must be untouched.
     std::vector<float> padded(static_cast<size_t>(kRasters), 10.0f);
-    padded[single] = 1.0f;
+    for (int y = kBy0; y < kBy0 + kB; ++y)
+        for (int x = kBx0; x < kBx0 + kB; ++x) padded[y * FRAME_W + x] = 1.0f;
     {
         TSDFVolume v(p);
         v.integrate(padded.data(), nullptr, Eigen::Matrix4f::Identity(),
