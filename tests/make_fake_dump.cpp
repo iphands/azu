@@ -20,7 +20,15 @@
 // An optional noise scale (1.0 = the Kinect v1 axial model sigma(z) = 0.0012 +
 // 0.0019 (z - 0.4)^2, per frame, seeded by frame index) adds depth noise.
 //
-// usage: make_fake_dump <out_dir> [frames] [pan|spin] [fx] [noise]
+// "protocol" mode writes a take following the handheld recording protocol, with
+// known boundaries for azu_trim tests (frames argument ignored, 171 frames):
+//   frames   0- 14  getting in position: jerky pose, accelerometer jitter 0.08 g
+//   frames  15- 74  hold: still, jitter 0.008 g
+//   frames  75- 95  turn 60 deg, jitter 0.04 g
+//   frames  96-155  hold: still, jitter 0.008 g
+//   frames 156-170  reaching for the keyboard: camera still, jitter 0.1 g
+//
+// usage: make_fake_dump <out_dir> [frames] [pan|spin|protocol] [fx] [noise]
 #include "sensor/DepthValidity.h"
 #include "support/SyntheticScene.h"
 
@@ -28,9 +36,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
+#include <random>
 #include <algorithm>
 #include <string>
-#include <sys/stat.h>
+#include <filesystem>
+#include <system_error>
 #include <vector>
 
 int main(int argc, char** argv) {
@@ -39,9 +50,12 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string dir = argv[1];
-    const int frames = argc > 2 ? std::atoi(argv[2]) : 60;
-    mkdir(dir.c_str(), 0755);
-    const bool spin = argc > 3 && std::string(argv[3]) == "spin";
+    const std::string mode = argc > 3 ? argv[3] : "pan";
+    const bool spin = mode == "spin";
+    const bool protocol = mode == "protocol";
+    const int frames = protocol ? 171 : (argc > 2 ? std::atoi(argv[2]) : 60);
+    std::error_code mk_ec;
+    std::filesystem::create_directories(dir, mk_ec);   // parents too (mkdir alone did not)
     azu_test::Intrinsics K;
     const float noise = argc > 5 ? std::strtof(argv[5], nullptr) : 0.0f;
     if (argc > 4 && std::strtof(argv[4], nullptr) > 0.0f) {
@@ -82,7 +96,20 @@ int main(int argc, char** argv) {
         if (!f) return 1;
         if (depth) {
             Eigen::Matrix4f pose;
-            if (spin) {
+            if (protocol) {
+                const Eigen::Matrix4f centre = azu_test::makePose({0.0f, 0.0f, 0.0f}, {0.0f, -0.05f, 1.15f});
+                const float deg = 3.14159265f / 180.0f;
+                if (di < 15) {
+                    const float k = static_cast<float>(di);
+                    pose = centre * azu_test::makePose({0.05f * std::sin(k * 1.3f), 0.05f * std::sin(k * 0.7f), 0.0f},
+                                                       {0.02f * std::sin(k * 2.1f), 0.02f * std::cos(k * 1.7f),
+                                                        0.01f * std::sin(k)});
+                } else {
+                    const float yaw = di < 75 ? 0.0f : (di < 96 ? 60.0f * deg * static_cast<float>(di - 75) / 21.0f
+                                                                : 60.0f * deg);
+                    pose = centre * azu_test::makePose({0.0f, yaw, 0.0f}, {0.0f, 0.0f, 0.0f});
+                }
+            } else if (spin) {
                 constexpr int kTurn = 240;   // 240 x 1.5 deg = 360 deg
                 const float yaw = 1.5f * 3.14159265f / 180.0f * static_cast<float>(std::min(di, kTurn));
                 pose = azu_test::makePose({0.0f, 0.0f, 0.0f}, {0.0f, -0.05f, 1.15f}) *
@@ -112,7 +139,17 @@ int main(int argc, char** argv) {
             FILE* af = std::fopen((dir + "/" + aname).c_str(), "wb");
             if (!af) return 1;
             unsigned char tilt[12] = {0};
-            const int16_t accel[3] = {0, 819, 0};
+            int16_t accel[3] = {0, 819, 0};
+            if (protocol) {
+                const int f_idx = di - 1;
+                const double amp = f_idx < 15 ? 0.08 : f_idx < 75 ? 0.008 : f_idx < 96 ? 0.04
+                                 : f_idx < 156 ? 0.008 : 0.1;
+                std::mt19937 rng(static_cast<uint32_t>(7000 + f_idx));
+                std::normal_distribution<double> n(0.0, amp * 819.0);
+                accel[0] = static_cast<int16_t>(std::lround(n(rng)));
+                accel[1] = static_cast<int16_t>(std::lround(819.0 + n(rng)));
+                accel[2] = static_cast<int16_t>(std::lround(n(rng)));
+            }
             std::memcpy(tilt, accel, sizeof(accel));
             std::fwrite(tilt, 1, sizeof(tilt), af);
             std::fclose(af);

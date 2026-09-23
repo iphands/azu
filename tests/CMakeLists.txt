@@ -436,6 +436,13 @@ target_include_directories(recording_trim_contract PRIVATE ${CMAKE_SOURCE_DIR}/t
 add_test(NAME recording_trim_contract COMMAND recording_trim_contract)
 set_tests_properties(recording_trim_contract PROPERTIES LABELS cpu TIMEOUT 60)
 
+# End to end: generated protocol take -> azu_trim -> checks -> azu_replay.
+add_test(NAME trim_e2e
+    COMMAND ${CMAKE_COMMAND} -DGEN=$<TARGET_FILE:make_fake_dump> -DTRIM=$<TARGET_FILE:azu_trim>
+            -DREPLAY=$<TARGET_FILE:azu_replay> -DDIR=${CMAKE_CURRENT_BINARY_DIR}/trim_e2e
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/trim_e2e.cmake)
+set_tests_properties(trim_e2e PROPERTIES LABELS cpu TIMEOUT 180)
+
 add_executable(tsdf_integration_race_contract tsdf_integration_race_contract.cpp)
 target_compile_definitions(tsdf_integration_race_contract PRIVATE ${AZU_TEST_DEFS})
 target_link_libraries(tsdf_integration_race_contract PRIVATE azu_test_core)
