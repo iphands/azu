@@ -257,12 +257,23 @@ int main(int argc, char** argv) {
     // World = first camera. "Up" is the first accelerometer reading (gravity
     // reaction) in camera axes; the accelerometer axes are taken as the camera
     // axes up to per-axis sign, chosen as the flip that best explains the run.
-    const Eigen::Vector3d a0 = records.front().has_accel ? records.front().accel : Eigen::Vector3d(0, -1, 0);
+    // Gravity reference: the first frame that has an accelerometer mean (the
+    // first depth frame can arrive before any sample), paired with that
+    // frame's pose.
+    Eigen::Vector3d a0(0, -1, 0);
+    Eigen::Matrix3d R0 = Eigen::Matrix3d::Identity();
+    for (const FrameRecord& r : records) {
+        if (r.has_accel) {
+            a0 = r.accel;
+            R0 = r.pose.block<3,3>(0,0).cast<double>();
+            break;
+        }
+    }
     Eigen::Vector3d best_sign(1, 1, 1);
     double best_err = 1e9;
     for (int m = 0; m < 8; ++m) {
         const Eigen::Vector3d sgn((m & 1) ? -1 : 1, (m & 2) ? -1 : 1, (m & 4) ? -1 : 1);
-        const Eigen::Vector3d g_world = sgn.cwiseProduct(a0);
+        const Eigen::Vector3d g_world = R0 * sgn.cwiseProduct(a0);
         double sum = 0.0;
         int n = 0;
         for (const FrameRecord& r : records) {
@@ -276,7 +287,8 @@ int main(int argc, char** argv) {
             best_sign = sgn;
         }
     }
-    const Eigen::Vector3d up = best_sign.cwiseProduct(a0).normalized();
+    const Eigen::Vector3d g_world = R0 * best_sign.cwiseProduct(a0);
+    const Eigen::Vector3d up = g_world.normalized();
 
     int good = 0, poor = 0, failed = 0, lost = 0, first_lost = -1;
     double yaw_total = 0.0, tilt_max = 0.0, tilt_sum = 0.0;
@@ -303,8 +315,7 @@ int main(int argc, char** argv) {
         }
         double tilt = 0.0;
         if (r.has_accel) {
-            const Eigen::Vector3d pred =
-                r.pose.block<3,3>(0,0).cast<double>().transpose() * best_sign.cwiseProduct(a0);
+            const Eigen::Vector3d pred = r.pose.block<3,3>(0,0).cast<double>().transpose() * g_world;
             tilt = angleDeg(best_sign.cwiseProduct(r.accel), pred);
             tilt_max = std::max(tilt_max, tilt);
             tilt_sum += tilt;
