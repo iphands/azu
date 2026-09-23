@@ -34,6 +34,8 @@ struct FrameData {
     // within the pairing window); `rgb` then holds stale bytes and must not be
     // fused into the volume.
     bool rgb_valid = true;
+    // Sensor time of the depth frame, ms on the Kinect clock (RawFrame::timestamp_depth).
+    double timestamp_ms = 0.0;
     
     // The world-from-camera transformation found by the tracker for this specific frame
     Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();

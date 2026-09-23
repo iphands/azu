@@ -115,6 +115,12 @@ public:
         return st;
     }
 
+    // Feed a depth / RGB sample as if libfreenect had delivered it (same pairing,
+    // same callback), e.g. from a recording on disk. `timestamp` is in 60 MHz
+    // device ticks. Must not be mixed with a running device.
+    void ingestDepth(const void* data, uint32_t timestamp) { onDepth(data, timestamp); }
+    void ingestRgb(const void* data, uint32_t timestamp) { onRgb(data, timestamp); }
+
     // Returns latest synchronized frame (zero-copy)
     std::shared_ptr<RawFrame> getLatestFrame();
 

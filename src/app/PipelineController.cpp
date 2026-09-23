@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 #ifdef CUDA_ENABLED
@@ -45,6 +46,8 @@ PipelineController::PipelineController(sensor::PreprocessBackend preferred_backe
     for (int i = 0; i < 3; ++i) {
         model_buffers_.buffers[i] = std::make_shared<tracking::ModelFrame>();
     }
+
+    if (const char* trace = std::getenv("AZU_TRACE")) trace_path_ = trace;
 }
 
 PipelineController::~PipelineController() {
@@ -101,9 +104,9 @@ bool PipelineController::startInternal(bool engage_sensor) {
     });
 
     if (!engage_sensor) {
-        KFLOG_WARN("Pipeline",
-                   "TEST SEAM active: sensor init/start bypassed; RawFrames must "
-                   "arrive via injectRawFrameForTests().");
+        KFLOG_INFO("Pipeline",
+                   "Offline start: sensor not opened; frames arrive via "
+                   "submitRawFrame() (or the test seam).");
     } else if (!sensor_->init()) {
         KFLOG_ERROR("Pipeline", "Sensor initialization FAILED. Is the Kinect connected?");
         running_.store(false);
@@ -270,6 +273,14 @@ bool PipelineController::startInternal(bool engage_sensor) {
     {
         std::lock_guard<std::mutex> lk(metrics_mutex_);
         metrics_.backend = backend_label;
+    }
+    resetInFlight();
+    if (!trace_path_.empty()) {
+        if (trace_.open(trace_path_)) {
+            KFLOGF_INFO("Pipeline", "Per-frame trace: %s", trace_path_.c_str());
+        } else {
+            KFLOGF_WARN("Pipeline", "Cannot open trace file %s", trace_path_.c_str());
+        }
     }
 
     // Launch pipeline threads
@@ -511,6 +522,9 @@ void PipelineController::stop() {
   if (meshing_thread_.joinable())
     meshing_thread_.join();
 
+  trace_.close();
+  resetInFlight();
+
   // Terminal state is published only once every writer is gone: trackingLoop
   // stores Running/TrackingLost as it finishes a frame, so storing Stopped
   // before the join let a mid-frame worker overwrite it afterwards.
@@ -730,6 +744,7 @@ void PipelineController::resetUiFrameTestStateForTests() {
 void PipelineController::onRawFrame(std::shared_ptr<sensor::RawFrame> raw) {
   if (!running_.load())
     return;
+  frameEntered();
 
   // Retain-latest, bounded: at capacity the OLDEST queued frame is displaced.
   // The old policy rejected the arriving frame instead, so a burst while the
@@ -751,6 +766,7 @@ void PipelineController::onRawFrame(std::shared_ptr<sensor::RawFrame> raw) {
   // destructed here — past the queue lock — exactly like KinectSensor's
   // publishLatest() does for the frame it replaces.
   displaced.reset();
+  if (displaced_a_frame) frameDone();
 
   raw_frames_total_.fetch_add(1, std::memory_order_relaxed);
   last_raw_frame_ns_.store(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count(),
@@ -771,6 +787,59 @@ void PipelineController::onRawFrame(std::shared_ptr<sensor::RawFrame> raw) {
     KFLOGF_DEBUG("Pipeline", "Sensor throughput: %d frames received (%d stale frames displaced)",
                  fc, dropped);
   }
+}
+
+void PipelineController::frameEntered() {
+  std::lock_guard<std::mutex> lk(idle_mtx_);
+  ++in_flight_;
+}
+
+void PipelineController::frameDone(int n) {
+  if (n <= 0) return;
+  std::lock_guard<std::mutex> lk(idle_mtx_);
+  in_flight_ = std::max<int64_t>(0, in_flight_ - n);
+  if (in_flight_ == 0) idle_cv_.notify_all();
+}
+
+void PipelineController::resetInFlight() {
+  std::lock_guard<std::mutex> lk(idle_mtx_);
+  in_flight_ = 0;
+  idle_cv_.notify_all();
+}
+
+bool PipelineController::waitIdle(std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lk(idle_mtx_);
+  return idle_cv_.wait_for(lk, timeout, [this] { return in_flight_ == 0 || !running_.load(); });
+}
+
+bool PipelineController::startOffline() {
+  return startInternal(false);
+}
+
+void PipelineController::submitRawFrame(std::shared_ptr<sensor::RawFrame> raw) {
+  onRawFrame(std::move(raw));
+}
+
+void PipelineController::setTracePath(const std::string& path) {
+  std::lock_guard<std::mutex> lk(control_mutex_);
+  trace_path_ = path;
+}
+
+float PipelineController::outsideVolumeFraction(const sensor::FrameData& f,
+                                                const Eigen::Matrix4f& pose,
+                                                const tsdf::TSDFParams& p) {
+  const Eigen::Matrix3f R = pose.block<3,3>(0,0);
+  const Eigen::Vector3f t = pose.block<3,1>(0,3);
+  const Eigen::Vector3f lo = p.origin;
+  const Eigen::Vector3f hi = p.origin + Eigen::Vector3f::Constant(p.voxel_size * p.resolution);
+  int total = 0, outside = 0;
+  for (size_t i = 0; i < f.vertices.size(); i += 16) {
+    if (!(f.depth_meters[i] > 0.0f)) continue;
+    const Eigen::Vector3f w = R * f.vertices[i] + t;
+    ++total;
+    if ((w.array() < lo.array()).any() || (w.array() >= hi.array()).any()) ++outside;
+  }
+  return total > 0 ? static_cast<float>(outside) / static_cast<float>(total) : 0.0f;
 }
 
 void PipelineController::emitLivePreview(const sensor::FrameData& f,
@@ -828,8 +897,11 @@ void PipelineController::enqueueForIntegration(
   // the pool mutex its deleter takes.
   displaced.reset();
   if (displaced_a_frame) {
-    std::lock_guard<std::mutex> lk(metrics_mutex_);
-    ++metrics_.dropped_integration_frames;
+    {
+      std::lock_guard<std::mutex> lk(metrics_mutex_);
+      ++metrics_.dropped_integration_frames;
+    }
+    frameDone();
   }
 }
 
@@ -874,16 +946,19 @@ void PipelineController::trackingLoopBody() {
     recordTrackingBandForTests(hp, raw->frame_id);
 #endif
 
+    const auto t_frame = steady_clock::now();
     // Build processed frame here (using pool)
     auto frame = acquireFreeData();
     if (!frame) {
         KFLOG_WARN("Pipeline", "FrameData pool exhausted — dropping raw frame (increase pool or slow capture)");
         sensor_->releaseFrame(std::move(raw)); // Don't forget to recycle raw
+        frameDone();
         continue;
     }
     
     frame->frame_id = raw->frame_id;
     frame->rgb_valid = raw->rgb_valid;
+    frame->timestamp_ms = raw->timestamp_depth;
 
     if (preprocessor_) {
         std::lock_guard<std::mutex> pp_lk(preprocessor_mutex_);
@@ -905,6 +980,7 @@ void PipelineController::trackingLoopBody() {
     
     // We can release 'raw' immediately after buildFrameData copies it
     sensor_->releaseFrame(std::move(raw));
+    const float ms_preprocess = duration<float, std::milli>(steady_clock::now() - t_frame).count();
 
     // Notify UI (throttled, safe shared_ptr copy)
     // REMOVED: To prevent 30FPS UI Flickering & Callback Fighting with integrationLoop.
@@ -915,6 +991,7 @@ void PipelineController::trackingLoopBody() {
         first_frame_ = false;
         frame->pose = Eigen::Matrix4f::Identity();
         const uint64_t origin_id = frame->frame_id;
+        const double origin_t_ms = frame->timestamp_ms;
         // Sole ownership moves into the queue; the previous copy handed this
         // FrameData back to the pool when the local died at the end of the
         // iteration while the queue still referenced it.
@@ -926,6 +1003,14 @@ void PipelineController::trackingLoopBody() {
             metrics_.icp_error   = 0.0f;
         }
         KFLOGF_INFO("Pipeline", "First frame accepted (ID: %lu). Initializing world origin.", origin_id);
+        if (trace_.isOpen()) {
+            FrameTraceRow row;
+            row.frame_id = origin_id;
+            row.t_ms = origin_t_ms;
+            row.queued_for_integration = true;
+            row.ms_preprocess = ms_preprocess;
+            trace_.write(row);
+        }
         continue;
     }
 
@@ -948,6 +1033,7 @@ void PipelineController::trackingLoopBody() {
                 std::lock_guard<std::mutex> lk(metrics_mutex_);
                 ++metrics_.dropped_pre_model_frames;
             }
+            frameDone();
             continue;
         }
     }
@@ -1010,6 +1096,7 @@ void PipelineController::trackingLoopBody() {
 
     // gpu_mutex_ first, tracker_mutex_ second — the order every other GPU path
     // uses; the CPU branches take the tracker lock alone.
+    const auto t_icp = steady_clock::now();
     std::unique_lock<std::mutex> gpu_lk;
     if (use_gpu_.load())
         gpu_lk = std::unique_lock<std::mutex>(gpu_mutex_);
@@ -1094,11 +1181,38 @@ void PipelineController::trackingLoopBody() {
     // unique_lock throws system_error(EPERM).
     if (gpu_lk.owns_lock())
         gpu_lk.unlock();
+    const float ms_icp = duration<float, std::milli>(steady_clock::now() - t_icp).count();
 
     // Grade the solve (tracking/TrackingPolicy.h): Good integrates, Poor only
     // moves the pose, Failed keeps the old pose and counts toward Lost. The
     // per-frame motion gate lives in the policy.
     const tracking::TrackQuality quality = tracking::classifyTracking(icp_result, prev_pose);
+
+    if (trace_.isOpen()) {
+        FrameTraceRow row;
+        row.frame_id = frame->frame_id;
+        row.t_ms = frame->timestamp_ms;
+        row.quality = static_cast<int>(quality);
+        row.relocalizing = is_lost;
+        row.queued_for_integration = (quality == tracking::TrackQuality::Good);
+        row.pose = icp_result.pose;
+        row.predicted = predicted_pose;
+        row.inliers = icp_result.inliers;
+        row.valid_live = icp_result.valid_live_points;
+        row.projected = icp_result.projected_points;
+        row.valid_model = icp_result.valid_model_points;
+        row.dist_filtered = icp_result.dist_filtered;
+        row.angle_filtered = icp_result.angle_filtered;
+        row.rms_m = tracking::icpRmsMeters(icp_result);
+        row.final_step = icp_result.final_step;
+        row.converged = icp_result.converged;
+        row.model_frame_id = model_ref->source_frame_id;
+        row.outside_volume = outsideVolumeFraction(*frame, icp_result.pose, hp.tsdf);
+        row.ms_preprocess = ms_preprocess;
+        row.ms_icp = ms_icp;
+        row.ms_track = duration<float, std::milli>(steady_clock::now() - t_frame).count();
+        trace_.write(row);
+    }
 
     tracked_frames_total_.fetch_add(1, std::memory_order_relaxed);
     {
@@ -1158,6 +1272,7 @@ void PipelineController::trackingLoopBody() {
             } else {
                 // Poor fit: follow the camera, keep the model clean.
                 frame.reset();
+                frameDone();
             }
         } else {
             // One failed frame is not a lost track: keep the previous pose and
@@ -1171,12 +1286,16 @@ void PipelineController::trackingLoopBody() {
                 }
 
                 // Clear the integration queue to prevent "garbage" poses from being integrated
-                std::lock_guard<std::mutex> lk(integration_queue_mutex_);
-                std::queue<std::shared_ptr<sensor::FrameData>> empty;
-                std::swap(integration_queue_, empty);
+                std::queue<std::shared_ptr<sensor::FrameData>> dropped;
+                {
+                    std::lock_guard<std::mutex> lk(integration_queue_mutex_);
+                    std::swap(integration_queue_, dropped);
+                }
+                frameDone(static_cast<int>(dropped.size()));
                 state_.store(PipelineState::TrackingLost);
             }
             frame.reset();
+            frameDone();
         }
     }
 }
@@ -1221,6 +1340,7 @@ void PipelineController::integrationLoopBody() {
     // A depth-only frame still integrates geometry, but its colour is not fused.
     const uint8_t* fuse_rgb = frame->rgb_valid ? frame->rgb.data() : nullptr;
 
+    const auto t_integ = steady_clock::now();
     {
       utils::ScopedTimer t("TSDF Integration");
       // gpu_mutex_ MUST be acquired before tsdf_mutex_ (consistent lock order).
@@ -1271,6 +1391,7 @@ void PipelineController::integrationLoopBody() {
 #endif
     }
 
+    const auto t_raycast = steady_clock::now();
     // 2. Generate model frame for tracking (Ping-Pong back buffer)
     int integrated_count = tsdf_->integratedFrames();
     { // Raycast on every integration; the block scopes the back-buffer bindings.
@@ -1455,9 +1576,21 @@ void PipelineController::integrationLoopBody() {
                   integrated_count);
     }
 
+    if (trace_.isOpen()) {
+      FrameTraceRow row;
+      row.kind = "integ";
+      row.frame_id = frame->frame_id;
+      row.t_ms = frame->timestamp_ms;
+      row.pose = frame->pose;
+      row.ms_integrate = duration<float, std::milli>(t_raycast - t_integ).count();
+      row.ms_raycast = duration<float, std::milli>(steady_clock::now() - t_raycast).count();
+      trace_.write(row);
+    }
+
     // Drop the worker's reference; the frame's custom deleter recycles it into
     // the pool once every other owner has dropped theirs.
     frame.reset();
+    frameDone();
 
     // Mesh cadence: time-based, and a fire-and-forget version bump. The old rule
     // (one request every 5 integrated frames) coupled mesh rate to capture rate,

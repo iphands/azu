@@ -89,6 +89,7 @@ endif()
 # QMetaObject/qApp. No display, no device, no GPU runtime.
 add_library(azu_test_pipeline STATIC
     "${CMAKE_SOURCE_DIR}/src/app/PipelineController.cpp"
+    "${CMAKE_SOURCE_DIR}/src/app/FrameTrace.cpp"
 )
 target_compile_definitions(azu_test_pipeline PUBLIC ${AZU_TEST_DEFS})
 target_link_libraries(azu_test_pipeline PUBLIC azu_test_core Qt6::Core)

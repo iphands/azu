@@ -20,6 +20,7 @@
 #include "tsdf/TSDFVolume.h"
 #include "meshing/MarchingCubes.h"
 #include "meshing/MeshData.h"
+#include "app/FrameTrace.h"
 #include "app/FusionHyperparams.h"
 #include <Eigen/Core>
 
@@ -104,6 +105,18 @@ public:
     bool start();
     void stop();
     void reset();
+
+    // ---- Offline / lockstep use (tools/azu_replay) ----
+    // Start the workers without opening the sensor; frames arrive through
+    // submitRawFrame(). waitIdle() returns once every submitted frame has been
+    // fully handled: graded, and if integrated also raycast into the model
+    // (false on timeout).
+    bool startOffline();
+    void submitRawFrame(std::shared_ptr<sensor::RawFrame> raw);
+    bool waitIdle(std::chrono::milliseconds timeout);
+    // Per-frame CSV trace (include/app/FrameTrace.h), opened at the next start().
+    // AZU_TRACE=<file> sets it at construction.
+    void setTracePath(const std::string& path);
 
     /** True while capture + pipeline worker threads are active. */
     bool isRunning() const { return running_.load(); }
@@ -358,6 +371,11 @@ private:
     // CUDA device chosen at the first GPU start; every thread that touches the
     // GPU makes it current first (the CUDA current device is per host thread).
     int                                   gpu_device_ = -1;
+    std::mutex                            idle_mtx_;
+    std::condition_variable               idle_cv_;
+    int64_t                               in_flight_ = 0;
+    std::string                           trace_path_;
+    FrameTrace                            trace_;
     void bindGpuDevice() const noexcept;
     mutable std::mutex                    control_mutex_;
 
@@ -371,6 +389,14 @@ private:
      * queue lock; the eviction is counted under metrics_mutex_.
      */
     void enqueueForIntegration(std::shared_ptr<sensor::FrameData> frame);
+    // In-flight frame accounting for waitIdle(): +1 per raw frame accepted, -1
+    // wherever a frame's journey ends (dropped, graded without integration, or
+    // integrated and raycast).
+    void frameEntered();
+    void frameDone(int n = 1);
+    void resetInFlight();
+    static float outsideVolumeFraction(const sensor::FrameData& f, const Eigen::Matrix4f& pose,
+                                       const tsdf::TSDFParams& p);
     /** Live depth at `pose` for the viewport, <= 10 Hz; used while frames are
      *  not being integrated (lost / poor fit), when no raycast preview flows. */
     void emitLivePreview(const sensor::FrameData& frame, const Eigen::Matrix4f& pose);
