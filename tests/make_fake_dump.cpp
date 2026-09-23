@@ -12,7 +12,12 @@
 // also write accelerometer records ('a' files, gravity only) like the real
 // recorder, so replay tools can check tilt.
 //
-// usage: make_fake_dump <out_dir> [frames] [pan|spin]
+// An optional focal length renders the depth with that IR camera and writes a
+// device.json whose zero-plane values encode it (f = reference_distance /
+// (2 * reference_pixel_size)), as fakenect-record does for a real unit; the
+// default (none) renders with the legacy 525 px and writes no device.json.
+//
+// usage: make_fake_dump <out_dir> [frames] [pan|spin] [fx]
 #include "sensor/DepthValidity.h"
 #include "support/SyntheticScene.h"
 
@@ -32,8 +37,23 @@ int main(int argc, char** argv) {
     }
     const std::string dir = argv[1];
     const int frames = argc > 2 ? std::atoi(argv[2]) : 60;
-    const bool spin = argc > 3 && std::string(argv[3]) == "spin";
     mkdir(dir.c_str(), 0755);
+    const bool spin = argc > 3 && std::string(argv[3]) == "spin";
+    azu_test::Intrinsics K;
+    if (argc > 4) {
+        K.fx = K.fy = std::strtof(argv[4], nullptr);
+        const double ref_distance = 120.0;
+        const double ref_pixel = ref_distance / (2.0 * K.fx);
+        FILE* dj = std::fopen((dir + "/device.json").c_str(), "w");
+        if (!dj) return 1;
+        std::fprintf(dj,
+                     "{\n \"reg_info\": {\n  \"zero_plane_info\": {\n"
+                     "   \"dcmos_emitter_distance\": 7.5,\n   \"dcmos_rcmos_distance\": 2.4,\n"
+                     "   \"reference_distance\": %.1f,\n   \"reference_pixel_size\": %.9f\n  }\n },\n"
+                     " \"const_shift\": 200\n}\n",
+                     ref_distance, ref_pixel);
+        std::fclose(dj);
+    }
 
     constexpr uint64_t kDepthPeriod = 2002155, kRgbPeriod = 2000287;
     constexpr uint64_t kStart = (1ull << 32) - 120000000ull;   // 2 s before the wrap
@@ -69,7 +89,7 @@ int main(int argc, char** argv) {
                 const float ph = static_cast<float>(di < frames / 2 ? di : frames - di);
                 pose = azu_test::makePose({0.0f, 0.003f * ph, 0.0f}, {0.0015f * ph, 0.0f, 0.0f});
             }
-            const std::vector<float> m = scene.renderDepth(pose);
+            const std::vector<float> m = scene.renderDepth(pose, K);
             std::vector<uint16_t> raw(m.size());
             for (size_t i = 0; i < m.size(); ++i)
                 raw[i] = m[i] > 0.0f ? kfusion::sensor::cpuDepthMetersToRaw(m[i], 0.3f, 5.0f) : 0;

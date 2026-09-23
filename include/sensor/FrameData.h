@@ -4,17 +4,21 @@
 #include <cstdint>
 #include <Eigen/Core>
 
+#include "sensor/CameraIntrinsics.h"
+
 namespace kfusion {
 namespace sensor {
 
 static constexpr int FRAME_W = 640;
 static constexpr int FRAME_H = 480;
 
-// Kinect v1 Intrinsics
-static constexpr float FX = 525.0f;
-static constexpr float FY = 525.0f;
-static constexpr float CX = 319.5f;
-static constexpr float CY = 239.5f;
+// Legacy / uncalibrated intrinsics (sensor/CameraIntrinsics.h). The pipeline
+// uses the device's calibrated intrinsics when it has them; these constants are
+// the fallback and what the synthetic tests render with.
+static constexpr float FX = kLegacyIntrinsics.fx;
+static constexpr float FY = kLegacyIntrinsics.fy;
+static constexpr float CX = kLegacyIntrinsics.cx;
+static constexpr float CY = kLegacyIntrinsics.cy;
 
 // Processed depth frame: per-pixel 3D vertex + normal + valid flag
 struct FrameData {
@@ -36,6 +40,8 @@ struct FrameData {
     bool rgb_valid = true;
     // Sensor time of the depth frame, ms on the Kinect clock (RawFrame::timestamp_depth).
     double timestamp_ms = 0.0;
+    // Intrinsics the vertices were back-projected with (set by buildFrameData).
+    CameraIntrinsics intrinsics{};
     
     // The world-from-camera transformation found by the tracker for this specific frame
     Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
@@ -76,7 +82,8 @@ void buildFrameData(const uint16_t* raw_depth,
                     const uint8_t*  raw_rgb,
                     FrameData& out,
                     float min_depth = 0.3f,
-                    float max_depth = 5.0f);
+                    float max_depth = 5.0f,
+                    const CameraIntrinsics& intrinsics = CameraIntrinsics{});
 
 // Build pyramid by successive 2x downsampling
 void buildFramePyramid(const FrameData& full_res, FramePyramid& pyramid);

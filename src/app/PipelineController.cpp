@@ -115,6 +115,20 @@ bool PipelineController::startInternal(bool engage_sensor) {
         return false;
     }
 
+    // Depth-camera intrinsics for this session: the device's factory
+    // calibration when the sensor has one (live or libfakenect with a
+    // device.json), otherwise what setIntrinsics() / the legacy default gave.
+    // AZU_INTRINSICS=legacy forces the historical 525 px (A/B experiments).
+    if (engage_sensor && sensor_->hasCalibratedIntrinsics()) {
+        intrinsics_ = sensor_->intrinsics();
+    }
+    if (const char* force = std::getenv("AZU_INTRINSICS"); force && std::string(force) == "legacy") {
+        intrinsics_ = sensor::kLegacyIntrinsics;
+    }
+    tracker_->setIntrinsics(intrinsics_);
+    KFLOGF_INFO("Pipeline", "Depth intrinsics: fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
+                intrinsics_.fx, intrinsics_.fy, intrinsics_.cx, intrinsics_.cy);
+
     if (engage_sensor && !sensor_->start()) {
         KFLOG_ERROR("Pipeline", "Sensor start FAILED. Stream could not be opened.");
         running_.store(false);
@@ -821,6 +835,11 @@ void PipelineController::submitRawFrame(std::shared_ptr<sensor::RawFrame> raw) {
   onRawFrame(std::move(raw));
 }
 
+void PipelineController::setIntrinsics(const sensor::CameraIntrinsics& k) {
+  std::lock_guard<std::mutex> lk(control_mutex_);
+  intrinsics_ = k;
+}
+
 void PipelineController::setTracePath(const std::string& path) {
   std::lock_guard<std::mutex> lk(control_mutex_);
   trace_path_ = path;
@@ -976,7 +995,8 @@ void PipelineController::trackingLoopBody() {
     // docs/CUDA_HIP_DEFERRED_CHANGES.md).
     // const auto& upscaled_rgb = preprocessor_->getSrRgbUpscaled();
     // sensor::buildFrameData(raw->depth.data(), upscaled_rgb.data(), *frame, hp.min_depth, hp.max_depth);
-    sensor::buildFrameData(raw->depth.data(), raw->rgb.data(), *frame, hp.min_depth, hp.max_depth);
+    sensor::buildFrameData(raw->depth.data(), raw->rgb.data(), *frame, hp.min_depth, hp.max_depth,
+                           intrinsics_);
     sensor::computeNormals(*frame);
     
     // We can release 'raw' immediately after buildFrameData copies it
@@ -1367,15 +1387,15 @@ void PipelineController::integrationLoopBody() {
               frame->depth_meters.data(),
               fuse_rgb,
               frame->pose,
-              static_cast<float>(sensor::FX), static_cast<float>(sensor::FY),
-              static_cast<float>(sensor::CX), static_cast<float>(sensor::CY),
+              intrinsics_.fx, intrinsics_.fy,
+              intrinsics_.cx, intrinsics_.cy,
               frame->width, frame->height, d_min, d_max);
       } else {
           gpu_lk.unlock(); // CPU path doesn't need GPU serialization
           tsdf_->integrate(
               frame->depth_meters.data(), fuse_rgb, frame->pose,
-              static_cast<float>(sensor::FX), static_cast<float>(sensor::FY),
-              static_cast<float>(sensor::CX), static_cast<float>(sensor::CY),
+              intrinsics_.fx, intrinsics_.fy,
+              intrinsics_.cx, intrinsics_.cy,
               frame->width, frame->height, d_min, d_max);
       }
 #elif defined(HIP_ENABLED)
@@ -1384,23 +1404,23 @@ void PipelineController::integrationLoopBody() {
               frame->depth_meters.data(),
               fuse_rgb,
               frame->pose,
-              static_cast<float>(sensor::FX), static_cast<float>(sensor::FY),
-              static_cast<float>(sensor::CX), static_cast<float>(sensor::CY),
+              intrinsics_.fx, intrinsics_.fy,
+              intrinsics_.cx, intrinsics_.cy,
               frame->width, frame->height, d_min, d_max);
       } else {
           gpu_lk.unlock(); // CPU path doesn't need GPU serialization
           tsdf_->integrate(
               frame->depth_meters.data(), fuse_rgb, frame->pose,
-              static_cast<float>(sensor::FX), static_cast<float>(sensor::FY),
-              static_cast<float>(sensor::CX), static_cast<float>(sensor::CY),
+              intrinsics_.fx, intrinsics_.fy,
+              intrinsics_.cx, intrinsics_.cy,
               frame->width, frame->height, d_min, d_max);
       }
 #else
       gpu_lk.unlock(); // CPU-only build: no GPU serialization needed
       tsdf_->integrate(
           frame->depth_meters.data(), fuse_rgb, frame->pose,
-          static_cast<float>(sensor::FX), static_cast<float>(sensor::FY),
-          static_cast<float>(sensor::CX), static_cast<float>(sensor::CY),
+          intrinsics_.fx, intrinsics_.fy,
+          intrinsics_.cx, intrinsics_.cy,
           frame->width, frame->height, d_min, d_max);
 #endif
     }
@@ -1423,10 +1443,8 @@ void PipelineController::integrationLoopBody() {
           // jitter/lag
           {
               std::shared_lock<std::shared_mutex> lk_tsdf(tsdf_mutex_);
-              tsdf_->raycast(frame->pose, static_cast<float>(sensor::FX),
-                             static_cast<float>(sensor::FY),
-                             static_cast<float>(sensor::CX),
-                             static_cast<float>(sensor::CY), sensor::DEPTH_WIDTH,
+              tsdf_->raycast(frame->pose, intrinsics_.fx, intrinsics_.fy,
+                             intrinsics_.cx, intrinsics_.cy, sensor::DEPTH_WIDTH,
                              sensor::DEPTH_HEIGHT, model_back.vertices.data(),
                              model_back.normals.data(), model_back.colors.data());
           }
@@ -1471,10 +1489,8 @@ void PipelineController::integrationLoopBody() {
               // TSDF volume that integration just wrote. Use gpu_mutex_ not shared_lock.
               std::lock_guard<std::mutex> gpu_lk(gpu_mutex_);
               std::shared_lock<std::shared_mutex> lk_tsdf(tsdf_mutex_);
-              tsdf_->raycastGPU(frame->pose, static_cast<float>(sensor::FX),
-                                static_cast<float>(sensor::FY),
-                                static_cast<float>(sensor::CX),
-                                static_cast<float>(sensor::CY), sensor::DEPTH_WIDTH,
+              tsdf_->raycastGPU(frame->pose, intrinsics_.fx, intrinsics_.fy,
+                                intrinsics_.cx, intrinsics_.cy, sensor::DEPTH_WIDTH,
                                 sensor::DEPTH_HEIGHT, model_back.d_vertices.get(),
                                 model_back.d_normals.get(), model_back.d_colors.get());
           }
@@ -1517,10 +1533,8 @@ void PipelineController::integrationLoopBody() {
               // simultaneously running a heavy marching cubes kernel on the 5650u.
               std::lock_guard<std::mutex> gpu_lk(gpu_mutex_);
               std::shared_lock<std::shared_mutex> lk_tsdf(tsdf_mutex_);
-              tsdf_->raycastGPU(frame->pose, static_cast<float>(sensor::FX),
-                                static_cast<float>(sensor::FY),
-                                static_cast<float>(sensor::CX),
-                                static_cast<float>(sensor::CY), sensor::DEPTH_WIDTH,
+              tsdf_->raycastGPU(frame->pose, intrinsics_.fx, intrinsics_.fy,
+                                intrinsics_.cx, intrinsics_.cy, sensor::DEPTH_WIDTH,
                                 sensor::DEPTH_HEIGHT, model_back.d_vertices.get(),
                                 model_back.d_normals.get(), model_back.d_colors.get());
           }

@@ -117,6 +117,13 @@ public:
     // Per-frame CSV trace (include/app/FrameTrace.h), opened at the next start().
     // AZU_TRACE=<file> sets it at construction.
     void setTracePath(const std::string& path);
+    // Depth intrinsics for sessions without a calibrated sensor (offline replay
+    // reads device.json). A live sensor's factory calibration overrides this.
+    void setIntrinsics(const sensor::CameraIntrinsics& k);
+    sensor::CameraIntrinsics intrinsics() const {
+        std::lock_guard<std::mutex> lk(control_mutex_);
+        return intrinsics_;
+    }
 
     /** True while capture + pipeline worker threads are active. */
     bool isRunning() const { return running_.load(); }
@@ -377,6 +384,8 @@ private:
     std::string                           trace_path_;
     // keepObservableMotion() threshold (eigenvalue ratio); 0 disables.
     float                                 degeneracy_rel_ = 5e-3f;
+    // Set before the workers start (control_mutex_), read-only while running.
+    sensor::CameraIntrinsics              intrinsics_{};
     FrameTrace                            trace_;
     void bindGpuDevice() const noexcept;
     mutable std::mutex                    control_mutex_;

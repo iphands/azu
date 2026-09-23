@@ -4,6 +4,7 @@
 // sensor, the frame builder and the signal conditioner all consume ONE
 // validity rule (big-fix Todo 20). It is included here because every existing
 // consumer of rawDepthToMeters() already includes this header.
+#include "sensor/CameraIntrinsics.h"
 #include "sensor/DepthValidity.h"
 
 #include <atomic>
@@ -97,6 +98,10 @@ public:
     void stop();
     bool isRunning() const { return running_.load(); }
     bool isConnected() const { return device_ != nullptr; }
+    // Depth (IR) intrinsics from the device's factory registration, read in
+    // init(); legacy 525 px when the device (or recording) has none.
+    bool hasCalibratedIntrinsics() const { return calibrated_; }
+    CameraIntrinsics intrinsics() const { return intrinsics_; }
 
     // Register the callback invoked (outside the pairing lock) for every
     // published frame, on the libusb event thread.
@@ -131,6 +136,8 @@ private:
     // libfreenect state
     freenect_context* ctx_    = nullptr;
     freenect_device*  device_ = nullptr;
+    CameraIntrinsics  intrinsics_{};
+    bool              calibrated_ = false;
 
     // Thread-safe pipeline state
     static constexpr size_t POOL_SIZE = 8;

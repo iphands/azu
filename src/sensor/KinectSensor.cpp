@@ -9,6 +9,7 @@
 
 #ifdef HAVE_FREENECT
 #include <libfreenect/libfreenect.h>
+#include <libfreenect/libfreenect_registration.h>
 #endif
 
 namespace kfusion {
@@ -69,6 +70,20 @@ bool KinectSensor::init() {
     if (freenect_open_device(ctx_, &device_, 0) < 0) {
         device_ = nullptr;
         return fail("freenect_open_device FAILED: Could not open Kinect index 0.");
+    }
+
+    {
+        freenect_registration reg = freenect_copy_registration(device_);
+        calibrated_ = intrinsicsFromZeroPlane(reg.zero_plane_info.reference_distance,
+                                              reg.zero_plane_info.reference_pixel_size,
+                                              &intrinsics_);
+        freenect_destroy_registration(&reg);
+        if (calibrated_) {
+            KFLOGF_INFO("Sensor", "IR intrinsics from device registration: f=%.1f px", intrinsics_.fx);
+        } else {
+            intrinsics_ = kLegacyIntrinsics;
+            KFLOG_WARN("Sensor", "No device registration; using legacy 525 px depth intrinsics.");
+        }
     }
 
     freenect_set_user(device_, this);

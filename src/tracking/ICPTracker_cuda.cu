@@ -317,7 +317,8 @@ ICPResult ICPTracker::trackGPU(const float*                d_depth,
     // 1. Build Level 0 on GPU
     dim3 block(16, 16);
     dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
-    computeVerticesKernel<<<grid, block>>>(d_depth, d_pyramid_v[0].get(), width, height, sensor::FX, sensor::FY, sensor::CX, sensor::CY);
+    computeVerticesKernel<<<grid, block>>>(d_depth, d_pyramid_v[0].get(), width, height,
+                                           intrinsics_.fx, intrinsics_.fy, intrinsics_.cx, intrinsics_.cy);
     computeNormalsKernel<<<grid, block>>>(d_depth, d_pyramid_v[0].get(), d_pyramid_n[0].get(), width, height);
 
     // 2. Build Pyramid on GPU
@@ -362,10 +363,10 @@ ICPResult ICPTracker::trackLevelGPU(const float3*            d_v_live,
     result.pose = pose_estimate;
 
     // Intrinsics for projecting into the MODEL frame (which is always full resolution)
-    float fx = kfusion::sensor::FX;
-    float fy = kfusion::sensor::FY;
-    float cx = kfusion::sensor::CX;
-    float cy = kfusion::sensor::CY;
+    float fx = intrinsics_.fx;
+    float fy = intrinsics_.fy;
+    float cx = intrinsics_.cx;
+    float cy = intrinsics_.cy;
 
     float angle_thresh_cos = cosf(params_.angle_threshold * 3.14159f / 180.0f);
 

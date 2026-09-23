@@ -148,6 +148,7 @@ bool ICPTracker::buildLinearSystem(const sensor::FrameData& live,
 {
     const int W = live.width;
     const int H = live.height;
+    const sensor::CameraIntrinsics K = intrinsics_;
     const float angle_thresh_cos = std::cos(params_.angle_threshold * M_PI / 180.0f);
 
     // Live Camera to World
@@ -233,8 +234,8 @@ bool ICPTracker::buildLinearSystem(const sensor::FrameData& live,
             acc.valid_live++;
 
             float inv_z = 1.0f / v_ref.z();
-            float model_x = sensor::FX * v_ref.x() * inv_z + sensor::CX;
-            float model_y = sensor::FY * v_ref.y() * inv_z + sensor::CY;
+            float model_x = K.fx * v_ref.x() * inv_z + K.cx;
+            float model_y = K.fy * v_ref.y() * inv_z + K.cy;
 
             // Round the sub-pixel projection to the nearest model pixel with the
             // shared floor primitive: floor(model + 0.5) (round-half-up), the CPU

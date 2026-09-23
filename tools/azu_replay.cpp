@@ -18,7 +18,7 @@
 // last frame registered against a model fused from only the first frames).
 //
 // usage: azu_replay <recording_dir> [--out DIR] [--backend auto|cpu|cuda]
-//                   [--preset helmet|chair|room|human]
+//                   [--preset helmet|chair|room|human] [--intrinsics device|legacy]
 //                   [--volume front|centred] [--res N] [--voxel M]
 //                   [--min-depth M] [--max-depth M] [--max-frames N] [--quiet]
 #include "app/PipelineController.h"
@@ -38,6 +38,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <sys/stat.h>
@@ -53,6 +54,7 @@ constexpr double kGravity    = 9.80665;
 
 struct Options {
     std::string dir, out = "replay-out", backend = "auto", volume = "front", preset;
+    std::string intrinsics = "device";
     int res = 0, max_frames = 0;
     float voxel = 0.0f, min_depth = 0.0f, max_depth = 0.0f;
     bool quiet = false;
@@ -73,6 +75,7 @@ bool parseArgs(int argc, char** argv, Options& o) {
         else if (a == "--backend") o.backend = next("--backend");
         else if (a == "--volume") { o.volume = next("--volume"); o.volume_set = true; }
         else if (a == "--preset") o.preset = next("--preset");
+        else if (a == "--intrinsics") o.intrinsics = next("--intrinsics");
         else if (a == "--res") o.res = std::atoi(next("--res"));
         else if (a == "--voxel") o.voxel = std::strtof(next("--voxel"), nullptr);
         else if (a == "--min-depth") o.min_depth = std::strtof(next("--min-depth"), nullptr);
@@ -85,6 +88,19 @@ bool parseArgs(int argc, char** argv, Options& o) {
         } else o.dir = a;
     }
     return !o.dir.empty();
+}
+
+// A number field from fakenect-record's device.json (flat enough for a scan).
+bool jsonNumber(const std::string& text, const std::string& key, double* out) {
+    const size_t k = text.find("\"" + key + "\"");
+    if (k == std::string::npos) return false;
+    const size_t colon = text.find(':', k);
+    if (colon == std::string::npos) return false;
+    char* end = nullptr;
+    const double v = std::strtod(text.c_str() + colon + 1, &end);
+    if (end == text.c_str() + colon + 1) return false;
+    *out = v;
+    return true;
 }
 
 // fakenect frame file: one header line, then raw bytes.
@@ -129,7 +145,7 @@ int main(int argc, char** argv) {
     if (!parseArgs(argc, argv, opt)) {
         std::fprintf(stderr,
                      "usage: azu_replay <recording_dir> [--out DIR] [--backend auto|cpu|cuda]\n"
-                     "                  [--preset helmet|chair|room|human]\n"
+                     "                  [--preset helmet|chair|room|human] [--intrinsics device|legacy]\n"
                      "                  [--volume front|centred] [--res N] [--voxel M]\n"
                      "                  [--min-depth M] [--max-depth M] [--max-frames N] [--quiet]\n");
         return 2;
@@ -183,14 +199,34 @@ int main(int argc, char** argv) {
     }
     pc.setHyperparams(hp);
     pc.setTracePath(opt.out + "/trace.csv");
+
+    // Depth intrinsics: the recording's device.json (the unit's factory
+    // registration) unless --intrinsics legacy.
+    sensor::CameraIntrinsics K = sensor::kLegacyIntrinsics;
+    std::string intr_source = "legacy";
+    if (opt.intrinsics == "device") {
+        std::ifstream dj(opt.dir + "/device.json");
+        const std::string text((std::istreambuf_iterator<char>(dj)), std::istreambuf_iterator<char>());
+        double ref_dist = 0.0, ref_px = 0.0;
+        if (jsonNumber(text, "reference_distance", &ref_dist) &&
+            jsonNumber(text, "reference_pixel_size", &ref_px) &&
+            sensor::intrinsicsFromZeroPlane(ref_dist, ref_px, &K)) {
+            intr_source = "device.json";
+        }
+    } else if (opt.intrinsics != "legacy") {
+        std::fprintf(stderr, "--intrinsics must be device or legacy\n");
+        return 2;
+    }
+    pc.setIntrinsics(K);
     if (!pc.startOffline()) {
         std::fprintf(stderr, "pipeline failed to start\n");
         return 1;
     }
     const std::string backend_label = pc.metricsSnapshot().backend;
-    std::printf("replay %s: backend %s, volume %s %d^3 x %.3f m (%.2f m), depth %.2f-%.2f m\n",
+    std::printf("replay %s: backend %s, volume %s %d^3 x %.3f m (%.2f m), depth %.2f-%.2f m, "
+                "fx %.1f (%s)\n",
                 opt.dir.c_str(), backend_label.c_str(), opt.volume.c_str(), hp.tsdf.resolution,
-                hp.tsdf.voxel_size, extent, hp.min_depth, hp.max_depth);
+                hp.tsdf.voxel_size, extent, hp.min_depth, hp.max_depth, K.fx, intr_source.c_str());
 
     // ---- pairing through the real sensor code
     sensor::KinectSensor pairing;
@@ -366,20 +402,21 @@ int main(int argc, char** argv) {
     sensor::FrameData fd;
     const std::vector<uint8_t> no_rgb(rgb_bytes, 0);
     for (size_t i = 0; i < first_depth.size(); ++i) {
-        sensor::buildFrameData(first_depth[i].data(), no_rgb.data(), fd, hp.min_depth, hp.max_depth);
-        loop_model.integrate(fd.depth_meters.data(), nullptr, first_pose[i], sensor::FX, sensor::FY,
-                             sensor::CX, sensor::CY, fd.width, fd.height, hp.min_depth, hp.max_depth);
+        sensor::buildFrameData(first_depth[i].data(), no_rgb.data(), fd, hp.min_depth, hp.max_depth, K);
+        loop_model.integrate(fd.depth_meters.data(), nullptr, first_pose[i], K.fx, K.fy, K.cx, K.cy,
+                             fd.width, fd.height, hp.min_depth, hp.max_depth);
     }
     const Eigen::Matrix4f end_pose = records.back().pose;
     tracking::ModelFrame model;
-    loop_model.raycast(end_pose, sensor::FX, sensor::FY, sensor::CX, sensor::CY, sensor::FRAME_W,
+    loop_model.raycast(end_pose, K.fx, K.fy, K.cx, K.cy, sensor::FRAME_W,
                        sensor::FRAME_H, model.vertices.data(), model.normals.data(), model.colors.data());
     model.pose = end_pose;
-    sensor::buildFrameData(last_depth.data(), no_rgb.data(), fd, hp.min_depth, hp.max_depth);
+    sensor::buildFrameData(last_depth.data(), no_rgb.data(), fd, hp.min_depth, hp.max_depth, K);
     sensor::computeNormals(fd);
     sensor::FramePyramid pyr;
     sensor::buildFramePyramid(fd, pyr);
     tracking::ICPTracker icp;
+    icp.setIntrinsics(K);
     const tracking::ICPResult loop = icp.track(pyr, model, end_pose, model.pose);
     // Only the observable part of the correction: facing bare walls, the solve's
     // answer along unobservable directions is arbitrary (same projection the
@@ -418,6 +455,7 @@ int main(int argc, char** argv) {
        << "  \"recording\": \"" << opt.dir << "\",\n"
        << "  \"backend\": \"" << backend_label << "\",\n"
        << "  \"preset\": \"" << opt.preset << "\",\n"
+       << "  \"fx\": " << K.fx << ", \"intrinsics_source\": \"" << intr_source << "\",\n"
        << "  \"volume\": \"" << opt.volume << "\", \"resolution\": " << hp.tsdf.resolution
        << ", \"voxel_size\": " << hp.tsdf.voxel_size << ",\n"
        << "  \"frames\": " << records.size() << ", \"good\": " << good << ", \"poor\": " << poor

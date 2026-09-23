@@ -113,17 +113,18 @@ inline float depthJumpThreshold(float depth_m) {
 void updateVerticesFromDepth(FrameData& frame) {
     const int W = frame.width;
     const int H = frame.height;
-    const float fx_inv = 1.0f / static_cast<float>(FX);
-    const float fy_inv = 1.0f / static_cast<float>(FY);
+    const CameraIntrinsics K = frame.intrinsics;
+    const float fx_inv = 1.0f / K.fx;
+    const float fy_inv = 1.0f / K.fy;
 
-    #pragma omp parallel for schedule(static) shared(frame, W, H, fx_inv, fy_inv)
+    #pragma omp parallel for schedule(static) shared(frame, W, H, fx_inv, fy_inv, K)
     for (int idx = 0; idx < W * H; ++idx) {
         float d = frame.depth_meters[idx];
         if (d > 0.0f) {
             int x = idx % W;
             int y = idx / W;
-            float vx = (static_cast<float>(x) - static_cast<float>(CX)) * fx_inv * d;
-            float vy = (static_cast<float>(y) - static_cast<float>(CY)) * fy_inv * d;
+            float vx = (static_cast<float>(x) - K.cx) * fx_inv * d;
+            float vy = (static_cast<float>(y) - K.cy) * fy_inv * d;
             frame.vertices[idx] = Eigen::Vector3f(vx, vy, d);
         } else {
             frame.vertices[idx] = Eigen::Vector3f::Zero();
@@ -137,8 +138,10 @@ void buildFrameData(const uint16_t* raw_depth,
                     const uint8_t*  raw_rgb,
                     FrameData&      out,
                     float           min_depth,
-                    float           max_depth)
+                    float           max_depth,
+                    const CameraIntrinsics& intrinsics)
 {
+    out.intrinsics = intrinsics;
     const int W = out.width;
     const int H = out.height;
     // THE CPU depth boundary for everything downstream (vertices, normals,

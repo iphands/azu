@@ -113,6 +113,10 @@ public:
 #endif
 
     const ICPParams& params() const { return params_; }
+    // Intrinsics of both the live frames and the model images (the pipeline
+    // raycasts the model with the same camera).
+    void setIntrinsics(const sensor::CameraIntrinsics& k) { intrinsics_ = k; }
+    const sensor::CameraIntrinsics& intrinsics() const { return intrinsics_; }
     void setParams(const ICPParams& p) { params_ = sanitizeParams(p); }
     void setNumThreads(int n) { num_threads_.store(n); }
 
@@ -120,6 +124,7 @@ private:
     static ICPParams sanitizeParams(const ICPParams& params);
 
     ICPParams params_;
+    sensor::CameraIntrinsics intrinsics_{};
     std::atomic<int> num_threads_{0};
 
     ICPResult trackLevel(const sensor::FrameData& live_level,
