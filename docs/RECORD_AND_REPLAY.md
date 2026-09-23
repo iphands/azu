@@ -3,24 +3,44 @@
 ## 1. Record (app closed: the Kinect is exclusive)
 
 ```bash
-mkdir -p ~/kinect-rec
-fakenect-record ~/kinect-rec/spin360-slow     # Ctrl-C to stop; refuses an existing dir
+mkdir -p ~/kinect-rec                          # fakenect-record only creates the last
+fakenect-record ~/kinect-rec/spin360-slow      # directory; it refuses an existing take
 ```
 
 ~46 MB/s (30 s ≈ 1.4 GB). Each take holds raw 11-bit depth (`d-*.pgm`), RGB
 (`r-*.ppm`), accelerometer samples (`a-*.dump`, ~300 Hz) and the unit's factory
 calibration (`device.json`). Timestamps are the device's 60 MHz ticks.
 
-Spin protocol: stand still 3 s facing something with shape (furniture, a corner),
-turn clockwise at a steady pace (≈30 s per turn, then ≈15 s), stop facing the
-start and hold 3 s, Ctrl-C. Starting and ending on the same view makes the loop
-check meaningful.
+Protocol (handheld is fine):
+
+1. start the recorder, get in position quickly
+2. hold still for at least 10 s
+3. do the capture (e.g. turn a full circle in ~30 s)
+4. hold still for at least 10 s
+5. move / reach for the keyboard and stop with Ctrl-C
+
+## 1b. Trim to the holds
+
+```bash
+./build-cuda/tools/azu_trim ~/kinect-rec/spin360-slow --dry-run   # review
+./build-cuda/tools/azu_trim ~/kinect-rec/spin360-slow             # writes spin360-slow-trimmed
+```
+
+azu_trim finds the first and last still hold (depth change AND accelerometer
+both quiet for >= 3 s, searched in the first/last 20 s), prints a 0.5 s timeline
+of both ends with the cut marked, and writes `<take>-trimmed`: the entries between
+the cuts as hardlinks, `device.json`, and `trim.json`. The positioning motion and
+the keyboard reach are gone; the holds are kept (the start hold anchors the model,
+the end hold is the loop-check reference). The original take is not modified.
+If a hold is too short it reports the best candidate and writes nothing: rerun
+with `--min-still 1.5`, or cut by hand with `--start S --end S` (seconds).
+Use the trimmed take everywhere below.
 
 ## 2. See it in the GUI at recorded speed
 
 ```bash
 FAKENECT_LOOP=0 LD_PRELOAD=/usr/local/lib/fakenect/libfakenect.so \
-  FAKENECT_PATH=~/kinect-rec/spin360-slow ./build-cuda/KinectFusionQt
+  FAKENECT_PATH=~/kinect-rec/spin360-slow-trimmed ./build-cuda/KinectFusionQt
 ```
 
 Pick the Room preset ("Stand in the middle, turn around"): its volume surrounds
@@ -30,8 +50,8 @@ a full turn.
 ## 3. Replay offline, deterministically
 
 ```bash
-./build-cuda/tools/azu_replay ~/kinect-rec/spin360-slow --preset room --out /tmp/spin-cuda
-./build-cuda/tools/azu_replay ~/kinect-rec/spin360-slow --preset room --backend cpu --out /tmp/spin-cpu
+./build-cuda/tools/azu_replay ~/kinect-rec/spin360-slow-trimmed --preset room --out /tmp/spin-cuda
+./build-cuda/tools/azu_replay ~/kinect-rec/spin360-slow-trimmed --preset room --backend cpu --out /tmp/spin-cpu
 scripts/trace_report.py /tmp/spin-cuda /tmp/spin-cpu -o /tmp/spin.html
 ```
 
@@ -60,7 +80,8 @@ Options: `--backend cpu|cuda`, `--preset helmet|chair|room|human`,
 
 ## 5. Synthetic recordings
 
-`build-b2-cpu/tests/make_fake_dump <dir> [frames] [pan|spin] [fx] [noise]` writes
-a recording of the synthetic room (`spin`: a full turn at 1.5°/frame), optionally
+`build-b2-cpu/tests/make_fake_dump <dir> [frames] [pan|spin|protocol] [fx] [noise]`
+writes a recording of the synthetic room (`spin`: a full turn at 1.5°/frame;
+`protocol`: positioning, hold, turn, hold, reach with known boundaries), optionally
 rendered with a given focal length (plus a matching `device.json`) and Kinect-like
 depth noise. The end pose of a synthetic spin is exact drift.
