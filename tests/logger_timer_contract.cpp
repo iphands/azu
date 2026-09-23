@@ -404,7 +404,13 @@ void sectionConcurrentThreshold() {
     }
     for (int w = 0; w < 4; ++w) {
         threads.emplace_back([w] {
-            for (int i = 0; i < 300; ++i) L().info("Race", "w" + std::to_string(w));
+            // Error records pass at both racing levels, so the non-vacuity
+            // check below cannot depend on scheduling: under load a flipper
+            // descheduled right after setLevel(Error) can filter every info().
+            for (int i = 0; i < 300; ++i) {
+                L().info("Race", "w" + std::to_string(w));
+                L().error("Race", "e" + std::to_string(w));
+            }
         });
     }
     for (int w = 3; w < 7; ++w) threads[w].join();

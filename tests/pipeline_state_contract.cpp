@@ -202,13 +202,16 @@ int main() {
           "tracking worker parked before the burst");
 
     const PipelineMetrics before_burst = controller.metricsSnapshot();
-    const uint64_t first_id = next_id;
+    // Under load the pump above can inject one frame before the worker parks;
+    // it then sits in the queue ahead of the burst. Count it instead of
+    // assuming an empty queue (that assumption made this test flaky).
+    const int queued_before = static_cast<int>(controller.rawQueueDepthForTests());
     constexpr int kBurst = 6;
     for (int i = 0; i < kBurst; ++i) {
         controller.injectRawFrameForTests(makeSyntheticFrame(next_id++));
     }
     const uint64_t last_id = next_id - 1;
-    const int kExcess = kBurst - static_cast<int>(kQueueCapacity);
+    const int kExcess = queued_before + kBurst - static_cast<int>(kQueueCapacity);
 
     CHECK(controller.rawQueueDepthForTests() == kQueueCapacity,
           "the raw queue stayed bounded at capacity under a burst");
@@ -222,7 +225,7 @@ int main() {
     }
 
     controller.resumePipelineWorkersForTests();
-    const uint64_t oldest_retained = first_id + kExcess;
+    const uint64_t oldest_retained = last_id - kQueueCapacity + 1;
     CHECK(pumpUntil(controller, next_id, [&controller, oldest_retained, last_id] {
               const uint64_t popped = controller.lastPoppedFrameIdForTests();
               return popped >= oldest_retained && popped >= last_id;
