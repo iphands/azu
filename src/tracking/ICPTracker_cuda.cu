@@ -310,10 +310,13 @@ ICPResult ICPTracker::trackGPU(const float*                d_depth,
                                const Eigen::Matrix4f&      pose_estimate,
                                const Eigen::Matrix4f&      ref_pose)
 {
-    ICPResult result;
-    result.pose = pose_estimate;
-    result.tracking_ok = true;
+    (void)d_rgb;
+    prepareLiveGPU(d_depth, width, height);
+    return trackPreparedGPU(width, height, model, pose_estimate, ref_pose);
+}
 
+void ICPTracker::prepareLiveGPU(const float* d_depth, int width, int height)
+{
     // 1. Build Level 0 on GPU
     dim3 block(16, 16);
     dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
@@ -331,6 +334,17 @@ ICPResult ICPTracker::trackGPU(const float*                d_depth,
         downsampleKernel<<<g, block>>>(d_pyramid_v[l-1].get(), d_pyramid_n[l-1].get(), sw, sh, d_pyramid_v[l].get(), d_pyramid_n[l].get(), dw, dh);
     }
     cudaDeviceSynchronize();
+}
+
+ICPResult ICPTracker::trackPreparedGPU(int                    width,
+                                       int                    height,
+                                       const ModelFrame&      model,
+                                       const Eigen::Matrix4f& pose_estimate,
+                                       const Eigen::Matrix4f& ref_pose)
+{
+    ICPResult result;
+    result.pose = pose_estimate;
+    result.tracking_ok = true;
 
     // 3. Track levels
     bool converged = false;

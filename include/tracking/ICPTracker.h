@@ -101,6 +101,16 @@ public:
                        const ModelFrame&           model,
                        const Eigen::Matrix4f&      pose_estimate,
                        const Eigen::Matrix4f&      ref_pose);
+    // trackGPU in two halves: build the live vertex/normal pyramid once, then
+    // solve against as many model images / estimates as needed (relocalization
+    // scores dozens of hypotheses per frame against the same live frame).
+    // trackGPU == prepareLiveGPU + trackPreparedGPU.
+    void prepareLiveGPU(const float* d_depth, int width, int height);
+    ICPResult trackPreparedGPU(int                    width,
+                               int                    height,
+                               const ModelFrame&      model,
+                               const Eigen::Matrix4f& pose_estimate,
+                               const Eigen::Matrix4f& ref_pose);
     void initGPU();
     void freeGPU();
 #elif defined(HIP_ENABLED)
