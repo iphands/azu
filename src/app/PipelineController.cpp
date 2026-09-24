@@ -54,6 +54,7 @@ PipelineController::PipelineController(sensor::PreprocessBackend preferred_backe
     if (const char* rs = std::getenv("AZU_RS_READOUT_MS")) rs_readout_ms_ = std::strtof(rs, nullptr);
     if (const char* g = std::getenv("AZU_GRAVITY_TILT_DEG")) gravity_gate_.max_tilt_deg = std::strtof(g, nullptr);
     if (const char* rs = std::getenv("AZU_RELOC_SWEEP")) reloc_sweep_ = std::string(rs) != "0";
+    if (const char* rf = std::getenv("AZU_RELOC_FERNS")) reloc_ferns_ = std::string(rf) != "0";
 }
 
 PipelineController::~PipelineController() {
@@ -1092,6 +1093,12 @@ void PipelineController::trackingLoopBody() {
         frame->pose = Eigen::Matrix4f::Identity();
         reacquired_frame_id_ = 0;
         visited_.assign(1, Eigen::Matrix4f::Identity());
+        ferns_.clear();
+        last_fern_frame_ = frame->frame_id;
+        if (reloc_ferns_) {
+            ferns_.maybeAdd(ferns_.encoder().encode(frame->depth_meters.data(), frame->width, frame->height),
+                            frame->pose, frame->frame_id);
+        }
         // The first camera is the world, so its measured up is world up.
         have_up_ = have_reading;
         if (have_reading) {
@@ -1236,10 +1243,12 @@ void PipelineController::trackingLoopBody() {
     const auto gravityAllowsReacquire = &tracking::GravityContext::allowsReacquire;
 
     tracking::RelocOutcome reloc;
+    float fern_dissim = -1.0f;
     if (is_lost) {
       // RELOCALIZATION (tracking/Relocalizer.h): every candidate — the last
-      // good pose, the model image's pose, the previous frame's best, a yaw
-      // sweep about gravity — gets its own model image raycast at that pose;
+      // good pose, the model image's pose, the previous frame's best, the
+      // nearest fern keyframes, a yaw sweep about gravity — gets its own model
+      // image raycast at that pose;
       // the best are refined and verified (fit, gravity, constraint,
       // render-and-compare, ambiguity). A CPU spreads the sweep over frames.
       tracking::RelocParams rp;
@@ -1285,6 +1294,13 @@ void PipelineController::trackingLoopBody() {
       req.icp = original_params;
       req.model_empty = !model_ready_.load();
       req.visited = &visited_;
+      if (reloc_ferns_ && ferns_.size() > 0) {
+          const tracking::FernCode code =
+              ferns_.encoder().encode(frame->depth_meters.data(), frame->width, frame->height);
+          const std::vector<std::pair<int, float>> nearest = ferns_.nearest(code, kFernCandidates);
+          if (!nearest.empty()) fern_dissim = nearest.front().second;
+          for (const auto& kv : nearest) req.keyframes.push_back(ferns_.keyframe(static_cast<size_t>(kv.first)).pose);
+      }
       reloc = relocalizer_.run(req, backend);
       // Restored under the same lock the swaps happened under, so the tracker
       // can never be left holding relocalization params.
@@ -1384,6 +1400,17 @@ void PipelineController::trackingLoopBody() {
         gravity == tracking::GravityVerdict::Disagree) {
         quality = tracking::TrackQuality::Poor;
     }
+    // Keyframe database: a frame that will be integrated (Good, not a
+    // re-acquisition, past probation) and was not taken mid-jerk is stored
+    // when it looks unlike every keyframe so far.
+    if (reloc_ferns_ && !is_lost && quality == tracking::TrackQuality::Good && reacquire_probation_ == 0 &&
+        gravity != tracking::GravityVerdict::Unsteady && frame->frame_id >= last_fern_frame_ + kFernEveryFrames) {
+        const tracking::FernCode code =
+            ferns_.encoder().encode(frame->depth_meters.data(), frame->width, frame->height);
+        fern_dissim = ferns_.minDissimilarity(code);
+        ferns_.maybeAdd(code, icp_result.pose, frame->frame_id);
+        last_fern_frame_ = frame->frame_id;
+    }
 
     if (trace_.isOpen()) {
         FrameTraceRow row;
@@ -1417,6 +1444,8 @@ void PipelineController::trackingLoopBody() {
             row.reloc_coverage = reloc.consistency.coverage();
             row.reloc_eig = reloc.eig_ratio;
         }
+        row.keyframes = static_cast<int>(ferns_.size());
+        row.fern_dissim = fern_dissim;
         row.ms_preprocess = ms_preprocess;
         row.ms_icp = ms_icp;
         row.ms_track = duration<float, std::milli>(steady_clock::now() - t_frame).count();

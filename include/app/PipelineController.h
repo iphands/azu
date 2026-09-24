@@ -17,6 +17,7 @@
 #include "sensor/FrameData.h"
 #include "sensor/Preprocessor.h"
 #include "tracking/Gravity.h"
+#include "tracking/FernDatabase.h"
 #include "tracking/Relocalizer.h"
 #include "tracking/ICPTracker.h"
 #include "tsdf/TSDFVolume.h"
@@ -236,6 +237,17 @@ private:
     // AZU_RELOC_SWEEP=0 turns the yaw sweep off (ablation).
     tracking::Relocalizer      relocalizer_;
     bool                       reloc_sweep_ = true;
+    // Keyframe database (tracking/FernDatabase.h), tracking thread only: every
+    // kFernEveryFrames-th frame that will be integrated (Good, past probation,
+    // gravity not Unsteady) is encoded and stored when unlike every stored
+    // one; while lost, the nearest keyframes' poses are relocalization
+    // candidates. Cleared with the world (first frame). AZU_RELOC_FERNS=0
+    // turns it off (ablation).
+    tracking::FernDatabase     ferns_;
+    bool                       reloc_ferns_ = true;
+    uint64_t                   last_fern_frame_ = 0;
+    static constexpr uint64_t  kFernEveryFrames = 5;
+    static constexpr int       kFernCandidates = 3;
     // Poses of integrated Good frames, one per 5 cm or 10 deg of change: a
     // re-acquisition must land near one (RelocParams::max_visited_*).
     std::vector<Eigen::Matrix4f> visited_;

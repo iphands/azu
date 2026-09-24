@@ -44,6 +44,10 @@ struct FrameTraceRow {
     const char* reloc_reject = "";
     float       reloc_consistent = -1.0f, reloc_violation = -1.0f, reloc_coverage = -1.0f;
     float       reloc_eig = -1.0f;
+    // keyframe database (tracking/FernDatabase.h): its size, and the BlockHD of
+    // this frame to the nearest keyframe when it was encoded (-1 = not encoded)
+    int         keyframes = 0;
+    float       fern_dissim = -1.0f;
 };
 
 class FrameTrace {

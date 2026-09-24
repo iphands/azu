@@ -1133,7 +1133,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
     - tracking/Relocalizer.h: each candidate gets its own raycast (160x120 coarse, 320x240 refine); candidates are gravity-snapped (last good, previous best, model pose, keyframes) plus a 34-entry yaw sweep about two pivots.
     - Verification: Good fit (no motion gate), gravity, constraint (eigen ratio >= 1e-3), render-and-compare, ambiguity, blacklist, and **visited**: within 0.2 m / 45 deg of a pose tracked before.
     - Probation (T3.13) and on-demand tracking renders until the model catches up.
-    - The fern DB (tracking/FernDatabase.h) is built and tested but not yet fed or queried by the pipeline.
+    - Fern keyframe DB (tracking/FernDatabase.h) wired: every 5th frame that will be integrated (not Unsteady) is encoded and stored when BlockHD > 0.2 to every keyframe; while lost the 3 nearest keyframes' poses join Stage A. ~0.25 ms encode + 0.08 ms lookup at ~1000 keyframes (one core). Synthetic kidnaps now re-acquire on the first lost frame with depth (CPU sweep alone: up to 5 frames). cap_001 (CUDA, 3 runs): 950-1090 Good, 381-395 deg, 33-40 keyframes; 1-2 re-acquisitions per run come from a keyframe, all right (6-10 cm / 3-8 deg from an earlier tracked pose); meshes show no duplicated structure. spin360-slow unchanged (832/836).
   - Measured:
     - spin360-slow (CUDA, 3 runs): re-acquires on the frame after its loop-closure loss every time; 832/836 Good; loop check 17.5-20 mm / 1.8 deg. Before: never recovered; ~705 Good.
     - cap_001 (CUDA, unwarp 33 ms, 3 runs): 937-1063 Good, 377-392 deg of yaw, 5-7 re-acquisitions. Two runs mesh the whole room with no duplicated structure; one ~250 deg. Before: 496-675 Good, 169-250 deg.
@@ -1142,7 +1142,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
     - Depth consistency, the constraint ratio, colour NCC, rotation/translation from the last good pose and a position-only 0.3 m radius all overlapped between right and wrong.
     - Pose distance to the nearest earlier tracked pose separated them: right 4-15 cm; wrong 26-142 cm.
     - A permissive version doubled the window and desk in the mesh.
-  - Left: feed/query the fern DB (step 10); azu_replay --kidnap/--blank/--reference (step 11); GPU relocalization has no test lane.
+  - Left: azu_replay --kidnap/--blank/--reference (step 11); GPU relocalization has no test lane.
   - Old reach: the +-10 deg hypothesis grid around the last good pose. At ~15 deg on the synthetic room it re-acquired with the orientation right and the position 21.6 cm off, and that wrong basin passed probation (pipeline_gravity_contract notes).
   - Sources: TRACK-09 (steps 2, 3), SOTA-11.
   - Notes:

@@ -36,6 +36,11 @@
 //         turn itself ends ~2 cm / 1.1 deg off)
 //      C  nothing is integrated from the loss until re-acquisition + 2
 //         (probation), and integration resumes afterwards
+//      D  the keyframe database (fed during the turn) offered candidates
+//      E  re-acquired within 2 frames: a keyframe near the target is tried on
+//         the first lost frame with depth. The CPU sweep alone (6 candidates
+//         per frame) took 5 frames for the body turn and 3 for -125 deg
+//         (AZU_RELOC_FERNS=0).
 //   3  negative: a bare wall 0.6 m away for 10 frames stays lost and integrates
 //      nothing
 #include "app/PipelineController.h"
@@ -257,6 +262,8 @@ int main() {
                   "C: " + n + " integrates nothing until re-acquisition + 2");
             CHECK(integrated.back() > integrated_at_loss, "C: " + n + " integration resumes");
         }
+        CHECK(obs.keyframes > 0, "D: " + n + " keyframes offered");
+        CHECK(recovered >= 0 && recovered <= 2, "E: " + n + " re-acquired within 2 frames");
     }
 
     // 3: a bare wall.

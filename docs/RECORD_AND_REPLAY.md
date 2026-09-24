@@ -79,6 +79,8 @@ coarse solves and refines, the accepted candidate's source (`last_good`,
 (`fit`, `gravity`, `constraint`, `unvisited`, `consistency`, `ambiguous`,
 `no_candidate`, `no_depth`, `unsteady`, ...), and the render-and-compare
 consistent / violation / coverage fractions and constraint ratio (`reloc_eig`).
+`keyframes` is the fern keyframe database's size; `fern_dissim` the BlockHD to the
+nearest keyframe on frames that were encoded (keyframe candidates, and lost frames).
 `model_frame_id` is 0 when tracking used an on-demand render. Outputs per run: `summary.json`, `frames.csv`
 (pose, accelerometer gravity, cumulative yaw, tilt error), `trace.csv` (per-frame
 ICP counters, grades, timings), `mesh.ply`. The summary reports frames by grade,
@@ -105,6 +107,7 @@ hold a turn), `--volume front|centred --res N --voxel M`,
 | `AZU_RS_READOUT_MS=<ms>` | rolling-shutter unwarp of each depth frame with the predicted motion (try 30; off by default) |
 | `AZU_GRAVITY_TILT_DEG=<deg>` | gravity gate: relocalization and integration refuse poses this far off the accelerometer (default 15, 0 = off) |
 | `AZU_RELOC_SWEEP=0` | relocalization without the yaw sweep (ablation) |
+| `AZU_RELOC_FERNS=0` | relocalization without the fern keyframe database (ablation) |
 | `AZU_CUDA_DEVICE=<n>` | pick the GPU |
 
 ## 5. Synthetic recordings

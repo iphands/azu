@@ -26,7 +26,7 @@ bool FrameTrace::open(const std::string& path) {
                 "rms_m,final_step,converged,model_frame_id,outside_volume,degenerate_dofs,"
                 "ms_preprocess,ms_icp,ms_track,ms_integrate,ms_raycast,tilt_err_deg,"
                 "reloc_solves,reloc_refines,reloc_source,reloc_reject,reloc_consistent,"
-                "reloc_violation,reloc_coverage,reloc_eig\n";
+                "reloc_violation,reloc_coverage,reloc_eig,keyframes,fern_dissim\n";
     }
     return open_;
 }
@@ -46,7 +46,8 @@ void FrameTrace::write(const FrameTraceRow& r) {
          << r.ms_integrate << ',' << r.ms_raycast << ',' << r.tilt_err_deg << ','
          << r.reloc_solves << ',' << r.reloc_refines << ',' << r.reloc_source << ','
          << r.reloc_reject << ',' << r.reloc_consistent << ',' << r.reloc_violation << ','
-         << r.reloc_coverage << ',' << r.reloc_eig << '\n';
+         << r.reloc_coverage << ',' << r.reloc_eig << ',' << r.keyframes << ','
+         << r.fern_dissim << '\n';
     if (++unflushed_ >= 30) {
         out_.flush();
         unflushed_ = 0;
