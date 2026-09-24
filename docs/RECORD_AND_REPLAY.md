@@ -85,15 +85,37 @@ nearest keyframe on frames that were encoded (keyframe candidates, and lost fram
 (pose, accelerometer gravity, cumulative yaw, tilt error), `trace.csv` (per-frame
 ICP counters, grades, timings), `mesh.ply`. The summary reports frames by grade,
 lost frames, yaw tracked about gravity, tilt vs the accelerometer, a loop check
-(last frame against a model of the first 30 frames, observable directions only)
-and the end pose relative to the start.
+(last frame against a model of the first 30 frames, observable directions only),
+the end pose relative to the start, and one row per loss episode: lost at,
+re-acquired at (frame index), the accepted candidate's source, tilt, Good frames
+of the next 30, lost again within 30, frames integrated from the loss to
+re-acquisition + 2 (probation: must be 0), and the error vs `--reference` at
+re-acquisition and 30 frames later. Also relocalizing-frame time p50/p95 and the
+keyframe count.
+
+Relocalization experiments. Ranges are the recording's depth frames (0-based,
+INDEX order, half-open; `frames.csv` has them as `depth_index`):
+- `--kidnap A:B[,C:D]` drops those frames, so the camera jumps from A-1 to B;
+- `--blank A:B[,C:D]` zeroes their depth (the accelerometer keeps running), so
+  tracking is lost after 3 frames and must re-acquire from B;
+- `--reference DIR` compares every frame with a run of the same recording without
+  them (same depth frame, where that run was Good): `frames.csv` `ref_err_mm/deg`.
+
+```bash
+R=~/kinect-rec/replays; REC=~/kinect-rec/cap_001-trimmed
+azu_replay $REC --out $R/ref
+azu_replay $REC --kidnap 150:200 --reference $R/ref --out $R/kidnap
+```
+Pick the kidnap so the landing view is one already mapped: in a single spin,
+the views after a jump are new until the turn comes back round, and the
+relocalizer rightly waits for them.
 
 The Room preset (384^3 x 2 cm centred on the camera, depth to 4 m) is the
 default. Options: `--backend cpu|cuda`, `--preset room|helmet|chair|human|none`
 (`none`: pipeline defaults, a 2.56 m box in front of the camera, which cannot
 hold a turn), `--volume front|centred --res N --voxel M`,
 `--min-depth/--max-depth`, `--intrinsics device|legacy` (device.json vs the old
-525 px), `--max-frames N`.
+525 px), `--max-frames N`, `--kidnap`, `--blank`, `--reference` (above).
 
 ## 4. A/B switches (environment, GUI and replay)
 

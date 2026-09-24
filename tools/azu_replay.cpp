@@ -14,13 +14,26 @@
 //   mesh.ply     final mesh
 //   summary.json the numbers below
 // Summary: frames by grade, lost frames / first loss, total yaw tracked (about the
-// gravity axis), tilt drift vs the accelerometer, and a loop-closure check (the
-// last frame registered against a model fused from only the first frames).
+// gravity axis), tilt drift vs the accelerometer, a loop-closure check (the
+// last frame registered against a model fused from only the first frames), and
+// one row per loss episode (when lost, when and from which candidate
+// re-acquired, how the next 30 frames went, anything integrated during
+// probation, error vs --reference).
+//
+// Relocalization experiments (ranges are recording depth frames, 0-based in
+// INDEX order, half-open A:B; frames.csv's depth_index column):
+//   --kidnap A:B[,C:D]  drop those frames: the camera jumps from A-1 to B
+//   --blank A:B[,C:D]   zero their depth (the accelerometer keeps running):
+//                       tracking is lost after 3 and must re-acquire after B
+//   --reference DIR     a replay of the same recording without them: every
+//                       frame is compared with that run's pose for the same
+//                       depth frame (frames.csv ref_err_*), when it was Good
 //
 // usage: azu_replay <recording_dir> [--out DIR] [--backend auto|cpu|cuda]
 //                   [--preset room|helmet|chair|human|none] [--intrinsics device|legacy]
 //                   [--volume front|centred] [--res N] [--voxel M]
 //                   [--min-depth M] [--max-depth M] [--max-frames N] [--quiet]
+//                   [--kidnap A:B[,..]] [--blank A:B[,..]] [--reference DIR]
 // The preset defaults to room (recordings are turns in place); `none` keeps
 // the pipeline defaults with a front-anchored 256^3 x 1 cm object volume.
 #include "FakenectRecording.h"
@@ -34,6 +47,7 @@
 
 #include <Eigen/Geometry>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -42,9 +56,12 @@
 #include <deque>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -61,7 +78,31 @@ struct Options {
     float voxel = 0.0f, min_depth = 0.0f, max_depth = 0.0f;
     bool quiet = false;
     bool volume_set = false;
+    std::vector<std::pair<int, int>> kidnap, blank;   // recording depth frames [A, B)
+    std::string reference;
 };
+
+// "A:B[,C:D...]" with 0 <= A < B.
+bool parseRanges(const std::string& text, std::vector<std::pair<int, int>>& out) {
+    std::stringstream ss(text);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        const size_t colon = item.find(':');
+        if (colon == std::string::npos) return false;
+        const int a = std::atoi(item.substr(0, colon).c_str());
+        const int b = std::atoi(item.substr(colon + 1).c_str());
+        if (a < 0 || b <= a) return false;
+        out.push_back({a, b});
+    }
+    return !out.empty();
+}
+
+bool inRanges(int i, const std::vector<std::pair<int, int>>& ranges) {
+    for (const auto& r : ranges) {
+        if (i >= r.first && i < r.second) return true;
+    }
+    return false;
+}
 
 bool parseArgs(int argc, char** argv, Options& o) {
     for (int i = 1; i < argc; ++i) {
@@ -84,6 +125,13 @@ bool parseArgs(int argc, char** argv, Options& o) {
         else if (a == "--max-depth") o.max_depth = std::strtof(next("--max-depth"), nullptr);
         else if (a == "--max-frames") o.max_frames = std::atoi(next("--max-frames"));
         else if (a == "--quiet") o.quiet = true;
+        else if (a == "--kidnap" || a == "--blank") {
+            if (!parseRanges(next(a.c_str()), a == "--kidnap" ? o.kidnap : o.blank)) {
+                std::fprintf(stderr, "%s wants A:B[,C:D...] with 0 <= A < B\n", a.c_str());
+                return false;
+            }
+        }
+        else if (a == "--reference") o.reference = next("--reference");
         else if (!a.empty() && a[0] == '-') {
             std::fprintf(stderr, "unknown option %s\n", a.c_str());
             return false;
@@ -112,12 +160,68 @@ double angleDeg(const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
 
 struct FrameRecord {
     uint64_t id = 0;
+    int depth_index = -1;   // the recording's depth frame (INDEX order)
     int quality = -1;
     int state = 0;
     Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
     Eigen::Vector3d accel = Eigen::Vector3d::Zero();
     bool has_accel = false;
 };
+
+// A CSV with a header row, as rows of named fields (no quoting: our files).
+struct Csv {
+    std::map<std::string, int> col;
+    std::vector<std::vector<std::string>> rows;
+    const std::string& at(size_t r, const char* name) const {
+        static const std::string none;
+        const auto it = col.find(name);
+        if (it == col.end() || it->second >= static_cast<int>(rows[r].size())) return none;
+        return rows[r][it->second];
+    }
+};
+
+bool readCsv(const std::string& path, Csv& out) {
+    std::ifstream in(path);
+    std::string line;
+    if (!std::getline(in, line)) return false;
+    auto split = [](const std::string& l) {
+        std::vector<std::string> f;
+        std::stringstream ss(l);
+        std::string x;
+        while (std::getline(ss, x, ',')) f.push_back(x);
+        return f;
+    };
+    const std::vector<std::string> head = split(line);
+    for (size_t i = 0; i < head.size(); ++i) out.col[head[i]] = static_cast<int>(i);
+    while (std::getline(in, line)) out.rows.push_back(split(line));
+    return true;
+}
+
+Eigen::Matrix4f poseFromCsv(const Csv& c, size_t r) {
+    auto f = [&](const char* n) { return std::strtof(c.at(r, n).c_str(), nullptr); };
+    Eigen::Matrix4f m = Eigen::Matrix4f::Identity();
+    m.block<3,3>(0,0) = Eigen::Quaternionf(f("qw"), f("qx"), f("qy"), f("qz")).normalized().toRotationMatrix();
+    m.block<3,1>(0,3) = Eigen::Vector3f(f("tx"), f("ty"), f("tz"));
+    return m;
+}
+
+struct PoseErr {
+    double mm = -1.0, deg = -1.0;
+};
+
+PoseErr poseErr(const Eigen::Matrix4f& a, const Eigen::Matrix4f& b) {
+    PoseErr e;
+    e.mm = (a.block<3,1>(0,3) - b.block<3,1>(0,3)).norm() * 1e3;
+    const Eigen::Matrix3d r = (a.block<3,3>(0,0).transpose() * b.block<3,3>(0,0)).cast<double>();
+    e.deg = Eigen::AngleAxisd(r).angle() * 180.0 / M_PI;
+    return e;
+}
+
+double percentile(std::vector<double> v, double q) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    return v[std::min(v.size() - 1, static_cast<size_t>(q * (v.size() - 1) + 0.5))];
+}
 
 }  // namespace
 
@@ -128,8 +232,23 @@ int main(int argc, char** argv) {
                      "usage: azu_replay <recording_dir> [--out DIR] [--backend auto|cpu|cuda]\n"
                      "                  [--preset room|helmet|chair|human|none] [--intrinsics device|legacy]\n"
                      "                  [--volume front|centred] [--res N] [--voxel M]\n"
-                     "                  [--min-depth M] [--max-depth M] [--max-frames N] [--quiet]\n");
+                     "                  [--min-depth M] [--max-depth M] [--max-frames N] [--quiet]\n"
+                     "                  [--kidnap A:B[,..]] [--blank A:B[,..]] [--reference DIR]\n");
         return 2;
+    }
+    // The reference run's Good poses by recording depth frame.
+    std::unordered_map<int, Eigen::Matrix4f> reference;
+    if (!opt.reference.empty()) {
+        Csv ref;
+        if (!readCsv(opt.reference + "/frames.csv", ref) || !ref.col.count("depth_index")) {
+            std::fprintf(stderr, "--reference: no frames.csv with a depth_index column in %s\n",
+                         opt.reference.c_str());
+            return 2;
+        }
+        for (size_t r = 0; r < ref.rows.size(); ++r) {
+            if (ref.at(r, "quality") != "0") continue;
+            reference[std::atoi(ref.at(r, "depth_index").c_str())] = poseFromCsv(ref, r);
+        }
     }
     mkdir(opt.out.c_str(), 0755);
 
@@ -226,6 +345,8 @@ int main(int argc, char** argv) {
     const size_t rgb_bytes = static_cast<size_t>(sensor::RGB_WIDTH) * sensor::RGB_HEIGHT * 3;
     const auto t_start = Clock::now();
     int timeouts = 0;
+    int depth_index = -1;
+    std::unordered_map<uint32_t, int> depth_index_of;   // ticks -> index, until published
     for (const azu_rec::Entry& e : entries) {
         const char type = e.type;
         const uint32_t ticks = e.ticks;
@@ -242,7 +363,11 @@ int main(int argc, char** argv) {
             continue;
         }
         if (type == 'd') {
+            ++depth_index;
+            if (inRanges(depth_index, opt.kidnap)) continue;   // never happened: the camera jumps
             if (!azu_rec::readPayload(path, depth_bytes, buf)) continue;
+            if (inRanges(depth_index, opt.blank)) std::fill(buf.begin(), buf.end(), 0);   // raw 0 = no depth
+            depth_index_of[ticks] = depth_index;
             pairing.ingestDepth(buf.data(), ticks);
         } else if (type == 'r') {
             if (!azu_rec::readPayload(path, rgb_bytes, buf)) continue;
@@ -253,6 +378,11 @@ int main(int argc, char** argv) {
             std::shared_ptr<sensor::RawFrame> f = std::move(published.front());
             published.pop_front();
             const uint64_t id = f->frame_id;
+            int frame_depth_index = -1;
+            if (const auto di = depth_index_of.find(f->depth_ticks); di != depth_index_of.end()) {
+                frame_depth_index = di->second;
+                depth_index_of.erase(di);   // ticks wrap every ~71.6 s
+            }
             const Eigen::Vector3d accel(f->accel[0], f->accel[1], f->accel[2]);
             const bool has_accel = f->accel_valid;
             std::vector<uint16_t> depth_copy(f->depth);
@@ -262,6 +392,7 @@ int main(int argc, char** argv) {
             const app::PipelineMetrics m = pc.metricsSnapshot();
             FrameRecord r;
             r.id = id;
+            r.depth_index = frame_depth_index;
             r.quality = records.empty() ? -1 : m.tracking_quality;
             r.state = static_cast<int>(m.state);
             r.pose = pc.currentPose();
@@ -331,8 +462,11 @@ int main(int argc, char** argv) {
     int good = 0, poor = 0, failed = 0, lost = 0, first_lost = -1;
     double yaw_total = 0.0, tilt_max = 0.0, tilt_sum = 0.0;
     int tilt_n = 0;
+    std::vector<double> tilt_of(records.size(), -1.0);
+    std::vector<PoseErr> ref_err(records.size());
     std::ofstream fcsv(opt.out + "/frames.csv");
-    fcsv << "idx,frame_id,quality,state,tx,ty,tz,qw,qx,qy,qz,ax,ay,az,yaw_total_deg,tilt_err_deg\n";
+    fcsv << "idx,frame_id,quality,state,tx,ty,tz,qw,qx,qy,qz,ax,ay,az,yaw_total_deg,tilt_err_deg,"
+            "depth_index,ref_err_mm,ref_err_deg\n";
     for (size_t i = 0; i < records.size(); ++i) {
         const FrameRecord& r = records[i];
         if (r.quality == 0) ++good;
@@ -358,12 +492,17 @@ int main(int argc, char** argv) {
             tilt_max = std::max(tilt_max, tilt);
             tilt_sum += tilt;
             ++tilt_n;
+            tilt_of[i] = tilt;
+        }
+        if (const auto ref = reference.find(r.depth_index); ref != reference.end()) {
+            ref_err[i] = poseErr(r.pose, ref->second);
         }
         const Eigen::Quaternionf q(Eigen::Matrix3f(r.pose.block<3,3>(0,0)));
         fcsv << i << ',' << r.id << ',' << r.quality << ',' << r.state << ',' << r.pose(0, 3) << ','
              << r.pose(1, 3) << ',' << r.pose(2, 3) << ',' << q.w() << ',' << q.x() << ',' << q.y()
              << ',' << q.z() << ',' << r.accel.x() << ',' << r.accel.y() << ',' << r.accel.z() << ','
-             << yaw_total * 180.0 / M_PI << ',' << tilt << '\n';
+             << yaw_total * 180.0 / M_PI << ',' << tilt << ',' << r.depth_index << ',' << ref_err[i].mm << ','
+             << ref_err[i].deg << '\n';
     }
 
     // ---- loop closure: last frame vs a model fused from the first frames only
@@ -405,6 +544,64 @@ int main(int argc, char** argv) {
     const double end_t = end_pose.block<3,1>(0,3).norm();
     const double end_r = Eigen::AngleAxisd(end_pose.block<3,3>(0,0).cast<double>()).angle() * 180.0 / M_PI;
 
+    // ---- loss episodes. The trace (closed by stop()) says which candidate
+    // re-acquired, what integrated, and how long relocalizing frames took.
+    Csv trace;
+    readCsv(opt.out + "/trace.csv", trace);
+    std::unordered_map<uint64_t, std::string> reloc_source;
+    std::vector<uint64_t> integrated_ids;
+    std::vector<double> reloc_ms;
+    int keyframes = 0;
+    for (size_t t = 0; t < trace.rows.size(); ++t) {
+        const std::string& kind = trace.at(t, "kind");
+        const uint64_t fid = std::strtoull(trace.at(t, "frame_id").c_str(), nullptr, 10);
+        if (kind == "integ") {
+            integrated_ids.push_back(fid);
+        } else if (kind == "track") {
+            if (!trace.at(t, "reloc_source").empty()) reloc_source[fid] = trace.at(t, "reloc_source");
+            if (trace.at(t, "relocalizing") == "1") reloc_ms.push_back(std::strtod(trace.at(t, "ms_track").c_str(), nullptr));
+            keyframes = std::max(keyframes, std::atoi(trace.at(t, "keyframes").c_str()));
+        }
+    }
+    struct Episode {
+        int lost_at = -1, reacquired_at = -1, lost_frames = 0;
+        std::string source;
+        double tilt = -1.0;
+        int good_next30 = 0, next30 = 0;
+        bool relost_within30 = false;
+        int integrated_in_probation = 0;
+        PoseErr err_at, err_after30;
+    };
+    constexpr int kAfter = 30;
+    constexpr int kProbationFrames = 3;   // PipelineController::kReacquireProbation
+    const int lost_state = static_cast<int>(app::PipelineState::TrackingLost);
+    std::vector<Episode> episodes;
+    for (size_t i = 1; i < records.size(); ++i) {
+        if (records[i].state != lost_state || records[i - 1].state == lost_state) continue;
+        Episode ep;
+        ep.lost_at = static_cast<int>(i);
+        size_t j = i;
+        while (j < records.size() && records[j].state == lost_state) ++j;
+        ep.lost_frames = static_cast<int>(j - i);
+        if (j < records.size()) {
+            ep.reacquired_at = static_cast<int>(j);
+            const auto src = reloc_source.find(records[j].id);
+            ep.source = src != reloc_source.end() ? src->second : "?";
+            ep.tilt = tilt_of[j];
+            for (size_t k = j; k < std::min(records.size(), j + kAfter); ++k) {
+                ++ep.next30;
+                ep.good_next30 += records[k].quality == 0;
+                if (k > j && records[k].state == lost_state) ep.relost_within30 = true;
+            }
+            const uint64_t lo = records[i].id;
+            const uint64_t hi = records[std::min(records.size() - 1, j + kProbationFrames - 1)].id;
+            for (uint64_t fid : integrated_ids) ep.integrated_in_probation += (fid >= lo && fid <= hi);
+            ep.err_at = ref_err[j];
+            if (j + kAfter < records.size()) ep.err_after30 = ref_err[j + kAfter];
+        }
+        episodes.push_back(ep);
+    }
+
     const double yaw_deg = yaw_total * 180.0 / M_PI;
     std::printf("\nframes %zu (%.1f s, %.1f fps): good %d, poor %d, failed %d, lost frames %d "
                 "(first at frame %d), timeouts %d\n",
@@ -418,6 +615,20 @@ int main(int argc, char** argv) {
                 first_depth.size(), loop_valid ? "" : "[UNRELIABLE] ", loop_t * 1e3, loop_r, loop.inliers,
                 loop_obs.degenerate_dofs);
     std::printf("end pose vs start pose: %.1f mm / %.2f deg\n", end_t * 1e3, end_r);
+    int reacquired = 0;
+    for (const Episode& ep : episodes) reacquired += ep.reacquired_at >= 0;
+    std::printf("loss episodes %zu, re-acquired %d; relocalizing frames %.1f ms p50 / %.1f ms p95; keyframes %d\n",
+                episodes.size(), reacquired, percentile(reloc_ms, 0.5), percentile(reloc_ms, 0.95), keyframes);
+    if (!episodes.empty()) {
+        std::printf("  lost@  reacq@  frames  source               tilt  good/30  relost  integ  ref@reacq       ref@+30\n");
+    }
+    for (const Episode& ep : episodes) {
+        std::printf("  %5d  %6d  %6d  %-19s %5.1f  %3d/%-3d  %6s  %5d  %6.1f mm %5.2f  %6.1f mm %5.2f\n", ep.lost_at,
+                    ep.reacquired_at, ep.lost_frames, ep.reacquired_at >= 0 ? ep.source.c_str() : "(never)",
+                    ep.tilt, ep.good_next30, ep.next30, ep.relost_within30 ? "yes" : "no",
+                    ep.integrated_in_probation, ep.err_at.mm, ep.err_at.deg, ep.err_after30.mm,
+                    ep.err_after30.deg);
+    }
     std::printf("outputs: %s/{trace.csv,frames.csv,summary.json%s}\n", opt.out.c_str(),
                 mesh_ok ? ",mesh.ply" : "");
 
@@ -439,7 +650,20 @@ int main(int argc, char** argv) {
        << "  \"loop_trans_mm\": " << loop_t * 1e3 << ", \"loop_rot_deg\": " << loop_r
        << ", \"loop_inliers\": " << loop.inliers << ", \"loop_reliable\": " << (loop_valid ? "true" : "false")
        << ", \"loop_unobservable_dofs\": " << loop_obs.degenerate_dofs << ",\n"
-       << "  \"end_vs_start_mm\": " << end_t * 1e3 << ", \"end_vs_start_deg\": " << end_r
-       << "\n}\n";
+       << "  \"end_vs_start_mm\": " << end_t * 1e3 << ", \"end_vs_start_deg\": " << end_r << ",\n"
+       << "  \"reloc_ms_p50\": " << percentile(reloc_ms, 0.5) << ", \"reloc_ms_p95\": " << percentile(reloc_ms, 0.95)
+       << ", \"keyframes\": " << keyframes << ",\n"
+       << "  \"episodes\": [";
+    for (size_t k = 0; k < episodes.size(); ++k) {
+        const Episode& ep = episodes[k];
+        js << (k ? "," : "") << "\n    {\"lost_at\": " << ep.lost_at << ", \"reacquired_at\": " << ep.reacquired_at
+           << ", \"lost_frames\": " << ep.lost_frames << ", \"source\": \"" << ep.source << "\", \"tilt_deg\": "
+           << ep.tilt << ", \"good_next30\": " << ep.good_next30 << ", \"next30\": " << ep.next30
+           << ", \"relost_within30\": " << (ep.relost_within30 ? "true" : "false")
+           << ", \"integrated_in_probation\": " << ep.integrated_in_probation << ", \"ref_err_mm\": " << ep.err_at.mm
+           << ", \"ref_err_deg\": " << ep.err_at.deg << ", \"ref_err_after30_mm\": " << ep.err_after30.mm
+           << ", \"ref_err_after30_deg\": " << ep.err_after30.deg << "}";
+    }
+    js << (episodes.empty() ? "]" : "\n  ]") << "\n}\n";
     return 0;
 }
