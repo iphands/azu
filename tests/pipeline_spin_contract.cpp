@@ -139,28 +139,24 @@ int main() {
     for (int i = 0; i < turn_frames + kHoldFrames; ++i) {
         const float yaw = kStepRad * static_cast<float>(std::min(i, turn_frames));
         truth = azu_test::makePose({0.0f, yaw, 0.0f}, {0.0f, 0.0f, 0.0f});
-        const uint64_t tracked_before = pc.trackedFrameCountForTests();
-        const int integrated_before = pc.metricsSnapshot().integrated_frames;
         std::vector<float> depth = scene.renderDepth(room_from_start * truth);
         if (i >= glitch_start && i < glitch_start + glitch_count) {
             std::fill(depth.begin(), depth.end(), 0.0f);   // sensor glitch: no depth
         }
         pc.injectRawFrameForTests(rawFrom(depth, static_cast<uint64_t>(i + 1)));
-        if (i == 0) {
-            waitFor([&] { return pc.metricsSnapshot().integrated_frames > integrated_before; }, 3s);
-            continue;
-        }
-        if (!waitFor([&] { return pc.trackedFrameCountForTests() > tracked_before; }, 3s)) {
+        // Lockstep: the frame is graded, and if integrated also raycast into the
+        // model, before the next one (waitIdle). Waiting only for the integrated
+        // count let the next frame track against the PREVIOUS model image when
+        // the raycast/swap had not landed yet, so the final error depended on
+        // machine load: 25-60 mm for the Room preset under the pinned gate.
+        if (!pc.waitIdle(10s)) {
             ++timeouts;
             continue;
         }
+        if (i == 0) continue;
         const auto m = pc.metricsSnapshot();
         ++graded;
-        if (m.tracking_quality == 0) {
-            ++good;
-            // Lockstep: the next frame tracks against the model this one produced.
-            waitFor([&] { return pc.metricsSnapshot().integrated_frames > integrated_before; }, 3s);
-        }
+        if (m.tracking_quality == 0) ++good;
         if (m.state == PipelineState::TrackingLost) {
             ++lost_frames;
             if (first_lost < 0) first_lost = i;
