@@ -836,6 +836,7 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
   - Notes: warp `__shfl_down_sync` plus a block reduce into a `float[blocks][27]` buffer, then a second kernel sums in fixed order in fp64. Add `static_assert` on the block size.
   - Acceptance: 5 repeats give bit-identical poses (today |Δpose| up to 2e-4).
   - Effort: S. Depends on: T2.13.
+  - CPU side done 2026-09-23: `ICPTracker.cpp` accumulated per-thread under `schedule(dynamic, 32)`, so rows landed in different partial sums each run; that flaked `pipeline_spin_room_preset` (lost at 121-123 deg in some Release gate runs). Now `schedule(static)`: bit-identical for a given thread count (5 runs at 16 threads: 249/249, 49.6 mm). Differs across thread counts; the gate pins `OMP_NUM_THREADS=16`.
 
 - [ ] **T2.16. Edge-owned GPU marching cubes**
   - Sources: GPU-09.
@@ -1127,8 +1128,22 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
   - Acceptance: a synthetic 12 m corridor walk keeps RSS/VRAM bounded (< 1.5× that of a 6 m room), and the final mesh is complete.
   - Effort: M. Depends on: T4.2 or T4.3.
 
-- [ ] **T4.5. Keyframe database and fern relocaliser** (probation after a re-acquisition landed with T3.13)
-  - Reach today: the +-10 deg hypothesis grid around the last good pose. At ~15 deg on the synthetic room it re-acquired with the orientation right and the position 21.6 cm off, and that wrong basin passed probation (pipeline_gravity_contract notes).
+- [~] **T4.5. Keyframe database and fern relocaliser** — relocalizer rework landed 2026-09-23 (plan: ~/.claude/plans/misty-exploring-eagle.md).
+  - Done:
+    - tracking/Relocalizer.h: each candidate gets its own raycast (160x120 coarse, 320x240 refine); candidates are gravity-snapped (last good, previous best, model pose, keyframes) plus a 34-entry yaw sweep about two pivots.
+    - Verification: Good fit (no motion gate), gravity, constraint (eigen ratio >= 1e-3), render-and-compare, ambiguity, blacklist, and **visited**: within 0.2 m / 45 deg of a pose tracked before.
+    - Probation (T3.13) and on-demand tracking renders until the model catches up.
+    - The fern DB (tracking/FernDatabase.h) is built and tested but not yet fed or queried by the pipeline.
+  - Measured:
+    - spin360-slow (CUDA, 3 runs): re-acquires on the frame after its loop-closure loss every time; 832/836 Good; loop check 17.5-20 mm / 1.8 deg. Before: never recovered; ~705 Good.
+    - cap_001 (CUDA, unwarp 33 ms, 3 runs): 937-1063 Good, 377-392 deg of yaw, 5-7 re-acquisitions. Two runs mesh the whole room with no duplicated structure; one ~250 deg. Before: 496-675 Good, 169-250 deg.
+    - Synthetic kidnaps (pipeline_kidnap_contract): 60, 180 (body turn), 125 deg and 55 deg + 0.14 m, all recovered within 5 frames.
+  - What did not work on real data (cap_001, re-acquisitions labelled against the RGB of the most similar earlier well-tracked pose):
+    - Depth consistency, the constraint ratio, colour NCC, rotation/translation from the last good pose and a position-only 0.3 m radius all overlapped between right and wrong.
+    - Pose distance to the nearest earlier tracked pose separated them: right 4-15 cm; wrong 26-142 cm.
+    - A permissive version doubled the window and desk in the mesh.
+  - Left: feed/query the fern DB (step 10); azu_replay --kidnap/--blank/--reference (step 11); GPU relocalization has no test lane.
+  - Old reach: the +-10 deg hypothesis grid around the last good pose. At ~15 deg on the synthetic room it re-acquired with the orientation right and the position 21.6 cm off, and that wrong basin passed probation (pipeline_gravity_contract notes).
   - Sources: TRACK-09 (steps 2, 3), SOTA-11.
   - Notes:
     - 80×60 normalised depth (and luma).

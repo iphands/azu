@@ -53,6 +53,13 @@ For a photosphere-style room (turn plus up/down sweeps):
 - avoid ending a sweep on a bare wall or ceiling: stop where there is furniture or
   a corner in view.
 
+If tracking is lost (the view shows live depth instead of the model), point the
+camera back at something with furniture that you already scanned, from about
+where you stood. The relocalizer only re-acquires a pose within 0.2 m and
+45 deg of one it tracked before, and waits on bare walls, ceilings and
+symmetric corners rather than guessing; a wrong guess would write the room in
+twice.
+
 You get:
 - `d-*.pgm`: raw 11-bit depth;
 - `r-*.ppm`: RGB;
