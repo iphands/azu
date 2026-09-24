@@ -15,9 +15,19 @@ Protocol (handheld is fine):
 
 1. start the recorder, get in position quickly
 2. hold still for at least 10 s
-3. do the capture (e.g. turn a full circle in ~30 s)
+3. do the capture (e.g. turn a full circle in ~30 s); keep every motion at
+   about 30 deg/s or slower, including up/down sweeps (see below)
 4. hold still for at least 10 s
 5. move / reach for the keyboard and stop with Ctrl-C
+
+Speed matters. The Kinect v1 depth camera is rolling shutter and the tracker
+follows frame to frame, so fast motion both bends each frame and leaves too
+little overlap. A slow turn at ~12 deg/s (spin360-slow) tracked ~358 deg and
+lost it only at the loop closure; a photosphere-style take with up/down sweeps
+at 60-100 deg/s (peaks 150-180 deg/s, cap_001) lost tracking after ~90 deg. For
+a room with up/down sweeps, take one floor-to-ceiling sweep in 4-5 s, pause at
+the top and bottom, turn ~20-30 deg between sweeps, and expect 2-3 minutes for
+the whole room.
 
 ## 1b. Trim to the holds
 
@@ -47,25 +57,32 @@ Pick the Room preset ("Stand in the middle, turn around"): its volume surrounds
 the camera. Object presets put the volume in front of the camera and cannot hold
 a full turn.
 
-## 3. Replay offline, deterministically
+## 3. Replay offline, in lockstep
 
 ```bash
-./build-cuda/tools/azu_replay ~/kinect-rec/spin360-slow-trimmed --preset room --out /tmp/spin-cuda
-./build-cuda/tools/azu_replay ~/kinect-rec/spin360-slow-trimmed --preset room --backend cpu --out /tmp/spin-cpu
+./build-cuda/tools/azu_replay ~/kinect-rec/spin360-slow-trimmed --out /tmp/spin-cuda
+./build-cuda/tools/azu_replay ~/kinect-rec/spin360-slow-trimmed --backend cpu --out /tmp/spin-cpu
 scripts/trace_report.py /tmp/spin-cuda /tmp/spin-cpu -o /tmp/spin.html
 ```
 
 Lockstep: every frame is fully tracked, integrated and raycast before the next,
-so runs repeat and compare. Outputs per run: `summary.json`, `frames.csv`
+so no frame is dropped and runs compare. CUDA runs are not bit-repeatable: the
+GPU ICP sums floats in a varying order, and near a tracking loss runs diverge.
+On cap_001, 4 identical runs tracked 89-359 deg of yaw after the same first loss.
+Compare several runs, or only up to the first loss (big-fix-two T2.15).
+Outputs per run: `summary.json`, `frames.csv`
 (pose, accelerometer gravity, cumulative yaw, tilt error), `trace.csv` (per-frame
 ICP counters, grades, timings), `mesh.ply`. The summary reports frames by grade,
 lost frames, yaw tracked about gravity, tilt vs the accelerometer, a loop check
 (last frame against a model of the first 30 frames, observable directions only)
 and the end pose relative to the start.
 
-Options: `--backend cpu|cuda`, `--preset helmet|chair|room|human`,
-`--volume front|centred --res N --voxel M`, `--min-depth/--max-depth`,
-`--intrinsics device|legacy` (device.json vs the old 525 px), `--max-frames N`.
+The Room preset (384^3 x 2 cm centred on the camera, depth to 4 m) is the
+default. Options: `--backend cpu|cuda`, `--preset room|helmet|chair|human|none`
+(`none`: pipeline defaults, a 2.56 m box in front of the camera, which cannot
+hold a turn), `--volume front|centred --res N --voxel M`,
+`--min-depth/--max-depth`, `--intrinsics device|legacy` (device.json vs the old
+525 px), `--max-frames N`.
 
 ## 4. A/B switches (environment, GUI and replay)
 
@@ -76,6 +93,7 @@ Options: `--backend cpu|cuda`, `--preset helmet|chair|room|human`,
 | `AZU_PREPROCESS=minimal` | depth: spatial median only (no hole fill, guided filter, EMA) |
 | `AZU_MOTION_MODEL=velocity` | keep velocity through failed frames |
 | `AZU_DEGENERACY_REL=<ratio>` | unobservable-motion threshold (default 5e-3, 0 = off) |
+| `AZU_RS_READOUT_MS=<ms>` | rolling-shutter unwarp of each depth frame with the predicted motion (try 30; off by default) |
 | `AZU_CUDA_DEVICE=<n>` | pick the GPU |
 
 ## 5. Synthetic recordings

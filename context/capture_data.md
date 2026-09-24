@@ -31,8 +31,27 @@ Protocol (handheld is fine):
 1. Start the recorder, pick up the camera and get in position quickly.
 2. **Hold still for at least 10 s**, pointed at something with shape (furniture, a corner).
 3. Do the capture, e.g. turn a full circle clockwise in about 30 s, at chest height.
+   **Move slowly: about 30 deg/s or less, up/down sweeps included** (next section).
 4. **Hold still for at least 10 s** facing where you started.
 5. Reach for the keyboard and press **Ctrl-C** (the recorder only cleans up on SIGINT).
+
+### How fast
+
+The depth camera reads its rows top to bottom (rolling shutter) and the tracker
+follows frame to frame, so fast motion both bends each frame and leaves too
+little overlap between frames.
+
+| Take | Motion | Result |
+|---|---|---|
+| spin360-slow | turn only, ~12 deg/s | ~358 deg tracked, lost only at the loop closure |
+| cap_001 | up/down sweeps at 60-100 deg/s, peaks 150-180 deg/s | lost after ~90 deg |
+
+For a photosphere-style room (turn plus up/down sweeps):
+- one floor-to-ceiling sweep in 4-5 s, with a short pause at the top and bottom;
+- turn 20-30 deg between sweeps (or turn slowly while sweeping);
+- expect 2-3 minutes for the whole room;
+- avoid ending a sweep on a bare wall or ceiling: stop where there is furniture or
+  a corner in view.
 
 You get:
 - `d-*.pgm`: raw 11-bit depth;
@@ -60,6 +79,9 @@ A frame counts as still only when both are low:
 |---|---|---|
 | depth change | < 0.015 (handheld still: 0.002-0.009) | turning 0.03-0.25 |
 | accelerometer std | < 0.025 g (handheld still: 0.013-0.022 g) | turning 0.03-0.07 g; a keyboard reach 0.07-0.09 g |
+
+The moving rows also gauge speed. A slow turn reads depth 0.03-0.25 and accel
+0.03-0.07 g; cap_001, which was too fast, read mostly 0.2-0.9 and 0.1-0.3 g.
 
 The first hold must begin within the first 20 s and the last must end within
 the last 20 s; each must last at least 3 s. Cuts go 0.25 s inside the holds.
@@ -95,9 +117,9 @@ directory first: azu_trim will not overwrite a recording.
 ## 4. Use the trimmed take
 
 ```bash
-# Replay offline, deterministic, both backends
-./build-cuda/tools/azu_replay ~/kinect-rec/<take>-trimmed --preset room --out /tmp/<take>-cuda
-./build-cuda/tools/azu_replay ~/kinect-rec/<take>-trimmed --preset room --backend cpu --out /tmp/<take>-cpu
+# Replay offline, both backends (Room preset is the default; CUDA runs vary near a loss)
+./build-cuda/tools/azu_replay ~/kinect-rec/<take>-trimmed --out /tmp/<take>-cuda
+./build-cuda/tools/azu_replay ~/kinect-rec/<take>-trimmed --backend cpu --out /tmp/<take>-cpu
 scripts/trace_report.py /tmp/<take>-cuda /tmp/<take>-cpu -o /tmp/<take>.html
 
 # Watch it in the GUI at recorded speed (pick the Room preset)
@@ -109,7 +131,7 @@ FAKENECT_LOOP=0 LD_PRELOAD=/usr/local/lib/fakenect/libfakenect.so \
 
 - [ ] `mkdir -p ~/kinect-rec`, app closed
 - [ ] `fakenect-record ~/kinect-rec/<new-name>`
-- [ ] get in position -> hold 10 s -> capture -> hold 10 s -> Ctrl-C
+- [ ] get in position -> hold 10 s -> capture (<= ~30 deg/s) -> hold 10 s -> Ctrl-C
 - [ ] `azu_trim <take> --dry-run`: both holds found?
 - [ ] `azu_trim <take>` -> `<take>-trimmed`
-- [ ] `azu_replay <take>-trimmed --preset room`
+- [ ] `azu_replay <take>-trimmed` (Room preset by default)

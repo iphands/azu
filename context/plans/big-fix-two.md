@@ -187,6 +187,50 @@ abort; synthetic closed-loop trajectory ATE 4.3 mm; relocalization recovers a
 12 deg / 3 cm offset on the first frame. `scripts/gate.sh`: CPU Release 47/47,
 CPU Debug 47/47, CUDA builds.
 
+## Field report: cap_001, handheld photosphere room take (2026-09-23)
+
+Counter-clockwise turn with repeated up/down sweeps; trimmed 1286 frames (42.9 s).
+Replayed with `azu_replay` (CUDA, Room preset).
+
+- **Operator speed.** Accelerometer pitch: sweeps of -83..+66 deg; mean rate
+  60-100 deg/s and peaks 150-180 deg/s, rising through the take. spin360-slow was
+  ~12 deg/s. This is past what frame-to-model ICP on a Kinect v1 holds, so the
+  capture guide now asks for <= ~30 deg/s (docs/RECORD_AND_REPLAY.md,
+  context/capture_data.md).
+- **Rolling shutter (new, not in the todos).** ICP RMS tracks pitch rate (r = 0.58),
+  not depth (median depth 1.1-2.4 m, where sensor noise is 2-9 mm). The opt-in unwarp
+  `AZU_RS_READOUT_MS` cut mean RMS in the worst sweep segment from 15.1 to 8.7 mm
+  at 20-33 ms. 60 ms overshoots; a negative value is worse. See T3.14.
+- **First loss at frames 352-419 with every variant tried** (one early run: 480).
+  Tried: the unwarp, RMS gate 25/35 mm, `AZU_PREPROCESS=minimal`, velocity model,
+  no degeneracy hold, legacy intrinsics. What happens at ~405: a fast sweep pushes RMS past
+  15 mm, Poor frames stop integration, the view pitches up onto a mostly bare
+  wall the model does not cover, and ICP diverges (33 deg in one frame).
+  Constant-velocity prediction is not the problem: median error 0.32 deg, p90
+  0.95 deg.
+- **Relocalization accepted wrong poses and integrated them.** Re-acquired on a
+  Poor fit at 35 mm RMS with a 17 deg tilt error. Also re-acquired three times
+  with 87-93 deg tilt error (likely the floor fitted to a wall); after the first,
+  28 of the next 30 frames graded Good and were integrated; the mesh shows a rotated second
+  copy of the room. Fixed in part: relocalization exits only on a Good fit. The
+  rest needs gravity (T3.13): a tilt gate of ~15 deg against the accelerometer
+  would have rejected all four.
+- **GPU ICP is not repeatable near a failure.** Four identical runs: 397-908 Good
+  frames, 89-359 deg of yaw. T2.15 is a prerequisite for trusting end-to-end A/B.
+  The luckiest run meshes nearly the whole room.
+- **azu_replay default.** Without `--preset` it used a 2.56 m object box in front
+  of the camera, so an operator's run lost the turn at once. The Room preset is
+  now the default (`--preset none` gives the old behaviour).
+
+Suggested order for the next session:
+1. T3.13, gravity check first: accelerometer in RawFrame, then a relocalization
+   and Good-grade tilt gate.
+2. T3.14, unwarp on by default for Kinect input.
+3. T2.15.
+4. T4.5.
+5. T5.1 speed warning.
+6. T4.6 offline refine (several passes over a recording).
+
 ## Execution rules
 
 - **Git (repo and `/home/iphands/prog/slop/CLAUDE.md`)**
@@ -1010,6 +1054,20 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
     - A replay tilted by 15°: exported floor normal within 2° of +Y.
     - Corridor probe with synthetic gravity: rotation error < 0.2°.
   - Effort: M. Depends on: T0.8.
+
+- [ ] **T3.14. Rolling-shutter unwarp on by default for Kinect input**
+  - Sources: cap_001 field report (above).
+  - Files: `include/sensor/RollingShutter.h` (today CPU + OpenMP, ~1 ms per frame, opt-in via `AZU_RS_READOUT_MS`), `PipelineController` (hook before preprocessing), `make_fake_dump` (emulate the readout so synthetic takes exercise it).
+  - Notes:
+    - Readout ~30 ms, fitted on cap_001 (20-33 ms best). Confirm on a second take.
+    - Second pass: re-unwarp with the ICP step, then re-solve, when the step is large.
+    - GPU path: unwarp the uploaded raw frame in the conditioner.
+    - A hyperparameter, not an environment variable, once on by default. Off for synthetic sources until make_fake_dump emulates the readout.
+  - Acceptance:
+    - `rolling_shutter_contract` stays green.
+    - On cap_001, mean RMS over tracked frames 230-300 at or below 9 mm.
+    - spin360-slow no worse (tracked frames, loop check).
+  - Effort: S-M. Depends on: none.
 
 ### Phase 4: room scale
 
