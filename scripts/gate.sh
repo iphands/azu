@@ -20,6 +20,11 @@
 # integrated 5 fps; with 8 tests in parallel on 16 CPUs the room-preset spin
 # lost track at 121 deg (the model lagged the tracker; it passes alone and at 4).
 # -j (the build) defaults to the size of the set.
+# OMP_WAIT_POLICY defaults to PASSIVE: with 4 tests of 16 OpenMP threads each
+# on 16 CPUs, libgomp's spinning threads (it only throttles the spin when ONE
+# process has more threads than CPUs) starved each other: 4 concurrent
+# relocalizer_contract runs took 210 s with the default policy, 36 s passive
+# (alone: 13.2 s default, 11.3 s passive), and a Debug run timed out at 240 s.
 #
 # usage: scripts/gate.sh [--cpu-list LIST] [--omp N] [-j N]
 set -euo pipefail
@@ -54,9 +59,10 @@ JOBS="${JOBS:-${N_CPUS}}"
 OMP="${OMP:-${N_CPUS}}"
 CTEST_JOBS=$(( N_CPUS / 4 > 0 ? N_CPUS / 4 : 1 ))
 export OMP_NUM_THREADS="${OMP}"
+export OMP_WAIT_POLICY="${OMP_WAIT_POLICY:-PASSIVE}"
 
 if [ -z "${GATE_PINNED:-}" ] && command -v taskset >/dev/null 2>&1; then
-    echo "== pinned to ${N_CPUS} CPUs (${CPU_LIST}), -j ${JOBS}, ctest -j ${CTEST_JOBS}, OMP_NUM_THREADS=${OMP}"
+    echo "== pinned to ${N_CPUS} CPUs (${CPU_LIST}), -j ${JOBS}, ctest -j ${CTEST_JOBS}, OMP_NUM_THREADS=${OMP}, OMP_WAIT_POLICY=${OMP_WAIT_POLICY}"
     export GATE_PINNED=1
     exec taskset -c "${CPU_LIST}" "$0" "${ARGS[@]}"
 fi
