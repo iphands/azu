@@ -25,6 +25,20 @@ struct CameraIntrinsics {
 // when no device calibration is available (synthetic data, tests).
 inline constexpr CameraIntrinsics kLegacyIntrinsics{};
 
+// The same camera rendered at w x h instead of ref_w x ref_h: focal lengths scale
+// with the size and pixel centres stay pixel centres ((c + 0.5) * s - 0.5).
+// Returns k itself at the same size, so full-resolution callers are unchanged.
+// The low-resolution model images of relocalization are raycast AND projected
+// into with this one function; any mismatch shifts every correspondence.
+inline CameraIntrinsics scaleIntrinsics(const CameraIntrinsics& k, int ref_w, int ref_h, int w,
+                                        int h) {
+    if (w == ref_w && h == ref_h) return k;
+    const float sx = static_cast<float>(w) / static_cast<float>(ref_w);
+    const float sy = static_cast<float>(h) / static_cast<float>(ref_h);
+    return CameraIntrinsics{k.fx * sx, k.fy * sy, (k.cx + 0.5f) * sx - 0.5f,
+                            (k.cy + 0.5f) * sy - 0.5f};
+}
+
 inline bool intrinsicsFromZeroPlane(double reference_distance_mm, double reference_pixel_size_mm,
                                     CameraIntrinsics* out) {
     if (!(reference_distance_mm > 0.0) || !(reference_pixel_size_mm > 0.0)) return false;

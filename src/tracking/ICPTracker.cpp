@@ -16,9 +16,10 @@ namespace kfusion {
 namespace tracking {
 
 // tracking:CPU-8: the level-scaled intrinsic helpers that used to sit here had
-// zero call sites. Projection is intentionally full-resolution at every pyramid
-// level (the model frame is built at full res); both backends do the same.
-// Do not "restore" per-level intrinsics without first rescaling the model side.
+// zero call sites. Projection goes into the MODEL image at every pyramid level,
+// with the intrinsics scaled to the model image's size (sensor::scaleIntrinsics;
+// identical to the camera's at 640x480); both backends do the same. The live
+// pyramid level does not change the projection.
 
 ICPParams ICPTracker::sanitizeParams(const ICPParams& params) {
     ICPParams out = params;
@@ -148,7 +149,14 @@ bool ICPTracker::buildLinearSystem(const sensor::FrameData& live,
 {
     const int W = live.width;
     const int H = live.height;
-    const sensor::CameraIntrinsics K = intrinsics_;
+    const int MW = model.width;
+    const int MH = model.height;
+    if (MW <= 0 || MH <= 0 || model.vertices.size() < static_cast<size_t>(MW) * MH ||
+        model.normals.size() < static_cast<size_t>(MW) * MH) {
+        return false;
+    }
+    const sensor::CameraIntrinsics K =
+        sensor::scaleIntrinsics(intrinsics_, sensor::FRAME_W, sensor::FRAME_H, MW, MH);
     const float angle_thresh_cos = std::cos(params_.angle_threshold * M_PI / 180.0f);
 
     // Live Camera to World
@@ -251,10 +259,10 @@ bool ICPTracker::buildLinearSystem(const sensor::FrameData& live,
                 continue;
             }
 
-            if (mx < 0 || mx >= sensor::FRAME_W || my < 0 || my >= sensor::FRAME_H) continue;
+            if (mx < 0 || mx >= MW || my < 0 || my >= MH) continue;
             acc.projected++;
             
-            int midx = my * sensor::FRAME_W + mx;
+            int midx = my * MW + mx;
             const Eigen::Vector3f& model_v_world = model.vertices[midx];
             const Eigen::Vector3f& model_n_world = model.normals[midx];
             if (!modelVertexIsValid(model_v_world) || !normalIsValid(model_n_world)) continue;

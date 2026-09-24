@@ -72,10 +72,13 @@ struct ModelFrame {
     Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
     uint64_t        source_frame_id = 0;
 
-    ModelFrame() {
-        vertices.assign(width * height, Eigen::Vector3f::Zero());
-        normals.assign(width * height, Eigen::Vector3f::Zero());
-        colors.assign(width * height * 3, 0);
+    // Any size: ICP projects into it with the intrinsics scaled to width x
+    // height (sensor::scaleIntrinsics). Relocalization scores hypotheses
+    // against 160x120 and 320x240 renders.
+    explicit ModelFrame(int w = sensor::FRAME_W, int h = sensor::FRAME_H) : width(w), height(h) {
+        vertices.assign(static_cast<size_t>(width) * height, Eigen::Vector3f::Zero());
+        normals.assign(static_cast<size_t>(width) * height, Eigen::Vector3f::Zero());
+        colors.assign(static_cast<size_t>(width) * height * 3, 0);
     }
     
     // Use default destructor as CudaUniquePtr handles cleanup
@@ -185,8 +188,9 @@ private:
                             int&   dist_filtered,
                             int&   angle_filtered);
     // tracking:CPU-7: there is deliberately no separate model-projection member
-    // here — projection lives inline in `buildLinearSystem`, at
-    // full-resolution intrinsics on every path.
+    // here — projection lives inline in `buildLinearSystem`, with the
+    // intrinsics scaled to the MODEL image's size (full resolution for the
+    // pipeline's model; smaller for relocalization renders) on every path.
 };
 
 } // namespace tracking

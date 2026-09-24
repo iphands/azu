@@ -350,11 +350,16 @@ ICPResult ICPTracker::trackLevelGPU(const float3*            d_v_live,
     ICPResult result;
     result.pose = pose_estimate;
 
-    // Intrinsics for projecting into the MODEL frame (which is always full resolution)
-    float fx = kfusion::sensor::FX;
-    float fy = kfusion::sensor::FY;
-    float cx = kfusion::sensor::CX;
-    float cy = kfusion::sensor::CY;
+    // Intrinsics for projecting into the MODEL image, scaled to its size. This
+    // also replaces the legacy 525 px constants this path still used after the
+    // CPU/CUDA paths moved to the device's calibrated intrinsics. Mirrored from
+    // CUDA; not compiled on the dev host (no ROCm).
+    const kfusion::sensor::CameraIntrinsics mk = kfusion::sensor::scaleIntrinsics(
+        intrinsics_, kfusion::sensor::FRAME_W, kfusion::sensor::FRAME_H, model.width, model.height);
+    float fx = mk.fx;
+    float fy = mk.fy;
+    float cx = mk.cx;
+    float cy = mk.cy;
 
     float angle_thresh_cos = cosf(params_.angle_threshold * 3.14159f / 180.0f);
 

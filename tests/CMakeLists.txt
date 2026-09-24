@@ -378,6 +378,14 @@ target_link_libraries(tracking_policy_contract PRIVATE azu_test_core)
 add_test(NAME tracking_policy_contract COMMAND tracking_policy_contract)
 set_tests_properties(tracking_policy_contract PROPERTIES LABELS cpu TIMEOUT 60)
 
+# Relocalization rework: ICP against a model image of any size.
+add_executable(icp_lowres_model_contract icp_lowres_model_contract.cpp)
+target_compile_definitions(icp_lowres_model_contract PRIVATE ${AZU_TEST_DEFS})
+target_include_directories(icp_lowres_model_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(icp_lowres_model_contract PRIVATE azu_test_core)
+add_test(NAME icp_lowres_model_contract COMMAND icp_lowres_model_contract)
+set_tests_properties(icp_lowres_model_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 add_executable(rolling_shutter_contract rolling_shutter_contract.cpp)
 target_compile_definitions(rolling_shutter_contract PRIVATE ${AZU_TEST_DEFS})
 target_include_directories(rolling_shutter_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -1619,7 +1627,8 @@ endif()
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     foreach(_azu_scene_test icp_refpose_contract pipeline_trajectory_contract
                             pipeline_relocalization_contract pipeline_spin_contract
-                            rolling_shutter_contract pipeline_gravity_contract)
+                            rolling_shutter_contract pipeline_gravity_contract
+                            icp_lowres_model_contract)
         target_compile_options(${_azu_scene_test} PRIVATE -O2)
     endforeach()
 endif()

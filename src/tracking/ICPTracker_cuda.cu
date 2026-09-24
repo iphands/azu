@@ -362,11 +362,14 @@ ICPResult ICPTracker::trackLevelGPU(const float3*            d_v_live,
     ICPResult result;
     result.pose = pose_estimate;
 
-    // Intrinsics for projecting into the MODEL frame (which is always full resolution)
-    float fx = intrinsics_.fx;
-    float fy = intrinsics_.fy;
-    float cx = intrinsics_.cx;
-    float cy = intrinsics_.cy;
+    // Intrinsics for projecting into the MODEL image, scaled to its size
+    // (identical to the camera's for the pipeline's 640x480 model).
+    const sensor::CameraIntrinsics mk =
+        sensor::scaleIntrinsics(intrinsics_, sensor::FRAME_W, sensor::FRAME_H, model.width, model.height);
+    float fx = mk.fx;
+    float fy = mk.fy;
+    float cx = mk.cx;
+    float cy = mk.cy;
 
     float angle_thresh_cos = cosf(params_.angle_threshold * 3.14159f / 180.0f);
 
