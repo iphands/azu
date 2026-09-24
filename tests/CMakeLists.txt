@@ -448,7 +448,8 @@ target_compile_definitions(pipeline_kidnap_contract PRIVATE ${AZU_TEST_DEFS})
 target_include_directories(pipeline_kidnap_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(pipeline_kidnap_contract PRIVATE azu_test_pipeline)
 add_test(NAME pipeline_kidnap_contract COMMAND pipeline_kidnap_contract)
-set_tests_properties(pipeline_kidnap_contract PROPERTIES LABELS cpu TIMEOUT 300)
+# Debug under the gate: 239 s once event F was added (was 225 s).
+set_tests_properties(pipeline_kidnap_contract PROPERTIES LABELS cpu TIMEOUT 420)
 
 # big-fix-two T3.13: gravity-checked relocalization, probation, no replayed jump.
 add_executable(pipeline_gravity_contract pipeline_gravity_contract.cpp)

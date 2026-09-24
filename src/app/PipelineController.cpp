@@ -1092,6 +1092,7 @@ void PipelineController::trackingLoopBody() {
         first_frame_ = false;
         frame->pose = Eigen::Matrix4f::Identity();
         reacquired_frame_id_ = 0;
+        last_tracked_ms_ = frame->timestamp_ms;
         visited_.assign(1, Eigen::Matrix4f::Identity());
         ferns_.clear();
         last_fern_frame_ = frame->frame_id;
@@ -1294,6 +1295,9 @@ void PipelineController::trackingLoopBody() {
       req.icp = original_params;
       req.model_empty = !model_ready_.load();
       req.visited = &visited_;
+      // Frames without a sensor clock (tests that leave it 0) do not bound it.
+      const double lost_ms = frame->timestamp_ms - last_tracked_ms_;
+      req.seconds_since_good = lost_ms > 0.0 ? static_cast<float>(lost_ms / 1000.0) : -1.0f;
       if (reloc_ferns_ && ferns_.size() > 0) {
           const tracking::FernCode code =
               ferns_.encoder().encode(frame->depth_meters.data(), frame->width, frame->height);
@@ -1506,6 +1510,7 @@ void PipelineController::trackingLoopBody() {
             if (is_lost) {
                 reacquire_probation_ = kReacquireProbation;
                 pre_reacquire_pose_ = prev_pose;
+                pre_reacquire_ms_ = last_tracked_ms_;
                 reacquired_frame_id_ = frame->frame_id;
                 reacquired_pose_ = icp_result.pose;
             }
@@ -1539,6 +1544,7 @@ void PipelineController::trackingLoopBody() {
                 velocity_.block<3,1>(0,3) = step.block<3,1>(0,3) * share;
             }
             frames_since_tracked_ = 0;
+            last_tracked_ms_ = frame->timestamp_ms;
             frame->pose = icp_result.pose;
             state_.store(PipelineState::Running);
             // First frame had no reading: take the reference from the first
@@ -1579,6 +1585,7 @@ void PipelineController::trackingLoopBody() {
                 std::lock_guard<std::mutex> lk(pose_mutex_);
                 current_pose_ = pre_reacquire_pose_;
                 last_pose_ = pre_reacquire_pose_;
+                last_tracked_ms_ = pre_reacquire_ms_;
             }
             if (!is_lost && consecutive_failures_ >= tracking::TrackingPolicy{}.failures_before_lost) {
                 KFLOG_WARN("Pipeline", "Tracking lost! Suspension of TSDF integration. Entering relocalization mode...");

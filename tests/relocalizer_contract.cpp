@@ -31,6 +31,8 @@
 //      the only pose tracked before is the pre-kidnap one (same place, 90 deg
 //      off) or one looking the same way 0.3 m away; found when one 0.1 m / 20
 //      deg from the truth is on the list
+//   J  the turn-rate bound (max_turn_rate_deg_s): A's 180 deg kidnap is refused
+//      as too fast 0.1 s after the last good pose, found 1 s after
 #include "support/RoomModel.h"
 #include "tracking/Relocalizer.h"
 #include "sensor/FrameData.h"
@@ -115,6 +117,7 @@ struct Attempt {
     azu_test::PoseError err{-1.0f, -1.0f};
     bool saw_blacklisted = false;
     bool saw_unvisited = false;
+    bool saw_too_fast = false;
 };
 
 const Eigen::Matrix4f kLastGood = azu_test::RoomModel::yawPitch(15.0f * kDeg, 0.0f);
@@ -136,7 +139,7 @@ Attempt relocalize(const azu_test::RoomModel& room, const Eigen::Matrix4f& truth
                    const GravityContext& g, std::vector<Eigen::Matrix4f> keyframes = {},
                    Relocalizer* reloc_in = nullptr, const std::vector<float>* depth_in = nullptr,
                    const Eigen::Matrix4f& last_good = kLastGood,
-                   const std::vector<Eigen::Matrix4f>* visited = nullptr) {
+                   const std::vector<Eigen::Matrix4f>* visited = nullptr, float seconds_since_good = -1.0f) {
     const std::vector<float> depth = depth_in ? *depth_in : room.depthAt(truth);
     CpuBackend be(room, depth);
     Relocalizer local(cpuParams());
@@ -148,6 +151,7 @@ Attempt relocalize(const azu_test::RoomModel& room, const Eigen::Matrix4f& truth
     req.keyframes = keyframes;
     req.gravity = g;
     req.visited = visited;
+    req.seconds_since_good = seconds_since_good;
     req.live_depth = depth.data();
     req.live_w = room.intrinsics().width;
     req.live_h = room.intrinsics().height;
@@ -156,6 +160,7 @@ Attempt relocalize(const azu_test::RoomModel& room, const Eigen::Matrix4f& truth
         a.last = reloc.run(req, be.hooks());
         if (a.last.reject == RelocReject::Blacklisted) a.saw_blacklisted = true;
         if (a.last.reject == RelocReject::Unvisited) a.saw_unvisited = true;
+        if (a.last.reject == RelocReject::TooFast) a.saw_too_fast = true;
         if (a.last.accepted) {
             a.accepted = true;
             a.err = azu_test::poseError(a.last.result.pose, truth);
@@ -285,6 +290,20 @@ int main() {
         report("I: visited includes 0.1 m / 20 deg off", c);
         CHECK(c.accepted && c.err.trans_m < 0.01f && c.err.rot_deg < 0.5f,
               "I: found when a tracked pose is 0.1 m / 20 deg from the truth");
+    }
+
+    // J
+    {
+        const Eigen::Matrix4f from = level(kSphereYaw - 180.0f);
+        const Eigen::Matrix4f truth = turned(from, 180.0f, -20.0f);
+        const Attempt a = relocalize(room, truth, sweep_calls, gravityFor(truth), {}, nullptr, nullptr, from, nullptr,
+                                     0.1f);
+        report("J: 180 deg, 0.1 s after", a);
+        CHECK(!a.accepted && a.saw_too_fast, "J: 180 deg in 0.1 s is refused as too fast");
+        const Attempt b = relocalize(room, truth, sweep_calls, gravityFor(truth), {}, nullptr, nullptr, from, nullptr,
+                                     1.0f);
+        report("J: 180 deg, 1 s after", b);
+        CHECK(b.accepted && b.err.trans_m < 0.01f && b.err.rot_deg < 0.5f, "J: 180 deg in 1 s is found");
     }
 
     if (g_failures == 0) {

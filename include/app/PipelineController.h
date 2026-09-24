@@ -346,6 +346,11 @@ private:
     static constexpr int                  kReacquireProbation = 3;
     int                                   reacquire_probation_ = 0;
     Eigen::Matrix4f                       pre_reacquire_pose_{Eigen::Matrix4f::Identity()};
+    // Sensor time of the frame current_pose_ was tracked on (restored with the
+    // pose when probation fails): relocalization bounds how far the camera can
+    // have turned since (RelocParams::max_turn_rate_deg_s).
+    double                                last_tracked_ms_ = 0.0;
+    double                                pre_reacquire_ms_ = 0.0;
     bool                                  first_frame_    = true;
 
     // Per-instance log throttle counters — replaces static locals in worker threads

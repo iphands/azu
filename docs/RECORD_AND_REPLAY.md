@@ -76,8 +76,9 @@ The trace's `tilt_err_deg` is the pipeline's own pose-vs-accelerometer angle
 (-1 when there is no reading). On relocalizing rows, `reloc_*` record the search:
 coarse solves and refines, the accepted candidate's source (`last_good`,
 `carry_over`, `model_pose`, `sweep`, `keyframe`, ...) or the reject reason
-(`fit`, `gravity`, `constraint`, `unvisited`, `consistency`, `ambiguous`,
-`no_candidate`, `no_depth`, `unsteady`, ...), and the render-and-compare
+(`fit`, `unconverged`, `gravity`, `constraint`, `unvisited`, `too_fast`,
+`consistency`, `ambiguous`, `no_candidate`, `no_depth`, `unsteady`, ...), and the
+render-and-compare
 consistent / violation / coverage fractions and constraint ratio (`reloc_eig`).
 `keyframes` is the fern keyframe database's size; `fern_dissim` the BlockHD to the
 nearest keyframe on frames that were encoded (keyframe candidates, and lost frames).

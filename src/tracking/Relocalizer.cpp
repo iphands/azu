@@ -14,6 +14,7 @@ const char* relocRejectName(RelocReject r) {
         case RelocReject::NoDepth:     return "no_depth";
         case RelocReject::Unsteady:    return "unsteady";
         case RelocReject::Unvisited:   return "unvisited";
+        case RelocReject::TooFast:     return "too_fast";
         case RelocReject::Unconverged: return "unconverged";
         case RelocReject::EmptyModel:  return "empty_model";
         case RelocReject::NoCandidate: return "no_candidate";
@@ -66,6 +67,11 @@ bool Relocalizer::nearVisited(const Eigen::Matrix4f& pose, const RelocRequest& r
         if ((v.block<3,1>(0,3) - c).squaredNorm() <= r2 && v.block<3,1>(0,2).dot(f) >= min_cos) return true;
     }
     return false;
+}
+
+bool Relocalizer::plausibleTurn(const Eigen::Matrix4f& pose, const RelocRequest& req) const {
+    if (p_.max_turn_rate_deg_s <= 0.0f || req.seconds_since_good < 0.0f) return true;
+    return poseGap(pose, req.last_good).rot_deg <= p_.max_turn_rate_deg_s * req.seconds_since_good + p_.turn_slack_deg;
 }
 
 bool Relocalizer::isLocal(const Eigen::Matrix4f& pose, const Eigen::Matrix4f& last_good) const {
@@ -294,6 +300,8 @@ std::vector<Relocalizer::Verified> Relocalizer::evaluate(const std::vector<Hypot
             why = RelocReject::Blacklisted;
         } else if (!nearVisited(rr.pose, req)) {
             why = RelocReject::Unvisited;
+        } else if (!plausibleTurn(rr.pose, req)) {
+            why = RelocReject::TooFast;
         } else {
             const ModelFrame& mv = be.render(rr.pose, RenderSize::Refine, true);
             c = depthConsistency(mv.vertices.data(), mv.normals.data(), mv.width, mv.height, rr.pose,

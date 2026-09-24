@@ -61,6 +61,7 @@ enum class RelocReject : uint8_t {
     NoDepth,       // too little live depth to try
     Unsteady,      // a reading exists but the hand is accelerating: gravity cannot vouch for any pose
     Unvisited,     // farther than max_visited_distance_m from every position tracked before
+    TooFast,       // turned farther from the last good pose than a hand can in the time lost
     Unconverged,   // the refine was still moving the pose when its rounds ran out
     EmptyModel,    // nothing fused yet
     NoCandidate,   // no candidate fitted at all
@@ -104,9 +105,10 @@ struct RelocParams {
     float refine_converged_deg  = 0.25f;
     // If the last round still moved it more than this, the pose is not taken
     // on this frame; the carry-over candidate resumes from it on the next.
-    // Along a weakly constrained direction each solve slides only 1-4 cm (a
-    // cap_001 kidnap in 1 run of 4 was taken 165 mm / 10.8 deg off and
-    // integrated while it slid in).
+    // It fires on 3-29 relocalizing frames per cap_001 run. It does NOT catch
+    // the cap_001 kidnap offsets it was aimed at (165-188 mm / 11-12 deg in 2
+    // of 10 runs): those refines had converged onto the offset, along a
+    // weakly constrained direction, and later views pulled them in.
     float refine_settled_m      = 0.02f;
     float refine_settled_deg    = 1.0f;
     bool  use_sweep             = true;
@@ -133,6 +135,16 @@ struct RelocParams {
     // list.
     float max_visited_distance_m = 0.2f;
     float max_visited_angle_deg  = 45.0f;
+    // A re-acquired pose may be at most max_turn_rate_deg_s * (time since the
+    // last good pose) + turn_slack_deg of rotation from it: a hand does not
+    // turn a camera 104 deg in 0.13 s, which a cap_001 keyframe candidate
+    // claimed (Good fit, consistency 0.94, and integrated 3 frames). Over the
+    // real re-acquisitions judged right (cap_001, spin360-slow) the fastest
+    // was 95 deg after 26 lost frames. Rotation only: spin360-slow's correct
+    // loop-closure recovery moves 0.4 m (drift) with 2.5-4.6 deg. Unknown
+    // time (RelocRequest::seconds_since_good < 0) or 0 turns it off.
+    float max_turn_rate_deg_s   = 180.0f;
+    float turn_slack_deg        = 30.0f;
     ConsistencyThresholds consistency;
     float ambiguous_trans_m     = 0.2f;
     float ambiguous_rot_deg     = 15.0f;
@@ -169,6 +181,7 @@ struct RelocRequest {
     Eigen::Matrix4f model_pose = Eigen::Matrix4f::Identity();
     std::vector<Eigen::Matrix4f> keyframes;   // nearest first
     const std::vector<Eigen::Matrix4f>* visited = nullptr;   // poses tracked Good (world-from-camera)
+    float           seconds_since_good = -1.0f;   // since last_good was tracked; < 0 = unknown
     GravityContext  gravity;
     const float*    live_depth = nullptr;     // meters, 0 = none
     int             live_w = 0, live_h = 0;
@@ -224,6 +237,7 @@ private:
 
     bool blacklisted(const Eigen::Matrix4f& pose) const;
     bool nearVisited(const Eigen::Matrix4f& pose, const RelocRequest& req) const;
+    bool plausibleTurn(const Eigen::Matrix4f& pose, const RelocRequest& req) const;
     bool isLocal(const Eigen::Matrix4f& pose, const Eigen::Matrix4f& last_good) const;
     // Coarse-score `cands`, refine the best basins, verify them. Returns the
     // verified ones; tracks the best basin's reject reason and the carry-over.

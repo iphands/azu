@@ -15,7 +15,9 @@
 // Lockstep (waitIdle), accelerometer readings from the true pose (world up -y).
 //   1  build the model: stand at the room centre looking 15 deg down and turn a
 //      full circle at 1.5 deg/frame; tracking is never lost
-//   2  kidnap events, each 4 frames without depth (lost after 3) and then a hold
+//   2  kidnap events, each 4 frames without depth (lost after 3), 0.5 s apart (a
+//      kidnap takes time: the relocalizer bounds the turn by the time since the
+//      last good pose, RelocParams::max_turn_rate_deg_s), and then a hold
 //      at the new pose, each onto a view with furniture in it:
 //        +60 deg; 180 deg about a point 0.12 m behind the camera (a body turn);
 //        -125 deg onto the cabinet; -55 deg and 0.14 m (beyond the old 30 deg
@@ -41,6 +43,9 @@
 //         the first lost frame with depth. The CPU sweep alone (6 candidates
 //         per frame) took 5 frames for the body turn and 3 for -125 deg
 //         (AZU_RELOC_FERNS=0).
+//      F  a 180 deg turn after only 4 blank frames at 30 fps (0.13 s): not
+//         re-acquired while 180 deg exceeds 180 deg/s x time lost + 30 deg (the
+//         first 15 hold frames, 0.63 s), then found within 2 cm / 2 deg
 //   3  negative: a bare wall 0.6 m away for 10 frames stays lost and integrates
 //      nothing
 #include "app/PipelineController.h"
@@ -149,9 +154,12 @@ Eigen::Matrix4f yawPitch(float yaw_deg, float pitch_deg, const Eigen::Vector3f& 
            azu_test::makePose({pitch_deg * kDeg, 0.0f, 0.0f}, {0, 0, 0});
 }
 
-std::shared_ptr<RawFrame> rawFrom(const std::vector<float>& depth, uint64_t id, const Eigen::Matrix4f& truth) {
+std::shared_ptr<RawFrame> rawFrom(const std::vector<float>& depth, uint64_t id, const Eigen::Matrix4f& truth,
+                                  double t_ms) {
     auto f = std::make_shared<RawFrame>();
     f->frame_id    = id;
+    f->timestamp_depth = t_ms;
+    f->timestamp_rgb   = t_ms;
     f->depth_valid = true;
     f->rgb_valid   = true;
     for (size_t i = 0; i < depth.size(); ++i) {
@@ -178,10 +186,12 @@ int main() {
     CHECK(pc.startWithoutSensorForTests(), "seam start");
 
     uint64_t id = 0;
-    auto feed = [&](const Eigen::Matrix4f& truth, bool blank = false) {
+    double t_ms = 0.0;
+    auto feed = [&](const Eigen::Matrix4f& truth, bool blank = false, double dt_ms = 1000.0 / 30.0) {
         std::vector<float> depth = room.renderDepth(kRoomFromWorld * truth);
         if (blank) std::fill(depth.begin(), depth.end(), 0.0f);
-        pc.injectRawFrameForTests(rawFrom(depth, ++id, truth));
+        t_ms += dt_ms;
+        pc.injectRawFrameForTests(rawFrom(depth, ++id, truth, t_ms));
         CHECK(pc.waitIdle(30s), "frame handled in time");
         return pc.metricsSnapshot();
     };
@@ -230,7 +240,7 @@ int main() {
         const kfusion::tracking::PoseGap jump = kfusion::tracking::poseGap(pose, ev.target);
         std::printf("  %s: kidnap of %.1f deg / %.2f m\n", ev.name, jump.rot_deg, jump.trans_m);
         const int integrated_at_loss = pc.metricsSnapshot().integrated_frames;
-        for (int i = 0; i < 4; ++i) feed(pose, /*blank=*/true);
+        for (int i = 0; i < 4; ++i) feed(pose, /*blank=*/true, 500.0);
         pose = ev.target;
         int recovered = -1;
         std::vector<int> integrated;
@@ -264,6 +274,26 @@ int main() {
         }
         CHECK(obs.keyframes > 0, "D: " + n + " keyframes offered");
         CHECK(recovered >= 0 && recovered <= 2, "E: " + n + " re-acquired within 2 frames");
+    }
+
+    // F: the same body-turn view, 180 deg from where the camera is, after 0.13 s.
+    {
+        const kfusion::tracking::PoseGap jump = kfusion::tracking::poseGap(pose, p2);
+        for (int i = 0; i < 4; ++i) feed(pose, /*blank=*/true);
+        pose = p2;
+        int recovered = -1;
+        for (int i = 0; i < 40 && recovered < 0; ++i) {
+            if (feed(pose).state == PipelineState::Running) recovered = i;
+        }
+        const auto err = trackedError(pose);
+        const auto obs = pc.lastRelocForTests();
+        std::printf("  fast %.0f deg turn: re-acquired at hold frame %d (%.2f s after the last good frame; last "
+                    "reject before: %s), %.2f mm / %.3f deg\n",
+                    jump.rot_deg, recovered, (recovered + 5) / 30.0, kfusion::tracking::relocRejectName(obs.reject),
+                    err.trans_m * 1e3, err.rot_deg);
+        CHECK(recovered >= 15, "F: not re-acquired while the turn is faster than a hand");
+        CHECK(recovered >= 0, "F: re-acquired once the time allows it");
+        CHECK(err.trans_m < 0.02f && err.rot_deg < 2.0f, "F: within 2 cm / 2 deg");
     }
 
     // 3: a bare wall.

@@ -1133,6 +1133,8 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
     - tracking/Relocalizer.h: each candidate gets its own raycast (160x120 coarse, 320x240 refine); candidates are gravity-snapped (last good, previous best, model pose, keyframes) plus a 34-entry yaw sweep about two pivots.
     - Verification: Good fit (no motion gate), gravity, constraint (eigen ratio >= 1e-3), render-and-compare, ambiguity, blacklist, and **visited**: within 0.2 m / 45 deg of a pose tracked before.
     - Probation (T3.13) and on-demand tracking renders until the model catches up.
+    - Refines converge: a Good-fit refine re-renders and re-solves until a round moves < 5 mm / 0.25 deg (4 solves max); still moving > 2 cm / 1 deg after that = `unconverged`, retried next frame from the carry-over.
+    - Turn-rate bound: at most 180 deg/s x (time since the last good pose) + 30 deg of rotation from it (`too_fast`). Blocks a cap_001 keyframe accept 104 deg off 0.1 s after the loss (it had integrated 3 frames). Cost: when the last good pose is itself > 30 deg wrong, the correction waits up to (error - 30)/180 s (seen once: 5 frames).
     - Fern keyframe DB (tracking/FernDatabase.h) wired: every 5th frame that will be integrated (not Unsteady) is encoded and stored when BlockHD > 0.2 to every keyframe; while lost the 3 nearest keyframes' poses join Stage A. ~0.25 ms encode + 0.08 ms lookup at ~1000 keyframes (one core). Synthetic kidnaps now re-acquire on the first lost frame with depth (CPU sweep alone: up to 5 frames). cap_001 (CUDA, 3 runs): 950-1090 Good, 381-395 deg, 33-40 keyframes; 1-2 re-acquisitions per run come from a keyframe, all right (6-10 cm / 3-8 deg from an earlier tracked pose); meshes show no duplicated structure. spin360-slow unchanged (832/836).
   - Measured:
     - spin360-slow (CUDA, 3 runs): re-acquires on the frame after its loop-closure loss every time; 832/836 Good; loop check 17.5-20 mm / 1.8 deg. Before: never recovered; ~705 Good.
@@ -1142,7 +1144,12 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
     - Depth consistency, the constraint ratio, colour NCC, rotation/translation from the last good pose and a position-only 0.3 m radius all overlapped between right and wrong.
     - Pose distance to the nearest earlier tracked pose separated them: right 4-15 cm; wrong 26-142 cm.
     - A permissive version doubled the window and desk in the mesh.
-  - Left: azu_replay --kidnap/--blank/--reference (step 11); GPU relocalization has no test lane.
+    - azu_replay --kidnap/--blank/--reference (CUDA, cap_001 unwarp 33 ms): blanks of 15 and 30 frames re-acquire on the first frame with depth, 19-30 mm / 0.1 deg from the reference. A 50-frame kidnap re-acquires 14 frames later, 10-17 mm / 0.7-2.0 deg off in 8 of 10 runs with converged refines; in 2 it converged onto an offset along a weak direction (165-188 mm / 10.8-12.1 deg) that the next views pulled in while integrating. Nothing was integrated during probation in any episode.
+    - spin360-slow kidnaps land on views a single spin never mapped, so it waits for the turn to come round (right behaviour). --blank 300:330 re-acquires onto the edge of the map (coverage 0.38) 60 mm / 2.3 deg off, and that offset stays.
+  - Limits (open):
+    - Weakly constrained views (eig 1e-3..3e-3) can be taken several cm off and fused while they slide in. Raising min_eig_ratio refuses spin360's correct loop recovery (2.1-2.5e-3).
+    - GPU relocalization has no test lane; replays vary run to run (one cap_001 run in three leaves ~1/3 of the room unmeshed, in every configuration tried).
+    - `yaw_tracked_deg` in azu_replay adds relocalization jumps as signed steps of at most 180 deg, so it is not "yaw tracked" after re-acquisitions (one run read 70 deg with a correct end pose).
   - Old reach: the +-10 deg hypothesis grid around the last good pose. At ~15 deg on the synthetic room it re-acquired with the orientation right and the position 21.6 cm off, and that wrong basin passed probation (pipeline_gravity_contract notes).
   - Sources: TRACK-09 (steps 2, 3), SOTA-11.
   - Notes:
