@@ -393,6 +393,13 @@ target_link_libraries(rolling_shutter_contract PRIVATE azu_test_core)
 add_test(NAME rolling_shutter_contract COMMAND rolling_shutter_contract)
 set_tests_properties(rolling_shutter_contract PROPERTIES LABELS cpu TIMEOUT 60)
 
+# Relocalization rework: candidate poses (gravity snap, yaw sweep, dedupe).
+add_executable(reloc_hypotheses_contract reloc_hypotheses_contract.cpp)
+target_compile_definitions(reloc_hypotheses_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(reloc_hypotheses_contract PRIVATE azu_test_core)
+add_test(NAME reloc_hypotheses_contract COMMAND reloc_hypotheses_contract)
+set_tests_properties(reloc_hypotheses_contract PROPERTIES LABELS cpu TIMEOUT 60)
+
 # big-fix-two T3.13: accelerometer mapping and the tilt gate.
 add_executable(gravity_contract gravity_contract.cpp)
 target_compile_definitions(gravity_contract PRIVATE ${AZU_TEST_DEFS})

@@ -68,5 +68,35 @@ inline GravityVerdict judgeGravity(const Eigen::Matrix4f& pose, bool have_ref,
     return tilt <= gate.max_tilt_deg ? GravityVerdict::Agree : GravityVerdict::Disagree;
 }
 
+// Everything the gravity checks need for one frame, in one place: the world-up
+// reference (from the first frame with a reading) and this frame's reading.
+struct GravityContext {
+    bool            have_ref = false;
+    Eigen::Vector3f up_world{0.0f, -1.0f, 0.0f};
+    float           ref_norm = 0.0f;
+    bool            have_reading = false;
+    Eigen::Vector3f up_cam = Eigen::Vector3f::Zero();
+    GravityGate     gate;
+
+    GravityVerdict judge(const Eigen::Matrix4f& pose, float* tilt_deg = nullptr) const {
+        return judgeGravity(pose, have_ref, up_world, ref_norm, have_reading, up_cam, gate, tilt_deg);
+    }
+    bool steady() const {
+        return have_ref && have_reading && accelSteady(up_cam, ref_norm, gate.max_norm_dev);
+    }
+    // Candidate poses may be rotated onto the measured gravity.
+    bool canSnap() const { return gate.max_tilt_deg > 0.0f && steady(); }
+    // A reading exists but the hand is accelerating: no pose can be vouched for.
+    bool blocksEveryPose() const {
+        return gate.max_tilt_deg > 0.0f && have_ref && have_reading && !steady();
+    }
+    // While lost, a pose may not contradict gravity, and a reading bent by an
+    // accelerating hand cannot vouch for one. Without any reading (no
+    // accelerometer, synthetic input) there is nothing to check.
+    static bool allowsReacquire(GravityVerdict v) {
+        return v == GravityVerdict::Agree || v == GravityVerdict::Unknown;
+    }
+};
+
 } // namespace tracking
 } // namespace kfusion

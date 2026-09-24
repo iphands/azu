@@ -1165,16 +1165,17 @@ void PipelineController::trackingLoopBody() {
         gpu_lk = std::unique_lock<std::mutex>(gpu_mutex_);
     std::unique_lock<std::mutex> tracker_lk(tracker_mutex_);
 
-    const auto judgeGravity = [&](const Eigen::Matrix4f& pose, float* tilt_deg) {
-        return tracking::judgeGravity(pose, have_up_, up_world_, up_ref_norm_, have_reading, up_cam,
-                                      gravity_gate_, tilt_deg);
+    tracking::GravityContext grav;
+    grav.have_ref = have_up_;
+    grav.up_world = up_world_;
+    grav.ref_norm = up_ref_norm_;
+    grav.have_reading = have_reading;
+    grav.up_cam = up_cam;
+    grav.gate = gravity_gate_;
+    const auto judgeGravity = [&grav](const Eigen::Matrix4f& pose, float* tilt_deg) {
+        return grav.judge(pose, tilt_deg);
     };
-    // While lost, a pose may not contradict gravity, and a reading bent by a
-    // hand that is accelerating cannot vouch for one. Without any reading (no
-    // accelerometer, synthetic input) there is nothing to check.
-    const auto gravityAllowsReacquire = [](tracking::GravityVerdict v) {
-        return v == tracking::GravityVerdict::Agree || v == tracking::GravityVerdict::Unknown;
-    };
+    const auto gravityAllowsReacquire = &tracking::GravityContext::allowsReacquire;
 
     if (is_lost) {
       // RELOCALIZATION: score many starting poses cheaply at the coarsest
