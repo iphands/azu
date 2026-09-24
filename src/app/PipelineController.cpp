@@ -1331,6 +1331,11 @@ void PipelineController::trackingLoopBody() {
             {
                 std::lock_guard<std::mutex> lk(pose_mutex_);
                 current_pose_ = icp_result.pose;
+                // A relocalization jump is not motion: without this the
+                // constant-velocity prediction replays the jump on the next
+                // frame (cap_001: predicted 16.6 deg / 116 mm off, the frames
+                // after a correct re-acquisition failed and it was lost again).
+                if (is_lost) last_pose_ = icp_result.pose;
             }
             // Velocity from this tracked frame (per-frame average if frames
             // failed in between). A relocalization jump is not a velocity.
