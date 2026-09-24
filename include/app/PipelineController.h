@@ -231,6 +231,14 @@ private:
     };
     OnDemandModels             ondemand_;
     uint64_t                   reacquired_frame_id_ = 0;
+    Eigen::Matrix4f            reacquired_pose_{Eigen::Matrix4f::Identity()};
+    // Relocalization (tracking/Relocalizer.h), tracking thread only.
+    // AZU_RELOC_SWEEP=0 turns the yaw sweep off (ablation).
+    tracking::Relocalizer      relocalizer_;
+    bool                       reloc_sweep_ = true;
+    // Poses of integrated Good frames, one per 5 cm or 10 deg of change: a
+    // re-acquisition must land near one (RelocParams::max_visited_*).
+    std::vector<Eigen::Matrix4f> visited_;
     // Raycast into the on-demand buffer of that size. The caller holds
     // tsdf_mutex_ shared (and gpu_mutex_ on the GPU path).
     const tracking::ModelFrame& renderModel(const Eigen::Matrix4f& pose, tracking::RenderSize size,
@@ -561,6 +569,19 @@ public:
         bool            valid = false;
     };
     MotionModelObservation lastMotionModelForTests();
+    /** The latest relocalization run (tracking/Relocalizer.h). */
+    struct RelocObservation {
+        uint64_t                   generation = 0;   // runs since construction
+        bool                       accepted = false;
+        tracking::HypothesisSource source = tracking::HypothesisSource::LastGood;
+        tracking::RelocReject      reject = tracking::RelocReject::None;
+        int                        coarse_solves = 0;
+        int                        refines = 0;
+        float                      consistent = 0.0f;
+        float                      eig_ratio = 0.0f;
+        size_t                     keyframes = 0;
+    };
+    RelocObservation lastRelocForTests();
     /** Frames the tracking worker has finished grading since construction. */
     uint64_t trackedFrameCountForTests() const {
         return tracked_frames_total_.load(std::memory_order_acquire);
@@ -614,6 +635,7 @@ public:
 private:
     struct SeamObservation {
         mutable std::mutex mtx;
+        RelocObservation reloc;
         DepthBandObservation tracking_band;
         DepthBandObservation integration_band;
         int applied_threads  = 0;

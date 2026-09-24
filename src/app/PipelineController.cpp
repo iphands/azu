@@ -53,6 +53,7 @@ PipelineController::PipelineController(sensor::PreprocessBackend preferred_backe
     if (const char* mm = std::getenv("AZU_MOTION_MODEL")) velocity_motion_model_ = std::string(mm) == "velocity";
     if (const char* rs = std::getenv("AZU_RS_READOUT_MS")) rs_readout_ms_ = std::strtof(rs, nullptr);
     if (const char* g = std::getenv("AZU_GRAVITY_TILT_DEG")) gravity_gate_.max_tilt_deg = std::strtof(g, nullptr);
+    if (const char* rs = std::getenv("AZU_RELOC_SWEEP")) reloc_sweep_ = std::string(rs) != "0";
 }
 
 PipelineController::~PipelineController() {
@@ -1090,6 +1091,7 @@ void PipelineController::trackingLoopBody() {
         first_frame_ = false;
         frame->pose = Eigen::Matrix4f::Identity();
         reacquired_frame_id_ = 0;
+        visited_.assign(1, Eigen::Matrix4f::Identity());
         // The first camera is the world, so its measured up is world up.
         have_up_ = have_reading;
         if (have_reading) {
@@ -1233,61 +1235,76 @@ void PipelineController::trackingLoopBody() {
     };
     const auto gravityAllowsReacquire = &tracking::GravityContext::allowsReacquire;
 
+    tracking::RelocOutcome reloc;
     if (is_lost) {
-      // RELOCALIZATION: score many starting poses cheaply at the coarsest
-      // pyramid level, then refine the best one with the normal parameters.
-      // Params come from this frame's snapshot.
-      constexpr int kLevels = sensor::FramePyramid::LEVELS;
-      tracking::ICPParams coarse = hp.icp;
-      coarse.dist_threshold *= 2.5f;
-      coarse.angle_threshold = 45.0f;
-      for (int l = 0; l < kLevels - 1; ++l) coarse.max_iterations[l] = 0;
-      coarse.max_iterations[kLevels - 1] = std::max(8, 2 * hp.icp.max_iterations[kLevels - 1]);
-      const tracking::ICPParams original_params = tracker_->params();
-
-      // Last good pose, the motion prediction, the pose the model was rendered
-      // at, and a +-10 deg yaw/pitch grid around the last good pose (the old
-      // set was prev_pose twice plus a 5 cm step along WORLD z).
-      std::vector<Eigen::Matrix4f> hypotheses = {prev_pose, predicted_pose, model_ref->pose};
-      constexpr float kStep = 10.0f * static_cast<float>(M_PI) / 180.0f;
-      for (int yi = -1; yi <= 1; ++yi) {
-          for (int pi = -1; pi <= 1; ++pi) {
-              if (yi == 0 && pi == 0) continue;
-              Eigen::Matrix4f d = Eigen::Matrix4f::Identity();
-              d.block<3,3>(0,0) =
-                  (Eigen::AngleAxisf(yi * kStep, Eigen::Vector3f::UnitY()) *
-                   Eigen::AngleAxisf(pi * kStep, Eigen::Vector3f::UnitX())).toRotationMatrix();
-              hypotheses.push_back(prev_pose * d);
-          }
+      // RELOCALIZATION (tracking/Relocalizer.h): every candidate — the last
+      // good pose, the model image's pose, the previous frame's best, a yaw
+      // sweep about gravity — gets its own model image raycast at that pose;
+      // the best are refined and verified (fit, gravity, constraint,
+      // render-and-compare, ambiguity). A CPU spreads the sweep over frames.
+      tracking::RelocParams rp;
+      rp.use_sweep = reloc_sweep_;
+      if (!use_gpu_.load()) {
+          rp.sweep_budget = 6;
+          rp.refine_top = 2;
       }
-
+      relocalizer_.setParams(rp);
+      const tracking::ICPParams original_params = tracker_->params();
       sensor::FramePyramid pyramid;
       if (!use_gpu_.load()) {
           sensor::buildFramePyramid(*frame, pyramid);
       }
-      auto solve = [&](const Eigen::Matrix4f& h) {
-          return use_gpu_.load() ? solve_gpu(*model_ref, h) : solve_cpu(pyramid, *model_ref, h);
-      };
-
-      tracker_->setParams(coarse);
-      tracking::ICPResult best_coarse;
-      bool best_graded = false;
-      for (const auto& h_pose : hypotheses) {
-          const tracking::ICPResult res = solve(h_pose);
-          const bool graded =
-              tracking::classifyTracking(res, prev_pose) != tracking::TrackQuality::Failed &&
-              gravityAllowsReacquire(judgeGravity(res.pose, nullptr));
-          // Prefer any gradable result (fit and gravity); among equals, the most inliers.
-          if ((graded && !best_graded) ||
-              (graded == best_graded && res.inliers > best_coarse.inliers)) {
-              best_coarse = res;
-              best_graded = graded;
-          }
+#ifdef CUDA_ENABLED
+      else {
+          tracker_->prepareLiveGPU(preprocessor_->getGPUDepthMeters(), frame->width, frame->height);
       }
+#endif
+      std::shared_lock<std::shared_mutex> reloc_tsdf_lk(tsdf_mutex_);
+      tracking::RelocBackend backend;
+      backend.render = [this](const Eigen::Matrix4f& pose, tracking::RenderSize size,
+                              bool need_host) -> const tracking::ModelFrame& {
+          return renderModel(pose, size, need_host);
+      };
+      backend.solve = [&](const tracking::ModelFrame& m, const Eigen::Matrix4f& est,
+                          const tracking::ICPParams& p) -> tracking::ICPResult {
+          tracker_->setParams(p);
+#ifdef CUDA_ENABLED
+          if (use_gpu_.load()) return tracker_->trackPreparedGPU(frame->width, frame->height, m, est, m.pose);
+#elif defined(HIP_ENABLED)
+          if (use_gpu_.load()) return solve_gpu(m, est);
+#endif
+          return solve_cpu(pyramid, m, est);
+      };
+      tracking::RelocRequest req;
+      req.last_good = prev_pose;
+      req.model_pose = model_ref->pose;
+      req.gravity = grav;
+      req.live_depth = frame->depth_meters.data();
+      req.live_w = frame->width;
+      req.live_h = frame->height;
+      req.icp = original_params;
+      req.model_empty = !model_ready_.load();
+      req.visited = &visited_;
+      reloc = relocalizer_.run(req, backend);
+      // Restored under the same lock the swaps happened under, so the tracker
+      // can never be left holding relocalization params.
       tracker_->setParams(original_params);
-      icp_result = solve(best_coarse.pose);
-      // Restored under the same lock the swap happened under, so the tracker can
-      // never be left holding recovery params.
+      icp_result = reloc.result;
+#ifdef AZU_PIPELINE_TEST_SEAM
+      {
+          std::lock_guard<std::mutex> lk(seam_obs_.mtx);
+          auto& o = seam_obs_.reloc;
+          ++o.generation;
+          o.accepted = reloc.accepted;
+          o.source = reloc.source;
+          o.reject = reloc.reject;
+          o.coarse_solves = reloc.coarse_solves;
+          o.refines = reloc.refines;
+          o.consistent = reloc.consistency.consistentFraction();
+          o.eig_ratio = reloc.eig_ratio;
+          o.keyframes = req.keyframes.size();
+      }
+#endif
     } else {
       // Retry from the previous pose only when the prediction's result grades
       // Failed; a non-converged solve with a good fit is kept (TRACK-17).
@@ -1344,7 +1361,12 @@ void PipelineController::trackingLoopBody() {
         degenerate_dofs = om.degenerate_dofs;
     }
 
-    tracking::TrackQuality quality = tracking::classifyTracking(icp_result, prev_pose);
+    // A re-acquisition is graded on its fit alone: the relocalizer verified it
+    // (a far recovery legitimately breaks the per-frame motion gate: spin360's
+    // loop closure re-acquires 0.44-0.47 m from the drifted pose).
+    tracking::TrackQuality quality =
+        is_lost ? (reloc.accepted ? tracking::classifyFit(icp_result) : tracking::TrackQuality::Failed)
+                : tracking::classifyTracking(icp_result, prev_pose);
     // Relocalization re-acquires only on a Good fit. A Poor fit from a
     // relocalization hypothesis is usually a wrong basin (cap_001: re-acquired
     // at 35 mm RMS with a 17 deg tilt error, then integrated a rotated copy).
@@ -1385,6 +1407,16 @@ void PipelineController::trackingLoopBody() {
         row.outside_volume = outsideVolumeFraction(*frame, icp_result.pose, hp.tsdf);
         row.degenerate_dofs = degenerate_dofs;
         row.tilt_err_deg = tilt_err;
+        if (is_lost) {
+            row.reloc_solves = reloc.coarse_solves;
+            row.reloc_refines = reloc.refines;
+            row.reloc_source = reloc.accepted ? tracking::hypothesisSourceName(reloc.source) : "";
+            row.reloc_reject = tracking::relocRejectName(reloc.reject);
+            row.reloc_consistent = reloc.consistency.consistentFraction();
+            row.reloc_violation = reloc.consistency.violationFraction();
+            row.reloc_coverage = reloc.consistency.coverage();
+            row.reloc_eig = reloc.eig_ratio;
+        }
         row.ms_preprocess = ms_preprocess;
         row.ms_icp = ms_icp;
         row.ms_track = duration<float, std::milli>(steady_clock::now() - t_frame).count();
@@ -1446,6 +1478,7 @@ void PipelineController::trackingLoopBody() {
                 reacquire_probation_ = kReacquireProbation;
                 pre_reacquire_pose_ = prev_pose;
                 reacquired_frame_id_ = frame->frame_id;
+                reacquired_pose_ = icp_result.pose;
             }
             bool integrate = quality == tracking::TrackQuality::Good;
             if (reacquire_probation_ > 0) {
@@ -1488,6 +1521,12 @@ void PipelineController::trackingLoopBody() {
             }
 
             if (integrate) {
+                if (visited_.size() < 20000 &&
+                    (visited_.empty() ||
+                     (visited_.back().block<3,1>(0,3) - icp_result.pose.block<3,1>(0,3)).norm() > 0.05f ||
+                     visited_.back().block<3,1>(0,2).dot(icp_result.pose.block<3,1>(0,2)) < 0.985f)) {   // 10 deg
+                    visited_.push_back(icp_result.pose);
+                }
                 // Enqueue for integration (retain-latest, sole owner moves in).
                 enqueueForIntegration(std::move(frame));
             } else {
@@ -1502,7 +1541,10 @@ void PipelineController::trackingLoopBody() {
             ++frames_since_tracked_;
             if (!is_lost && reacquire_probation_ > 0) {
                 // The re-acquisition did not hold: back to relocalizing from
-                // the pose before it, as if it had never happened.
+                // the pose before it, as if it had never happened, and do not
+                // take that basin again for a while.
+                relocalizer_.rejectBasin(reacquired_pose_);
+                reacquired_frame_id_ = 0;
                 reacquire_probation_ = 0;
                 consecutive_failures_ = tracking::TrackingPolicy{}.failures_before_lost;
                 std::lock_guard<std::mutex> lk(pose_mutex_);
@@ -1523,6 +1565,7 @@ void PipelineController::trackingLoopBody() {
                     std::swap(integration_queue_, dropped);
                 }
                 frameDone(static_cast<int>(dropped.size()));
+                relocalizer_.beginLoss();
                 state_.store(PipelineState::TrackingLost);
             }
             frame.reset();
@@ -2181,6 +2224,11 @@ PipelineController::MotionModelObservation
 PipelineController::lastMotionModelForTests() {
   std::lock_guard<std::mutex> lk(seam_obs_.mtx);
   return seam_obs_.motion;
+}
+
+PipelineController::RelocObservation PipelineController::lastRelocForTests() {
+  std::lock_guard<std::mutex> lk(seam_obs_.mtx);
+  return seam_obs_.reloc;
 }
 
 uint64_t PipelineController::lastPoppedFrameIdForTests() {

@@ -14,15 +14,14 @@
 //        integration resumes after
 //     D  the frame after the re-acquisition is predicted from the re-acquired
 //        pose with zero motion (the jump is not replayed as velocity)
-//   run 2, frames 30-35 read a 40 deg roll the camera does not have:
+//   run 2, frames 30-41 read a 40 deg roll the camera does not have:
 //     E  no re-acquisition while the reading contradicts every pose
-//     F  recovery within 10 frames once the reading is right (frame 36)
+//     F  recovery within 10 frames once the reading is right (frame 42), by
+//        then ~15 deg from the last good pose
 //     G  the pose after recovery is within 2 cm / 1 deg of the truth
-// The window is short on purpose: the camera keeps turning 0.25 deg per frame,
-// and the relocalizer's +-10 deg hypothesis grid reaches ~13 deg (12 deg offset
-// plus 6 frames). With a 12-frame window it re-acquired at ~15 deg with the
-// position 21.6 cm off: a relocalizer reach limit (big-fix-two T4.5), which
-// gravity cannot see.
+// (The old relocalizer, a +-10 deg grid around the last good pose, re-acquired
+// that 15 deg case with the position 21.6 cm off; the rework's per-candidate
+// raycasts and sweep find it: tracking/Relocalizer.h.)
 #include "app/PipelineController.h"
 #include "sensor/DepthValidity.h"
 #include "sensor/KinectSensor.h"
@@ -164,12 +163,12 @@ int main() {
               a.after_reacquire_prediction.rot_deg < 0.1f,
           "D: the frame after a re-acquisition is predicted with zero motion");
 
-    const Run b = run(scene, 30, 36, 40.0f * 3.14159265f / 180.0f);
+    const Run b = run(scene, 30, 42, 40.0f * 3.14159265f / 180.0f);
     std::printf("  run 2: lost=%d running while the reading is wrong=%d recovered_at=%d final %.2f mm / %.3f deg\n",
                 b.entered_lost, b.running_while_bad, b.recovered_at, b.final_err.trans_m * 1e3,
                 b.final_err.rot_deg);
     CHECK(b.running_while_bad == 0, "E: no re-acquisition while the reading contradicts the pose");
-    CHECK(b.recovered_at >= 36 && b.recovered_at < 46, "F: recovers within 10 frames of a right reading");
+    CHECK(b.recovered_at >= 42 && b.recovered_at < 52, "F: recovers within 10 frames of a right reading");
     CHECK(b.final_err.trans_m < 0.02f && b.final_err.rot_deg < 1.0f, "G: pose within 2 cm / 1 deg");
 
     if (g_failures == 0) {

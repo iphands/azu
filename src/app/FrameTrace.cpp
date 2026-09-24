@@ -24,7 +24,9 @@ bool FrameTrace::open(const std::string& path) {
                 "tx,ty,tz,qw,qx,qy,qz,ptx,pty,ptz,pqw,pqx,pqy,pqz,"
                 "inliers,valid_live,projected,valid_model,dist_filtered,angle_filtered,"
                 "rms_m,final_step,converged,model_frame_id,outside_volume,degenerate_dofs,"
-                "ms_preprocess,ms_icp,ms_track,ms_integrate,ms_raycast,tilt_err_deg\n";
+                "ms_preprocess,ms_icp,ms_track,ms_integrate,ms_raycast,tilt_err_deg,"
+                "reloc_solves,reloc_refines,reloc_source,reloc_reject,reloc_consistent,"
+                "reloc_violation,reloc_coverage,reloc_eig\n";
     }
     return open_;
 }
@@ -41,7 +43,10 @@ void FrameTrace::write(const FrameTraceRow& r) {
          << r.rms_m << ',' << r.final_step << ',' << int(r.converged) << ','
          << r.model_frame_id << ',' << r.outside_volume << ',' << r.degenerate_dofs << ','
          << r.ms_preprocess << ',' << r.ms_icp << ',' << r.ms_track << ','
-         << r.ms_integrate << ',' << r.ms_raycast << ',' << r.tilt_err_deg << '\n';
+         << r.ms_integrate << ',' << r.ms_raycast << ',' << r.tilt_err_deg << ','
+         << r.reloc_solves << ',' << r.reloc_refines << ',' << r.reloc_source << ','
+         << r.reloc_reject << ',' << r.reloc_consistent << ',' << r.reloc_violation << ','
+         << r.reloc_coverage << ',' << r.reloc_eig << '\n';
     if (++unflushed_ >= 30) {
         out_.flush();
         unflushed_ = 0;

@@ -38,6 +38,12 @@ struct FrameTraceRow {
     float    ms_integrate = 0.0f, ms_raycast = 0.0f;
     // gravity (tracking/Gravity.h): pose vs accelerometer, -1 = not measurable
     float    tilt_err_deg = -1.0f;
+    // relocalization (tracking/Relocalizer.h); only on relocalizing rows
+    int         reloc_solves = 0, reloc_refines = 0;
+    const char* reloc_source = "";
+    const char* reloc_reject = "";
+    float       reloc_consistent = -1.0f, reloc_violation = -1.0f, reloc_coverage = -1.0f;
+    float       reloc_eig = -1.0f;
 };
 
 class FrameTrace {

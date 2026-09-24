@@ -441,6 +441,15 @@ target_link_libraries(pipeline_relocalization_contract PRIVATE azu_test_pipeline
 add_test(NAME pipeline_relocalization_contract COMMAND pipeline_relocalization_contract)
 set_tests_properties(pipeline_relocalization_contract PROPERTIES LABELS cpu TIMEOUT 180)
 
+# Relocalization rework: kidnaps of 55-180 deg (one also 0.14 m) through the
+# real controller, in a furnished room; a bare wall stays lost.
+add_executable(pipeline_kidnap_contract pipeline_kidnap_contract.cpp)
+target_compile_definitions(pipeline_kidnap_contract PRIVATE ${AZU_TEST_DEFS})
+target_include_directories(pipeline_kidnap_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(pipeline_kidnap_contract PRIVATE azu_test_pipeline)
+add_test(NAME pipeline_kidnap_contract COMMAND pipeline_kidnap_contract)
+set_tests_properties(pipeline_kidnap_contract PROPERTIES LABELS cpu TIMEOUT 300)
+
 # big-fix-two T3.13: gravity-checked relocalization, probation, no replayed jump.
 add_executable(pipeline_gravity_contract pipeline_gravity_contract.cpp)
 target_compile_definitions(pipeline_gravity_contract PRIVATE ${AZU_TEST_DEFS})
@@ -1661,7 +1670,8 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
                             pipeline_relocalization_contract pipeline_spin_contract
                             rolling_shutter_contract pipeline_gravity_contract
                             icp_lowres_model_contract depth_consistency_contract
-                            fern_database_contract relocalizer_contract)
+                            fern_database_contract relocalizer_contract
+                            pipeline_kidnap_contract)
         target_compile_options(${_azu_scene_test} PRIVATE -O2)
     endforeach()
 endif()
