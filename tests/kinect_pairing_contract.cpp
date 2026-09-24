@@ -19,6 +19,9 @@
 //      exact bytes injected for them, and publication happens outside the lock
 //   7  with no callback the ready slot holds only the newest frame
 //   8  the pool returns in full once references drop
+//   9  each depth frame carries the mean accelerometer reading since the
+//      previous one (the previous mean when none arrived; invalid before the
+//      first; a zero vector is not a reading)
 #include "sensor/KinectSensor.h"
 
 #include <cmath>
@@ -101,6 +104,7 @@ public:
 
     void depth(uint32_t ts) { sensor_.injectDepthForTests(depthPayload(ts).data(), ts); }
     void rgb(uint32_t ts) { sensor_.injectRgbForTests(rgbPayload(ts).data(), ts); }
+    void accel(double x, double y, double z) { sensor_.ingestAccel(x, y, z); }
 
     size_t publishedCount() const { return published_.size(); }
     size_t readyCount() const { return sensor_.readyFrameCountForTests(); }
@@ -261,6 +265,33 @@ void sectionPoolUnderLoad() {
     }
 }
 
+void sectionAccel() {
+    Fixture fx;
+    const uint32_t T = 12000u * kTicksPerMs;
+    auto pair = [&](uint32_t i) {
+        fx.rgb(T + ms(33.0 * i));
+        fx.depth(T + ms(33.0 * i + 4));
+    };
+    auto near = [](float a, float b) { return std::fabs(a - b) < 1e-5f; };
+    pair(0);
+    CHECK(fx.publishedCount() == 1 && !fx.frame(0).accel_valid, "accel: invalid before the first sample");
+    fx.accel(0.0, 9.0, 0.0);
+    fx.accel(0.2, 9.2, 0.4);
+    pair(1);
+    CHECK(fx.publishedCount() == 2 && fx.frame(1).accel_valid, "accel: valid after samples");
+    CHECK(near(fx.frame(1).accel[0], 0.1f) && near(fx.frame(1).accel[1], 9.1f) &&
+              near(fx.frame(1).accel[2], 0.2f),
+          "accel: the frame carries the mean of the samples since the previous frame");
+    pair(2);
+    CHECK(fx.frame(2).accel_valid && near(fx.frame(2).accel[1], 9.1f),
+          "accel: no new sample -> the previous mean");
+    fx.accel(0.0, 0.0, 0.0);
+    fx.accel(1.0, 8.0, 1.0);
+    pair(3);
+    CHECK(near(fx.frame(3).accel[0], 1.0f) && near(fx.frame(3).accel[1], 8.0f),
+          "accel: a zero vector (no reading yet) is ignored");
+}
+
 }  // namespace
 
 int main() {
@@ -269,6 +300,7 @@ int main() {
     sectionWrap();
     sectionLatestSlot();
     sectionPoolUnderLoad();
+    sectionAccel();
 
     if (g_failures == 0) {
         std::printf("kinect_pairing_contract: PASS (%d checks)\n", g_checks);

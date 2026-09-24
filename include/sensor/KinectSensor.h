@@ -8,6 +8,7 @@
 #include "sensor/DepthValidity.h"
 
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <mutex>
 #include <queue>
@@ -50,6 +51,13 @@ struct RawFrame {
     // Geometry never waits on colour.
     bool   rgb_valid       = false;
     uint64_t frame_id      = 0;
+    // Accelerometer, m/s^2 in the ACCELEROMETER's axes (libfreenect
+    // freenect_get_mks_accel): the mean of the samples since the previous depth
+    // frame, or the previous mean when none arrived. At rest it is the reaction
+    // to gravity, so it points up; tracking/Gravity.h maps it to camera axes.
+    // accel_valid stays false until the first sample.
+    float  accel[3]        = {0.0f, 0.0f, 0.0f};
+    bool   accel_valid     = false;
 
     RawFrame() {
         depth.resize(DEPTH_WIDTH * DEPTH_HEIGHT);
@@ -125,6 +133,11 @@ public:
     // device ticks. Must not be mixed with a running device.
     void ingestDepth(const void* data, uint32_t timestamp) { onDepth(data, timestamp); }
     void ingestRgb(const void* data, uint32_t timestamp) { onRgb(data, timestamp); }
+    // One accelerometer sample, m/s^2 in the accelerometer's axes. The next
+    // depth frame carries the mean of the samples since the previous one. A
+    // near-zero vector (no reading yet) is ignored. The capture thread feeds the
+    // live device here; offline replays feed their recorded samples.
+    void ingestAccel(double x, double y, double z);
 
     // Returns latest synchronized frame (zero-copy)
     std::shared_ptr<RawFrame> getLatestFrame();
@@ -170,6 +183,16 @@ private:
 
     uint64_t frame_counter_ = 0;
     uint64_t pair_log_      = 0;
+
+    // Accelerometer samples since the last depth frame (guarded by sync_mutex_).
+    double   accel_sum_[3]  = {0.0, 0.0, 0.0};
+    int      accel_count_   = 0;
+    float    accel_mean_[3] = {0.0f, 0.0f, 0.0f};
+    bool     have_accel_    = false;
+    // Live polling (capture thread only).
+    std::chrono::steady_clock::time_point last_accel_poll_{};
+    bool     accel_warned_  = false;
+    void     pollAccel();
 
     std::atomic<uint64_t> depth_callbacks_{0}, rgb_callbacks_{0};
     std::atomic<uint64_t> paired_{0}, depth_only_{0}, pool_exhausted_{0};

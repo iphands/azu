@@ -221,10 +221,6 @@ int main(int argc, char** argv) {
     std::vector<uint16_t> last_depth;
     constexpr size_t kLoopModelFrames = 30;
 
-    Eigen::Vector3d accel_now = Eigen::Vector3d::Zero();
-    Eigen::Vector3d accel_sum = Eigen::Vector3d::Zero();
-    int accel_count = 0;
-    bool have_accel = false;
     std::vector<uint8_t> buf;
     const size_t depth_bytes = static_cast<size_t>(sensor::DEPTH_WIDTH) * sensor::DEPTH_HEIGHT * 2;
     const size_t rgb_bytes = static_cast<size_t>(sensor::RGB_WIDTH) * sensor::RGB_HEIGHT * 3;
@@ -235,20 +231,15 @@ int main(int argc, char** argv) {
         const uint32_t ticks = e.ticks;
         const std::string path = opt.dir + "/" + e.file;
         if (type == 'a') {
-            // ~10 samples per frame; the mean over the frame interval removes
-            // most hand jitter from the gravity estimate.
+            // ~10 samples per frame. The sensor averages them over each frame
+            // interval and hands the mean to the pipeline with the frame (the
+            // gravity gate), exactly as for a live device.
             int16_t xyz[3];
             if (azu_rec::readAccelCounts(opt.dir, e, xyz)) {
-                accel_sum += Eigen::Vector3d(xyz[0], xyz[1], xyz[2]) * (kGravity / azu_rec::kCountsPerG);
-                ++accel_count;
+                const double k = kGravity / azu_rec::kCountsPerG;
+                pairing.ingestAccel(xyz[0] * k, xyz[1] * k, xyz[2] * k);
             }
             continue;
-        }
-        if (type == 'd' && accel_count > 0) {
-            accel_now = accel_sum / accel_count;
-            have_accel = true;
-            accel_sum.setZero();
-            accel_count = 0;
         }
         if (type == 'd') {
             if (!azu_rec::readPayload(path, depth_bytes, buf)) continue;
@@ -262,6 +253,8 @@ int main(int argc, char** argv) {
             std::shared_ptr<sensor::RawFrame> f = std::move(published.front());
             published.pop_front();
             const uint64_t id = f->frame_id;
+            const Eigen::Vector3d accel(f->accel[0], f->accel[1], f->accel[2]);
+            const bool has_accel = f->accel_valid;
             std::vector<uint16_t> depth_copy(f->depth);
             pc.submitRawFrame(std::move(f));
             if (!pc.waitIdle(std::chrono::seconds(20))) ++timeouts;
@@ -272,8 +265,8 @@ int main(int argc, char** argv) {
             r.quality = records.empty() ? -1 : m.tracking_quality;
             r.state = static_cast<int>(m.state);
             r.pose = pc.currentPose();
-            r.accel = accel_now;
-            r.has_accel = have_accel;
+            r.accel = accel;
+            r.has_accel = has_accel;
             records.push_back(r);
             if (first_depth.size() < kLoopModelFrames) {
                 first_depth.push_back(depth_copy);

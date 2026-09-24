@@ -148,6 +148,9 @@ void KinectSensor::stop() {
         rgb   = std::move(rgb_held_);
         depth = std::move(depth_waiting_);
         have_depth_ticks_ = have_rgb_ticks_ = false;
+        accel_sum_[0] = accel_sum_[1] = accel_sum_[2] = 0.0;
+        accel_count_ = 0;
+        have_accel_ = false;
     }
 }
 
@@ -162,8 +165,43 @@ void KinectSensor::captureLoop() {
             KFLOGF_ERROR("Sensor", "libfreenect event processing error: %d", ret);
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
+        pollAccel();
     }
 #endif
+}
+
+void KinectSensor::pollAccel() {
+#ifdef HAVE_FREENECT
+    // At most 100 Hz: on a live device the read is a USB control transfer to
+    // the motor subdevice (fakenect-record polls the same way, between event
+    // pumps); under libfakenect it returns the last replayed 'a' record.
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_accel_poll_ < std::chrono::milliseconds(10)) return;
+    last_accel_poll_ = now;
+    if (freenect_update_tilt_state(device_) < 0) {
+        if (!accel_warned_) {
+            accel_warned_ = true;
+            KFLOG_WARN("Sensor", "Accelerometer read failed; frames carry no gravity reading.");
+        }
+        return;
+    }
+    freenect_raw_tilt_state* st = freenect_get_tilt_state(device_);
+    if (!st) return;
+    double x = 0.0, y = 0.0, z = 0.0;
+    freenect_get_mks_accel(st, &x, &y, &z);
+    ingestAccel(x, y, z);
+#endif
+}
+
+void KinectSensor::ingestAccel(double x, double y, double z) {
+    // A zeroed state (fakenect before its first 'a' record) is not a reading.
+    if (!(x * x + y * y + z * z > 1.0)) return;
+    std::lock_guard<std::mutex> lk(sync_mutex_);
+    accel_sum_[0] += x;
+    accel_sum_[1] += y;
+    accel_sum_[2] += z;
+    ++accel_count_;
+    have_accel_ = true;
 }
 
 #ifdef HAVE_FREENECT
@@ -242,6 +280,16 @@ void KinectSensor::onDepth(const void* data, uint32_t timestamp) {
         frame->timestamp_depth = unwrapTicksMs(timestamp, last_depth_ticks_, depth_wraps_,
                                                have_depth_ticks_);
         frame->depth_valid     = true;
+        // Mean over the frame interval: most hand jitter averages out.
+        if (accel_count_ > 0) {
+            for (int k = 0; k < 3; ++k) {
+                accel_mean_[k] = static_cast<float>(accel_sum_[k] / accel_count_);
+                accel_sum_[k] = 0.0;
+            }
+            accel_count_ = 0;
+        }
+        std::memcpy(frame->accel, accel_mean_, sizeof(accel_mean_));
+        frame->accel_valid     = have_accel_;
 
         // A parked depth frame that never got a closer RGB sample goes out now,
         // depth-only, ahead of this one so ids stay in capture order.
