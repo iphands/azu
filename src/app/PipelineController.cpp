@@ -1250,7 +1250,11 @@ void PipelineController::trackingLoopBody() {
         degenerate_dofs = om.degenerate_dofs;
     }
 
-    const tracking::TrackQuality quality = tracking::classifyTracking(icp_result, prev_pose);
+    tracking::TrackQuality quality = tracking::classifyTracking(icp_result, prev_pose);
+    // Relocalization re-acquires only on a Good fit. A Poor fit from a
+    // relocalization hypothesis is usually a wrong basin (cap_001: re-acquired
+    // at 35 mm RMS with a 17 deg tilt error, then integrated a rotated copy).
+    if (is_lost && quality == tracking::TrackQuality::Poor) quality = tracking::TrackQuality::Failed;
 
     if (trace_.isOpen()) {
         FrameTraceRow row;
