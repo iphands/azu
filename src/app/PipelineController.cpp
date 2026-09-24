@@ -183,6 +183,10 @@ bool PipelineController::startInternal(bool engage_sensor) {
                     model_buffers_.buffers[i]->d_normals = utils::make_cuda_unique<float3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
                     model_buffers_.buffers[i]->d_colors = utils::make_cuda_unique<uchar3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
                 }
+                for (tracking::ModelFrame* m : {&ondemand_.coarse, &ondemand_.refine, &ondemand_.full}) {
+                    m->d_vertices = utils::make_cuda_unique<float3>(m->width * m->height);
+                    m->d_normals = utils::make_cuda_unique<float3>(m->width * m->height);
+                }
                 gpu_resources_ready_ = true;
             }
             use_gpu_ = true;
@@ -216,6 +220,10 @@ bool PipelineController::startInternal(bool engage_sensor) {
                     model_buffers_.buffers[i]->d_vertices = utils::make_hip_unique<float3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
                     model_buffers_.buffers[i]->d_normals = utils::make_hip_unique<float3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
                     model_buffers_.buffers[i]->d_colors = utils::make_hip_unique<uchar3>(sensor::DEPTH_WIDTH * sensor::DEPTH_HEIGHT);
+                }
+                for (tracking::ModelFrame* m : {&ondemand_.coarse, &ondemand_.refine, &ondemand_.full}) {
+                    m->d_vertices = utils::make_hip_unique<float3>(m->width * m->height);
+                    m->d_normals = utils::make_hip_unique<float3>(m->width * m->height);
                 }
                 gpu_resources_ready_ = true;
             }
@@ -598,8 +606,52 @@ void PipelineController::releaseGpuResources() noexcept {
         model_buffers_.buffers[i]->d_normals.reset();
         model_buffers_.buffers[i]->d_colors.reset();
     }
+    for (tracking::ModelFrame* m : {&ondemand_.coarse, &ondemand_.refine, &ondemand_.full}) {
+        m->d_vertices.reset();
+        m->d_normals.reset();
+    }
 #endif
     gpu_resources_ready_ = false;
+}
+
+const tracking::ModelFrame& PipelineController::renderModel(const Eigen::Matrix4f& pose,
+                                                            tracking::RenderSize size, bool need_host) {
+    tracking::ModelFrame& m = size == tracking::RenderSize::Coarse   ? ondemand_.coarse
+                              : size == tracking::RenderSize::Refine ? ondemand_.refine
+                                                                     : ondemand_.full;
+    const sensor::CameraIntrinsics k =
+        sensor::scaleIntrinsics(intrinsics_, sensor::FRAME_W, sensor::FRAME_H, m.width, m.height);
+    m.pose = pose;
+    m.source_frame_id = 0;
+    const size_t n = static_cast<size_t>(m.width) * m.height;
+#ifdef CUDA_ENABLED
+    if (use_gpu_.load()) {
+        tsdf_->raycastGPU(pose, k.fx, k.fy, k.cx, k.cy, m.width, m.height, m.d_vertices.get(),
+                          m.d_normals.get(), nullptr);
+        if (need_host) {
+            static_assert(sizeof(Eigen::Vector3f) == sizeof(float3), "host/device vertex layouts differ");
+            (void)cudaMemcpy(m.vertices.data(), m.d_vertices.get(), n * sizeof(float3), cudaMemcpyDeviceToHost);
+            (void)cudaMemcpy(m.normals.data(), m.d_normals.get(), n * sizeof(float3), cudaMemcpyDeviceToHost);
+        }
+        return m;
+    }
+#elif defined(HIP_ENABLED)
+    if (use_gpu_.load()) {
+        tsdf_->raycastGPU(pose, k.fx, k.fy, k.cx, k.cy, m.width, m.height, m.d_vertices.get(),
+                          m.d_normals.get(), nullptr);
+        if (need_host) {
+            static_assert(sizeof(Eigen::Vector3f) == sizeof(float3), "host/device vertex layouts differ");
+            (void)hipMemcpy(m.vertices.data(), m.d_vertices.get(), n * sizeof(float3), hipMemcpyDeviceToHost);
+            (void)hipMemcpy(m.normals.data(), m.d_normals.get(), n * sizeof(float3), hipMemcpyDeviceToHost);
+        }
+        return m;
+    }
+#endif
+    (void)need_host;
+    (void)n;
+    tsdf_->raycast(pose, k.fx, k.fy, k.cx, k.cy, m.width, m.height, m.vertices.data(), m.normals.data(),
+                   m.colors.data());
+    return m;
 }
 
 void PipelineController::onWorkerFault(const char* worker, const char* what) noexcept {
@@ -1037,6 +1089,7 @@ void PipelineController::trackingLoopBody() {
     if (first_frame_) {
         first_frame_ = false;
         frame->pose = Eigen::Matrix4f::Identity();
+        reacquired_frame_id_ = 0;
         // The first camera is the world, so its measured up is world up.
         have_up_ = have_reading;
         if (have_reading) {
@@ -1131,31 +1184,34 @@ void PipelineController::trackingLoopBody() {
     // span the whole track() (and, in relocalization, the recovery-params swap
     // around it). They do not lock, so a caller can hold the lock across
     // several calls without a self-deadlock.
-    auto solve_cpu = [&](const sensor::FramePyramid& pyramid,
+    auto solve_cpu = [&](const sensor::FramePyramid& pyramid, const tracking::ModelFrame& model,
                          const Eigen::Matrix4f& estimate) -> tracking::ICPResult {
-        return tracker_->track(pyramid, *model_ref, estimate, model_ref->pose);
+        return tracker_->track(pyramid, model, estimate, model.pose);
     };
-    auto solve_gpu = [&](const Eigen::Matrix4f& estimate) -> tracking::ICPResult {
+    auto solve_gpu = [&](const tracking::ModelFrame& model,
+                         const Eigen::Matrix4f& estimate) -> tracking::ICPResult {
         tracking::ICPResult res;
 #ifdef CUDA_ENABLED
         res = tracker_->trackGPU(
             preprocessor_->getGPUDepthMeters(),
             preprocessor_->getGPURgb(),
             frame->width, frame->height,
-            *model_ref, estimate, model_ref->pose
+            model, estimate, model.pose
         );
 #elif defined(HIP_ENABLED)
         res = tracker_->trackGPU(
             preprocessor_->getGPUDepthMeters(),
             preprocessor_->getGPURgb(),
             frame->width, frame->height,
-            *model_ref, estimate, model_ref->pose
+            model, estimate, model.pose
         );
 #else
+        (void)model;
         (void)estimate;
 #endif
         return res;
     };
+    uint64_t model_frame_used = model_ref->source_frame_id;
 
     // gpu_mutex_ first, tracker_mutex_ second — the order every other GPU path
     // uses; the CPU branches take the tracker lock alone.
@@ -1210,7 +1266,7 @@ void PipelineController::trackingLoopBody() {
           sensor::buildFramePyramid(*frame, pyramid);
       }
       auto solve = [&](const Eigen::Matrix4f& h) {
-          return use_gpu_.load() ? solve_gpu(h) : solve_cpu(pyramid, h);
+          return use_gpu_.load() ? solve_gpu(*model_ref, h) : solve_cpu(pyramid, *model_ref, h);
       };
 
       tracker_->setParams(coarse);
@@ -1238,17 +1294,31 @@ void PipelineController::trackingLoopBody() {
       const auto failed = [&](const tracking::ICPResult& r) {
         return tracking::classifyTracking(r, prev_pose) == tracking::TrackQuality::Failed;
       };
+      // After a re-acquisition, until the integration thread's model image is
+      // newer than the re-acquired frame, track against a fresh render at the
+      // last tracked pose: the triple-buffer image was raycast before the loss.
+      const tracking::ModelFrame* track_model = model_ref.get();
+      std::shared_lock<std::shared_mutex> ondemand_tsdf_lk;
+      if (reacquired_frame_id_ != 0) {
+          if (model_ref->source_frame_id > reacquired_frame_id_) {
+              reacquired_frame_id_ = 0;
+          } else {
+              ondemand_tsdf_lk = std::shared_lock<std::shared_mutex>(tsdf_mutex_);
+              track_model = &renderModel(prev_pose, tracking::RenderSize::Full, false);
+              model_frame_used = 0;
+          }
+      }
       if (use_gpu_.load()) {
-        icp_result = solve_gpu(predicted_pose);
+        icp_result = solve_gpu(*track_model, predicted_pose);
         if (failed(icp_result)) {
-          icp_result = solve_gpu(prev_pose);
+          icp_result = solve_gpu(*track_model, prev_pose);
         }
       } else {
         sensor::FramePyramid pyramid;
         sensor::buildFramePyramid(*frame, pyramid);
-        icp_result = solve_cpu(pyramid, predicted_pose);
+        icp_result = solve_cpu(pyramid, *track_model, predicted_pose);
         if (failed(icp_result)) {
-          icp_result = solve_cpu(pyramid, prev_pose);
+          icp_result = solve_cpu(pyramid, *track_model, prev_pose);
         }
       }
     }
@@ -1311,7 +1381,7 @@ void PipelineController::trackingLoopBody() {
         row.rms_m = tracking::icpRmsMeters(icp_result);
         row.final_step = icp_result.final_step;
         row.converged = icp_result.converged;
-        row.model_frame_id = model_ref->source_frame_id;
+        row.model_frame_id = model_frame_used;   // 0 = an on-demand render
         row.outside_volume = outsideVolumeFraction(*frame, icp_result.pose, hp.tsdf);
         row.degenerate_dofs = degenerate_dofs;
         row.tilt_err_deg = tilt_err;
@@ -1375,6 +1445,7 @@ void PipelineController::trackingLoopBody() {
             if (is_lost) {
                 reacquire_probation_ = kReacquireProbation;
                 pre_reacquire_pose_ = prev_pose;
+                reacquired_frame_id_ = frame->frame_id;
             }
             bool integrate = quality == tracking::TrackQuality::Good;
             if (reacquire_probation_ > 0) {

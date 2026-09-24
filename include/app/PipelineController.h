@@ -17,6 +17,7 @@
 #include "sensor/FrameData.h"
 #include "sensor/Preprocessor.h"
 #include "tracking/Gravity.h"
+#include "tracking/Relocalizer.h"
 #include "tracking/ICPTracker.h"
 #include "tsdf/TSDFVolume.h"
 #include "meshing/MarchingCubes.h"
@@ -217,6 +218,23 @@ private:
     // the accelerometer's rest magnitude, from the first frame when it carries
     // a reading (else the first Good frame that does). AZU_GRAVITY_TILT_DEG
     // sets the relocalization gate; 0 turns it off.
+    // On-demand model images (relocalization rework), tracking thread only.
+    // Relocalization raycasts the model at each candidate pose; after a
+    // re-acquisition, tracking runs against a fresh full-size render until the
+    // integration thread's model image comes from a frame newer than the
+    // re-acquired one (probation frames are not integrated, so the triple-buffer
+    // image is the one raycast before the loss and may not overlap at all).
+    struct OnDemandModels {
+        tracking::ModelFrame coarse{160, 120};
+        tracking::ModelFrame refine{320, 240};
+        tracking::ModelFrame full{640, 480};
+    };
+    OnDemandModels             ondemand_;
+    uint64_t                   reacquired_frame_id_ = 0;
+    // Raycast into the on-demand buffer of that size. The caller holds
+    // tsdf_mutex_ shared (and gpu_mutex_ on the GPU path).
+    const tracking::ModelFrame& renderModel(const Eigen::Matrix4f& pose, tracking::RenderSize size,
+                                            bool need_host);
     bool                       have_up_ = false;
     Eigen::Vector3f            up_world_{0.0f, -1.0f, 0.0f};
     float                      up_ref_norm_ = 0.0f;
