@@ -408,6 +408,14 @@ target_link_libraries(depth_consistency_contract PRIVATE azu_test_core)
 add_test(NAME depth_consistency_contract COMMAND depth_consistency_contract)
 set_tests_properties(depth_consistency_contract PROPERTIES LABELS cpu TIMEOUT 120)
 
+# Relocalization rework: random-fern keyframe database (Glocker et al.).
+add_executable(fern_database_contract fern_database_contract.cpp)
+target_compile_definitions(fern_database_contract PRIVATE ${AZU_TEST_DEFS})
+target_include_directories(fern_database_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fern_database_contract PRIVATE azu_test_core)
+add_test(NAME fern_database_contract COMMAND fern_database_contract)
+set_tests_properties(fern_database_contract PROPERTIES LABELS cpu TIMEOUT 120)
+
 # big-fix-two T3.13: accelerometer mapping and the tilt gate.
 add_executable(gravity_contract gravity_contract.cpp)
 target_compile_definitions(gravity_contract PRIVATE ${AZU_TEST_DEFS})
@@ -1643,7 +1651,8 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     foreach(_azu_scene_test icp_refpose_contract pipeline_trajectory_contract
                             pipeline_relocalization_contract pipeline_spin_contract
                             rolling_shutter_contract pipeline_gravity_contract
-                            icp_lowres_model_contract depth_consistency_contract)
+                            icp_lowres_model_contract depth_consistency_contract
+                            fern_database_contract)
         target_compile_options(${_azu_scene_test} PRIVATE -O2)
     endforeach()
 endif()
