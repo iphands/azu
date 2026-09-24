@@ -82,6 +82,28 @@ int main() {
           "a non-finite error is Failed");
     CHECK(TrackingPolicy{}.failures_before_lost == 3, "three consecutive failures enter Lost");
 
+    // classifyFit: the same fit grades without the motion gate (relocalization).
+    const Eigen::Matrix4f far = prev * move(0.45f, 0.7f);
+    CHECK(classifyFit(fit(far, 150000, 200000, 4e-6f)) == TrackQuality::Good,
+          "classifyFit: a tight fit 45 cm / 40 deg away is still Good");
+    CHECK(classifyTracking(fit(far, 150000, 200000, 4e-6f), prev) == TrackQuality::Failed,
+          "classifyTracking: the same result fails the motion gate");
+    CHECK(classifyFit(fit(far, 30000, 200000, 4e-6f)) == TrackQuality::Poor,
+          "classifyFit: a weak fit is Poor");
+    CHECK(classifyFit(fit(far, 99, 200000, 4e-6f)) == TrackQuality::Failed,
+          "classifyFit: fewer than 100 inliers is Failed");
+    CHECK(withinFrameMotion(near, prev) && !withinFrameMotion(far, prev),
+          "withinFrameMotion: 2 cm / 1.7 deg inside, 45 cm / 40 deg outside");
+
+    // weakestDirectionRatio: a fully constrained system vs one with a free direction.
+    Eigen::Matrix<float, 6, 6> info = Eigen::Matrix<float, 6, 6>::Identity() * 100.0f;
+    info(5, 5) = 1.0f;
+    CHECK(std::fabs(weakestDirectionRatio(info) - 0.01f) < 1e-5f, "weakestDirectionRatio: 1/100");
+    info(5, 5) = 0.0f;
+    CHECK(weakestDirectionRatio(info) == 0.0f, "weakestDirectionRatio: an unobserved direction is 0");
+    CHECK(weakestDirectionRatio(Eigen::Matrix<float, 6, 6>::Zero()) == 0.0f,
+          "weakestDirectionRatio: an empty system is 0");
+
     if (g_failures == 0) {
         std::printf("tracking_policy_contract: PASS (%d checks)\n", g_checks);
         return 0;

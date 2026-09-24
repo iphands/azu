@@ -61,16 +61,13 @@ inline float icpFitRatio(const ICPResult& r) {
                : 0.0f;
 }
 
-inline TrackQuality classifyTracking(const ICPResult& r, const Eigen::Matrix4f& prev_pose,
-                                     const TrackingPolicy& p = TrackingPolicy{}) {
+// The fit alone: Failed when the solve is unusable, Good when it is tight and
+// well supported, Poor otherwise. No motion gate: a relocalization result may
+// legitimately land far from the last tracked pose (spin360-slow after its loop
+// closure: Good fits 0.44-0.47 m from the drifted pose, all refused by the
+// per-frame gate), so it is verified another way (tracking/Relocalizer.h).
+inline TrackQuality classifyFit(const ICPResult& r, const TrackingPolicy& p = TrackingPolicy{}) {
     if (!r.pose.allFinite() || !std::isfinite(r.error) || r.inliers < p.min_inliers) {
-        return TrackQuality::Failed;
-    }
-    const Eigen::Matrix4f d = prev_pose.inverse() * r.pose;
-    const float trans = d.block<3,1>(0,3).norm();
-    const float c = std::max(-1.0f, std::min(1.0f, (d.block<3,3>(0,0).trace() - 1.0f) * 0.5f));
-    const float angle = std::acos(c);
-    if (!(trans <= p.max_frame_translation) || !(angle <= p.max_frame_rotation)) {
         return TrackQuality::Failed;
     }
     if (r.inliers >= p.min_good_inliers && icpFitRatio(r) >= p.min_fit_ratio &&
@@ -78,6 +75,38 @@ inline TrackQuality classifyTracking(const ICPResult& r, const Eigen::Matrix4f& 
         return TrackQuality::Good;
     }
     return TrackQuality::Poor;
+}
+
+// The per-frame motion gate: at most max_frame_translation / max_frame_rotation
+// from `prev_pose`.
+inline bool withinFrameMotion(const Eigen::Matrix4f& pose, const Eigen::Matrix4f& prev_pose,
+                              const TrackingPolicy& p = TrackingPolicy{}) {
+    const Eigen::Matrix4f d = prev_pose.inverse() * pose;
+    const float trans = d.block<3,1>(0,3).norm();
+    const float c = std::max(-1.0f, std::min(1.0f, (d.block<3,3>(0,0).trace() - 1.0f) * 0.5f));
+    const float angle = std::acos(c);
+    return trans <= p.max_frame_translation && angle <= p.max_frame_rotation;
+}
+
+// Frame-to-frame tracking: the fit, and the per-frame motion gate.
+inline TrackQuality classifyTracking(const ICPResult& r, const Eigen::Matrix4f& prev_pose,
+                                     const TrackingPolicy& p = TrackingPolicy{}) {
+    const TrackQuality fit = classifyFit(r, p);
+    if (fit == TrackQuality::Failed) return fit;
+    if (!withinFrameMotion(r.pose, prev_pose, p)) return TrackQuality::Failed;
+    return fit;
+}
+
+// Smallest over largest eigenvalue of the ICP information matrix: how well the
+// weakest direction is constrained (0 when a direction is not observed at all,
+// e.g. sliding along a single wall). 0 for an empty or non-finite matrix.
+inline float weakestDirectionRatio(const Eigen::Matrix<float, 6, 6>& information) {
+    if (!information.allFinite()) return 0.0f;
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<float, 6, 6>> es(information);
+    if (es.info() != Eigen::Success) return 0.0f;
+    const float max_ev = es.eigenvalues().maxCoeff();
+    if (!(max_ev > 0.0f)) return 0.0f;
+    return std::max(0.0f, es.eigenvalues().minCoeff()) / max_ev;
 }
 
 // Degeneracy-aware motion (big-fix-two T3.7). Facing a single wall, ICP cannot
