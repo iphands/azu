@@ -88,6 +88,7 @@ bool PipelineController::startInternal(bool engage_sensor) {
     success_log_counter_  = 0;
     hip_ui_skip_          = 0;
     consecutive_failures_ = 0;
+    reacquire_probation_  = 0;
     {
         // The motion model belongs to ONE session. last_pose_ is the previous
         // frame's pose, and the pose-to-pose predictor forms
@@ -661,6 +662,7 @@ void PipelineController::reset() {
     success_log_counter_  = 0;
     hip_ui_skip_          = 0;
     consecutive_failures_ = 0;
+    reacquire_probation_  = 0;
     // frame_count_ and metrics_ are a pair guarded by metrics_mutex_ everywhere
     // else (onRawFrame writes both under it), so the reset that zeroes them takes
     // the same lock; control_mutex_ does not, because it serialises lifecycle and
@@ -1328,6 +1330,21 @@ void PipelineController::trackingLoopBody() {
 
         if (quality != tracking::TrackQuality::Failed) {
             consecutive_failures_ = 0;
+            // Probation: a re-acquisition can get the orientation right and the
+            // position wrong (cap_001: the next frame's ICP moved it 26 cm, over
+            // the motion gate, after the re-acquired frame had been integrated as
+            // a ghost). Nothing integrates until kReacquireProbation consecutive
+            // Good frames, the re-acquired one included, have tracked from it; a
+            // failure on the way goes straight back to relocalization.
+            if (is_lost) {
+                reacquire_probation_ = kReacquireProbation;
+                pre_reacquire_pose_ = prev_pose;
+            }
+            bool integrate = quality == tracking::TrackQuality::Good;
+            if (reacquire_probation_ > 0) {
+                integrate = false;
+                if (quality == tracking::TrackQuality::Good) --reacquire_probation_;
+            }
             {
                 std::lock_guard<std::mutex> lk(pose_mutex_);
                 current_pose_ = icp_result.pose;
@@ -1356,11 +1373,11 @@ void PipelineController::trackingLoopBody() {
             frame->pose = icp_result.pose;
             state_.store(PipelineState::Running);
 
-            if (quality == tracking::TrackQuality::Good) {
+            if (integrate) {
                 // Enqueue for integration (retain-latest, sole owner moves in).
                 enqueueForIntegration(std::move(frame));
             } else {
-                // Poor fit: follow the camera, keep the model clean.
+                // Poor fit or on probation: follow the camera, keep the model clean.
                 frame.reset();
                 frameDone();
             }
@@ -1369,6 +1386,15 @@ void PipelineController::trackingLoopBody() {
             // wait; only a run of failures enters relocalization.
             ++consecutive_failures_;
             ++frames_since_tracked_;
+            if (!is_lost && reacquire_probation_ > 0) {
+                // The re-acquisition did not hold: back to relocalizing from
+                // the pose before it, as if it had never happened.
+                reacquire_probation_ = 0;
+                consecutive_failures_ = tracking::TrackingPolicy{}.failures_before_lost;
+                std::lock_guard<std::mutex> lk(pose_mutex_);
+                current_pose_ = pre_reacquire_pose_;
+                last_pose_ = pre_reacquire_pose_;
+            }
             if (!is_lost && consecutive_failures_ >= tracking::TrackingPolicy{}.failures_before_lost) {
                 KFLOG_WARN("Pipeline", "Tracking lost! Suspension of TSDF integration. Entering relocalization mode...");
                 if (preprocessor_) {

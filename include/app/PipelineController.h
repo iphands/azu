@@ -294,6 +294,11 @@ private:
     mutable RateWindow rate_;   // guarded by metrics_mutex_
     int                                   frame_count_    = 0;
     int                                   consecutive_failures_ = 0;  // tracking thread only
+    // Re-acquisition probation (tracking thread only): Good frames still needed
+    // before integration resumes, and the pose to fall back to if it fails.
+    static constexpr int                  kReacquireProbation = 3;
+    int                                   reacquire_probation_ = 0;
+    Eigen::Matrix4f                       pre_reacquire_pose_{Eigen::Matrix4f::Identity()};
     bool                                  first_frame_    = true;
 
     // Per-instance log throttle counters — replaces static locals in worker threads
