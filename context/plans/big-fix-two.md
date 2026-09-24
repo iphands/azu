@@ -223,8 +223,7 @@ Replayed with `azu_replay` (CUDA, Room preset).
   now the default (`--preset none` gives the old behaviour).
 
 Suggested order for the next session:
-1. T3.13, gravity check first: accelerometer in RawFrame, then a relocalization
-   and Good-grade tilt gate.
+1. ~~T3.13 gravity check~~ first slice done (2026-09-23, see T3.13).
 2. T3.14, unwarp on by default for Kinect input.
 3. T2.15.
 4. T4.5.
@@ -1042,7 +1041,21 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
   - Acceptance: flat-wall RMS planarity at 2.5 m improves by ≥ 30%.
   - Effort: M. Depends on: T3.11.
 
-- [ ] **T3.13. IMU gravity alignment and prior**
+- [~] **T3.13. IMU gravity alignment and prior** — first slice done 2026-09-23. Done:
+  - accelerometer on every frame: `RawFrame::accel`; KinectSensor polls it live at up to 100 Hz and averages per frame; libfakenect replays 'a' records; azu_replay feeds its samples;
+  - `tracking/Gravity.h`: axis map, tilt error, verdicts;
+  - relocalization refuses poses > 15 deg off gravity (`AZU_GRAVITY_TILT_DEG`);
+  - a tracked Good frame > 15 deg off is graded Poor (not integrated);
+  - `tilt_err_deg` trace column;
+  - two fixes found on the way: the constant-velocity prediction replayed the relocalization jump, and re-acquisitions now serve a 3-Good-frame probation before integrating (from T4.5).
+
+  Measured on cap_001 (CUDA, 4 runs each, unwarp 33 ms):
+  - HEAD-like: 393-672 Good frames, 91-252 deg of yaw; 2 of 4 runs collapse at ~100 deg.
+  - Now: 496-675 Good, 169-250 deg; every run recovers; re-acquisitions within 8.1 deg of gravity.
+  - Correct poses: tilt error p50 2.3, p90 4.8, p99 6.9 deg.
+  - spin360-slow unchanged.
+
+  Not done: the soft roll/pitch residual in ICP, the gravity-aligned world and floor origin, the 15 deg tilted-replay acceptance.
   - Sources: TRACK-15, SENSOR-16 (accelerometer part).
   - Files: `KinectSensor.cpp` (the capture thread polls `freenect_update_tilt_state` and `freenect_get_mks_accel` at 10–20 Hz; `libfreenect.h:495`, `:561`), the tracking prior.
   - Notes:
@@ -1114,7 +1127,8 @@ Format: **ID. Title**, then what/why, sources, files, implementation notes, acce
   - Acceptance: a synthetic 12 m corridor walk keeps RSS/VRAM bounded (< 1.5× that of a 6 m room), and the final mesh is complete.
   - Effort: M. Depends on: T4.2 or T4.3.
 
-- [ ] **T4.5. Keyframe database and fern relocaliser**
+- [ ] **T4.5. Keyframe database and fern relocaliser** (probation after a re-acquisition landed with T3.13)
+  - Reach today: the +-10 deg hypothesis grid around the last good pose. At ~15 deg on the synthetic room it re-acquired with the orientation right and the position 21.6 cm off, and that wrong basin passed probation (pipeline_gravity_contract notes).
   - Sources: TRACK-09 (steps 2, 3), SOTA-11.
   - Notes:
     - 80×60 normalised depth (and luma).

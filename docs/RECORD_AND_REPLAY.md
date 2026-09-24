@@ -70,7 +70,8 @@ so no frame is dropped and runs compare. CUDA runs are not bit-repeatable: the
 GPU ICP sums floats in a varying order, and near a tracking loss runs diverge.
 On cap_001, 4 identical runs tracked 89-359 deg of yaw after the same first loss.
 Compare several runs, or only up to the first loss (big-fix-two T2.15).
-Outputs per run: `summary.json`, `frames.csv`
+The trace's `tilt_err_deg` is the pipeline's own pose-vs-accelerometer angle
+(-1 when there is no reading). Outputs per run: `summary.json`, `frames.csv`
 (pose, accelerometer gravity, cumulative yaw, tilt error), `trace.csv` (per-frame
 ICP counters, grades, timings), `mesh.ply`. The summary reports frames by grade,
 lost frames, yaw tracked about gravity, tilt vs the accelerometer, a loop check
@@ -94,6 +95,7 @@ hold a turn), `--volume front|centred --res N --voxel M`,
 | `AZU_MOTION_MODEL=velocity` | keep velocity through failed frames |
 | `AZU_DEGENERACY_REL=<ratio>` | unobservable-motion threshold (default 5e-3, 0 = off) |
 | `AZU_RS_READOUT_MS=<ms>` | rolling-shutter unwarp of each depth frame with the predicted motion (try 30; off by default) |
+| `AZU_GRAVITY_TILT_DEG=<deg>` | gravity gate: relocalization and integration refuse poses this far off the accelerometer (default 15, 0 = off) |
 | `AZU_CUDA_DEVICE=<n>` | pick the GPU |
 
 ## 5. Synthetic recordings
