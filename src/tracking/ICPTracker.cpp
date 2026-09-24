@@ -219,7 +219,13 @@ bool ICPTracker::buildLinearSystem(const sensor::FrameData& live,
 
     std::vector<LocalAcc> local(num_threads);
 
-    #pragma omp parallel for schedule(dynamic, 32) num_threads(num_threads)
+    // schedule(static): each thread always sums the same rows, and the partial
+    // sums below combine in thread order, so a solve is bit-reproducible for a
+    // given thread count. schedule(dynamic, 32) handed rows out first-come, and
+    // the float sums differed run to run by rounding: enough, on a marginal
+    // frame, to flip Good/Poor and lose pipeline_spin_room_preset at 121-123
+    // deg in some Release gate runs and not others.
+    #pragma omp parallel for schedule(static) num_threads(num_threads)
     for (int y = 1; y < H - 1; ++y) {
         int tid = 0;
 #ifdef _OPENMP
