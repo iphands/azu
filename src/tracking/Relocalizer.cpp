@@ -13,6 +13,7 @@ const char* relocRejectName(RelocReject r) {
         case RelocReject::None:        return "none";
         case RelocReject::NoDepth:     return "no_depth";
         case RelocReject::Unsteady:    return "unsteady";
+        case RelocReject::Unvisited:   return "unvisited";
         case RelocReject::EmptyModel:  return "empty_model";
         case RelocReject::NoCandidate: return "no_candidate";
         case RelocReject::Fit:         return "fit";
@@ -54,6 +55,18 @@ bool Relocalizer::blacklisted(const Eigen::Matrix4f& pose) const {
     });
 }
 
+bool Relocalizer::nearVisited(const Eigen::Matrix4f& pose, const RelocRequest& req) const {
+    if (p_.max_visited_distance_m <= 0.0f || !req.visited || req.visited->empty()) return true;
+    const Eigen::Vector3f c = pose.block<3,1>(0,3);
+    const Eigen::Vector3f f = pose.block<3,1>(0,2);
+    const float r2 = p_.max_visited_distance_m * p_.max_visited_distance_m;
+    const float min_cos = std::cos(p_.max_visited_angle_deg * 3.14159265f / 180.0f);
+    for (const Eigen::Matrix4f& v : *req.visited) {
+        if ((v.block<3,1>(0,3) - c).squaredNorm() <= r2 && v.block<3,1>(0,2).dot(f) >= min_cos) return true;
+    }
+    return false;
+}
+
 bool Relocalizer::isLocal(const Eigen::Matrix4f& pose, const Eigen::Matrix4f& last_good) const {
     const PoseGap g = poseGap(pose, last_good);
     return g.trans_m <= p_.local_trans_m && g.rot_deg <= p_.local_rot_deg;
@@ -65,6 +78,7 @@ RelocOutcome Relocalizer::run(const RelocRequest& req, const RelocBackend& be) {
     best_basin_inliers_ = -1;
     best_basin_reject_ = RelocReject::None;
     have_best_refined_ = false;
+    run_basins_.clear();
 
     for (Basin& b : blacklist_) --b.runs_left;
     blacklist_.erase(std::remove_if(blacklist_.begin(), blacklist_.end(),
@@ -151,6 +165,7 @@ RelocOutcome Relocalizer::run(const RelocRequest& req, const RelocBackend& be) {
         carry_ = best_refined_.pose;
         have_carry_ = true;
         out.result = best_refined_;
+        out.eig_ratio = weakestDirectionRatio(best_refined_.information);
     }
     if (verified.empty()) {
         out.reject = best_basin_inliers_ >= 0 ? best_basin_reject_ : RelocReject::NoCandidate;
@@ -164,18 +179,34 @@ bool Relocalizer::decide(std::vector<Verified>& all, RelocOutcome& out) const {
     std::stable_sort(all.begin(), all.end(), [](const Verified& a, const Verified& b) {
         return a.c.consistentFraction() > b.c.consistentFraction();
     });
-    for (size_t i = 1; i < all.size(); ++i) {
-        const PoseGap gap = poseGap(all[0].r.pose, all[i].r.pose);
-        const bool distant = gap.trans_m >= p_.ambiguous_trans_m || gap.rot_deg >= p_.ambiguous_rot_deg;
-        if (distant && all[0].c.consistentFraction() - all[i].c.consistentFraction() <= p_.ambiguous_gap) {
-            out.reject = RelocReject::Ambiguous;
-            out.result = all[0].r;
-            out.consistency = all[0].c;
-            return false;
-        }
+    auto distant = [&](const Eigen::Matrix4f& a, const Eigen::Matrix4f& b) {
+        const PoseGap gap = poseGap(a, b);
+        return gap.trans_m >= p_.ambiguous_trans_m || gap.rot_deg >= p_.ambiguous_rot_deg;
+    };
+    bool ambiguous = false;
+    for (size_t i = 1; i < all.size() && !ambiguous; ++i) {
+        ambiguous = distant(all[0].r.pose, all[i].r.pose) &&
+                    all[0].c.consistentFraction() - all[i].c.consistentFraction() <= p_.ambiguous_gap;
+    }
+    // A distant basin that fitted nearly as well in the coarse stage, refined
+    // or not: on cap_001 bare ceiling corners and closet doors verified at
+    // 0.76-0.96 consistency against other corners and walls while such twins
+    // sat unrefined further down the coarse list.
+    for (const CoarseBasin& b : run_basins_) {
+        if (ambiguous || !p_.coarse_ambiguity) break;
+        ambiguous = distant(all[0].r.pose, b.pose) && b.fit >= all[0].coarse_fit - p_.coarse_ambiguous_fit_gap &&
+                    b.inliers >= p_.coarse_ambiguous_inlier_share * all[0].coarse_inliers;
+    }
+    if (ambiguous) {
+        out.reject = RelocReject::Ambiguous;
+        out.result = all[0].r;
+        out.consistency = all[0].c;
+        out.eig_ratio = weakestDirectionRatio(all[0].r.information);
+        return false;
     }
     out.accepted = true;
     out.reject = RelocReject::None;
+    out.eig_ratio = weakestDirectionRatio(all[0].r.information);
     out.result = all[0].r;
     out.consistency = all[0].c;
     out.source = all[0].source;
@@ -190,7 +221,7 @@ std::vector<Relocalizer::Verified> Relocalizer::evaluate(const std::vector<Hypot
     const GravityContext& g = req.gravity;
 
     ICPParams coarse = req.icp;
-    coarse.dist_threshold *= p_.coarse_dist_scale;
+    coarse.dist_threshold = std::max(coarse.dist_threshold * p_.coarse_dist_scale, p_.coarse_min_dist_m);
     coarse.angle_threshold = p_.coarse_angle_deg;
     constexpr int kLevels = sensor::FramePyramid::LEVELS;
     for (int l = 0; l < kLevels - 1; ++l) coarse.max_iterations[l] = 0;
@@ -223,6 +254,7 @@ std::vector<Relocalizer::Verified> Relocalizer::evaluate(const std::vector<Hypot
         });
         if (!dup) basins.push_back(s);
     }
+    for (const Scored& b : basins) run_basins_.push_back({b.r.pose, icpFitRatio(b.r), b.r.inliers});
 
     // Refine the best few, then verify. The reject reason reported is the one
     // of the best-supported basin seen in this run.
@@ -245,6 +277,8 @@ std::vector<Relocalizer::Verified> Relocalizer::evaluate(const std::vector<Hypot
             why = RelocReject::Constraint;
         } else if (blacklisted(rr.pose)) {
             why = RelocReject::Blacklisted;
+        } else if (!nearVisited(rr.pose, req)) {
+            why = RelocReject::Unvisited;
         } else {
             const ModelFrame& mv = be.render(rr.pose, RenderSize::Refine, true);
             c = depthConsistency(mv.vertices.data(), mv.normals.data(), mv.width, mv.height, rr.pose,
@@ -253,7 +287,7 @@ std::vector<Relocalizer::Verified> Relocalizer::evaluate(const std::vector<Hypot
             if (!c.passes(p_.consistency)) why = RelocReject::Consistency;
         }
         if (why == RelocReject::None) {
-            verified.push_back({rr, c, basins[i].source});
+            verified.push_back({rr, c, basins[i].source, icpFitRatio(basins[i].r), basins[i].r.inliers});
         } else if (rr.inliers > best_basin_inliers_) {
             best_basin_inliers_ = rr.inliers;
             best_basin_reject_ = why;

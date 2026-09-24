@@ -15,8 +15,8 @@
 // and H checks that the bare-corner case is refused as ambiguous.
 //
 //   A  in-place kidnaps of 45, 90 and 180 deg, and 180 deg about the body pivot
-//      (0.12 m behind the camera), found by the sweep within ceil(34/6) calls,
-//      within 1 cm / 0.5 deg
+//      (0.12 m behind the camera, which moves it 0.24 m), found by the sweep
+//      within ceil(34/6) calls, within 1 cm / 0.5 deg
 //   B  0.2 m + 30 deg away, with a keyframe near the truth: found on the first
 //      call, from the keyframe
 //   C  no gravity reading at all, a level 90 deg kidnap: still found (old grid +
@@ -27,6 +27,10 @@
 //   F  a frame without depth costs no solve
 //   G  a basin whose probation failed is refused
 //   H  a 180 deg kidnap onto a bare corner of the square room: ambiguous, refused
+//   I  the visited-pose check (max_visited_*): A's 90 deg kidnap is refused when
+//      the only pose tracked before is the pre-kidnap one (same place, 90 deg
+//      off) or one looking the same way 0.3 m away; found when one 0.1 m / 20
+//      deg from the truth is on the list
 #include "support/RoomModel.h"
 #include "tracking/Relocalizer.h"
 #include "sensor/FrameData.h"
@@ -110,6 +114,7 @@ struct Attempt {
     RelocOutcome last;
     azu_test::PoseError err{-1.0f, -1.0f};
     bool saw_blacklisted = false;
+    bool saw_unvisited = false;
 };
 
 const Eigen::Matrix4f kLastGood = azu_test::RoomModel::yawPitch(15.0f * kDeg, 0.0f);
@@ -130,7 +135,8 @@ Eigen::Matrix4f turned(const Eigen::Matrix4f& from, float yaw_deg, float pitch_d
 Attempt relocalize(const azu_test::RoomModel& room, const Eigen::Matrix4f& truth, int max_calls,
                    const GravityContext& g, std::vector<Eigen::Matrix4f> keyframes = {},
                    Relocalizer* reloc_in = nullptr, const std::vector<float>* depth_in = nullptr,
-                   const Eigen::Matrix4f& last_good = kLastGood) {
+                   const Eigen::Matrix4f& last_good = kLastGood,
+                   const std::vector<Eigen::Matrix4f>* visited = nullptr) {
     const std::vector<float> depth = depth_in ? *depth_in : room.depthAt(truth);
     CpuBackend be(room, depth);
     Relocalizer local(cpuParams());
@@ -141,6 +147,7 @@ Attempt relocalize(const azu_test::RoomModel& room, const Eigen::Matrix4f& truth
     req.model_pose = last_good;
     req.keyframes = keyframes;
     req.gravity = g;
+    req.visited = visited;
     req.live_depth = depth.data();
     req.live_w = room.intrinsics().width;
     req.live_h = room.intrinsics().height;
@@ -148,6 +155,7 @@ Attempt relocalize(const azu_test::RoomModel& room, const Eigen::Matrix4f& truth
     for (a.calls = 1; a.calls <= max_calls; ++a.calls) {
         a.last = reloc.run(req, be.hooks());
         if (a.last.reject == RelocReject::Blacklisted) a.saw_blacklisted = true;
+        if (a.last.reject == RelocReject::Unvisited) a.saw_unvisited = true;
         if (a.last.accepted) {
             a.accepted = true;
             a.err = azu_test::poseError(a.last.result.pose, truth);
@@ -158,10 +166,11 @@ Attempt relocalize(const azu_test::RoomModel& room, const Eigen::Matrix4f& truth
 }
 
 void report(const char* what, const Attempt& a) {
-    std::printf("  %-34s %s after %d call(s), source %s, reject %s, solves %d+%d, consistent %.3f, err %.2f mm / %.3f deg\n",
+    std::printf("  %-34s %s after %d call(s), source %s, reject %s, solves %d+%d, consistent %.3f, eig %.1e, err %.2f mm / %.3f deg\n",
                 what, a.accepted ? "ACCEPTED" : "not accepted", std::min(a.calls, 99),
                 hypothesisSourceName(a.last.source), relocRejectName(a.last.reject), a.last.coarse_solves,
-                a.last.refines, a.last.consistency.consistentFraction(), a.err.trans_m * 1e3, a.err.rot_deg);
+                a.last.refines, a.last.consistency.consistentFraction(), a.last.eig_ratio, a.err.trans_m * 1e3,
+                a.err.rot_deg);
 }
 
 }  // namespace
@@ -199,11 +208,11 @@ int main() {
         CHECK(a.err.trans_m < 0.01f && a.err.rot_deg < 0.5f, "B: within 1 cm / 0.5 deg");
     }
 
-    // C: level views are only constrained facing a corner, so start 30 deg to
-    // the right and turn 90 deg to the corner at 60 deg (ratio 2e-2).
+    // C: a level 90 deg kidnap onto the sphere. (A bare level corner is
+    // genuinely ambiguous in the square room, gravity or not: refused.)
     {
-        const Eigen::Matrix4f from = azu_test::RoomModel::yawPitch(-30.0f * kDeg, 0.0f);
-        const Eigen::Matrix4f truth = azu_test::RoomModel::yawPitch(60.0f * kDeg, 0.0f);
+        const Eigen::Matrix4f from = level(kSphereYaw - 90.0f);
+        const Eigen::Matrix4f truth = level(kSphereYaw);
         const Attempt a = relocalize(room, truth, (34 + 8 + 5) / 6, GravityContext{}, {}, nullptr, nullptr, from);
         report("C: 90 deg, no gravity", a);
         CHECK(a.accepted && a.err.trans_m < 0.01f && a.err.rot_deg < 0.5f, "C: found without gravity");
@@ -253,6 +262,29 @@ int main() {
         report("H: 180 deg onto a bare corner", a);
         CHECK(!a.accepted && a.last.reject == RelocReject::Ambiguous,
               "H: the square room's bare corner is ambiguous and refused");
+    }
+
+    // I
+    {
+        const Eigen::Matrix4f from = level(kSphereYaw - 90.0f);
+        const Eigen::Matrix4f truth = turned(from, 90.0f, -20.0f);
+        const std::vector<Eigen::Matrix4f> before_only = {from};
+        const Attempt a = relocalize(room, truth, sweep_calls, gravityFor(truth), {}, nullptr, nullptr, from,
+                                     &before_only);
+        report("I: visited = the pre-kidnap pose", a);
+        CHECK(!a.accepted && a.saw_unvisited, "I: refused when only a pose 90 deg off was tracked");
+
+        const std::vector<Eigen::Matrix4f> far = {truth * azu_test::makePose({0.0f, 0.0f, 0.0f}, {0.3f, 0.0f, 0.0f})};
+        const Attempt b = relocalize(room, truth, sweep_calls, gravityFor(truth), {}, nullptr, nullptr, from, &far);
+        report("I: visited = 0.3 m from the truth", b);
+        CHECK(!b.accepted && b.saw_unvisited, "I: refused when the nearest tracked pose is 0.3 m away");
+
+        const std::vector<Eigen::Matrix4f> near = {
+            from, truth * azu_test::makePose({0.0f, 20.0f * kDeg, 0.0f}, {0.1f, 0.0f, 0.0f})};
+        const Attempt c = relocalize(room, truth, sweep_calls, gravityFor(truth), {}, nullptr, nullptr, from, &near);
+        report("I: visited includes 0.1 m / 20 deg off", c);
+        CHECK(c.accepted && c.err.trans_m < 0.01f && c.err.rot_deg < 0.5f,
+              "I: found when a tracked pose is 0.1 m / 20 deg from the truth");
     }
 
     if (g_failures == 0) {

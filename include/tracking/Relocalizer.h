@@ -60,6 +60,7 @@ enum class RelocReject : uint8_t {
     None,
     NoDepth,       // too little live depth to try
     Unsteady,      // a reading exists but the hand is accelerating: gravity cannot vouch for any pose
+    Unvisited,     // farther than max_visited_distance_m from every position tracked before
     EmptyModel,    // nothing fused yet
     NoCandidate,   // no candidate fitted at all
     Fit,           // best refined fit not Good
@@ -76,6 +77,12 @@ const char* hypothesisSourceName(HypothesisSource s);
 struct RelocParams {
     // Coarse scoring (pyramid level 2 only, against a 160x120 render).
     float coarse_dist_scale     = 2.5f;
+    // The sweep steps 20 deg, so a candidate can miss by 10 deg: 0.44-0.52 m of
+    // point motion at 2.5-3 m. With the pipeline's default 0.1 m ICP distance
+    // (x2.5 = 0.25 m) a 12 deg miss gave 0 inliers; 0.5 m converged to 0.2 mm
+    // (synthetic room, 160x120 and 640x480 renders alike). The coarse solve only
+    // has to find the basin; verification rejects wrong ones.
+    float coarse_min_dist_m     = 0.5f;
     float coarse_angle_deg      = 45.0f;
     int   coarse_min_iterations = 8;
     int   coarse_max_iterations = 30;
@@ -89,11 +96,40 @@ struct RelocParams {
     SweepParams sweep;
     float keep_unsnapped_deg    = 4.0f;    // also try last_good as tracked when snapping moved it more
     // Verification.
+    // Weakest/strongest information eigenvalue of the refined solve: refuses
+    // truly degenerate views (a single bare wall reads 8e-6..4e-4). It does NOT
+    // separate right from wrong re-acquisitions on real data: on cap_001 wrong
+    // ones (closet doors, bare ceiling corners) read 1.3e-3..2.3e-3, and so did
+    // spin360-slow's correct loop-closure recovery (2.1e-3..2.5e-3). See
+    // max_visited_distance_m for what does.
     float min_eig_ratio         = 1e-3f;
+    // A re-acquired pose must be one the camera has effectively been at before:
+    // within this distance AND this angle (between the viewing directions) of
+    // some pose tracked Good earlier. A view is only matched reliably from near
+    // where that part of the room was seen. cap_001, 22 re-acquisitions over
+    // three runs, each labelled against the RGB of the most similar earlier
+    // well-tracked pose: every right one within 4-15 cm / 3-27 deg of it; every
+    // wrong one 26-142 cm away, except one chained off an earlier wrong accept.
+    // A position-only 0.3 m radius let wrong ones through: in an in-place spin
+    // every position is near some visited one. spin360-slow's loop-closure
+    // recovery lands back on its start. 0 turns the check off; so does an empty
+    // list.
+    float max_visited_distance_m = 0.2f;
+    float max_visited_angle_deg  = 45.0f;
     ConsistencyThresholds consistency;
     float ambiguous_trans_m     = 0.2f;
     float ambiguous_rot_deg     = 15.0f;
     float ambiguous_gap         = 0.05f;   // consistent fractions this close are a tie
+    // Coarse-stage ambiguity (off by default): a distant basin that fitted
+    // nearly as well in the coarse solve (fit ratio within the gap, at least the
+    // inlier share) makes the frame ambiguous even if never refined. It caught
+    // some wrong cap_001 re-acquisitions, but it also refused spin360-slow's
+    // correct loop-closure recovery on 127 frames in a row: the drifted model
+    // holds two copies of the start, 0.44 m apart. max_visited_distance_m
+    // catches those wrong ones without that cost.
+    bool  coarse_ambiguity      = false;
+    float coarse_ambiguous_fit_gap    = 0.05f;
+    float coarse_ambiguous_inlier_share = 0.5f;
     float local_trans_m         = 0.15f;   // accepted without the full-sweep ambiguity check
     float local_rot_deg         = 30.0f;
     float min_live_valid_share  = 0.10f;
@@ -115,6 +151,7 @@ struct RelocRequest {
     Eigen::Matrix4f last_good  = Eigen::Matrix4f::Identity();
     Eigen::Matrix4f model_pose = Eigen::Matrix4f::Identity();
     std::vector<Eigen::Matrix4f> keyframes;   // nearest first
+    const std::vector<Eigen::Matrix4f>* visited = nullptr;   // poses tracked Good (world-from-camera)
     GravityContext  gravity;
     const float*    live_depth = nullptr;     // meters, 0 = none
     int             live_w = 0, live_h = 0;
@@ -129,6 +166,7 @@ struct RelocOutcome {
     HypothesisSource source = HypothesisSource::LastGood;
     RelocReject      reject = RelocReject::None;
     int              candidates = 0, coarse_solves = 0, refines = 0;
+    float            eig_ratio = 0.0f;       // weakestDirectionRatio of `result`
 };
 
 class Relocalizer {
@@ -154,6 +192,13 @@ private:
         ICPResult        r;
         DepthConsistency c;
         HypothesisSource source;
+        float            coarse_fit = 0.0f;   // the coarse basin it was refined from
+        int              coarse_inliers = 0;
+    };
+    struct CoarseBasin {
+        Eigen::Matrix4f pose;
+        float           fit;
+        int             inliers;
     };
     struct Basin {
         Eigen::Matrix4f pose;
@@ -161,6 +206,7 @@ private:
     };
 
     bool blacklisted(const Eigen::Matrix4f& pose) const;
+    bool nearVisited(const Eigen::Matrix4f& pose, const RelocRequest& req) const;
     bool isLocal(const Eigen::Matrix4f& pose, const Eigen::Matrix4f& last_good) const;
     // Coarse-score `cands`, refine the best basins, verify them. Returns the
     // verified ones; tracks the best basin's reject reason and the carry-over.
@@ -178,6 +224,7 @@ private:
     RelocReject        best_basin_reject_ = RelocReject::None;
     bool               have_best_refined_ = false;
     ICPResult          best_refined_;
+    std::vector<CoarseBasin> run_basins_;   // every gradable coarse basin of this run
 };
 
 } // namespace tracking
