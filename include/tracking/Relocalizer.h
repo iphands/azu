@@ -61,6 +61,7 @@ enum class RelocReject : uint8_t {
     NoDepth,       // too little live depth to try
     Unsteady,      // a reading exists but the hand is accelerating: gravity cannot vouch for any pose
     Unvisited,     // farther than max_visited_distance_m from every position tracked before
+    Unconverged,   // the refine was still moving the pose when its rounds ran out
     EmptyModel,    // nothing fused yet
     NoCandidate,   // no candidate fitted at all
     Fit,           // best refined fit not Good
@@ -92,6 +93,22 @@ struct RelocParams {
     // Budget per lost frame, in candidates (counted, not timed: deterministic).
     int   sweep_budget          = 34;      // the whole sweep (GPU); 6 on CPU
     int   refine_top            = 3;       // 2 on CPU
+    // A refine that fits Good re-renders at its result and solves again until
+    // a round moves the pose less than refine_converged_* (at most
+    // refine_rounds solves).
+    // One solve against an image rendered at the coarse pose converges only
+    // partway: a cap_001 kidnap was accepted 141 mm / 9.4 deg off, and the
+    // next ~10 tracked frames pulled it in while integrating.
+    int   refine_rounds         = 4;
+    float refine_converged_m    = 0.005f;
+    float refine_converged_deg  = 0.25f;
+    // If the last round still moved it more than this, the pose is not taken
+    // on this frame; the carry-over candidate resumes from it on the next.
+    // Along a weakly constrained direction each solve slides only 1-4 cm (a
+    // cap_001 kidnap in 1 run of 4 was taken 165 mm / 10.8 deg off and
+    // integrated while it slid in).
+    float refine_settled_m      = 0.02f;
+    float refine_settled_deg    = 1.0f;
     bool  use_sweep             = true;
     SweepParams sweep;
     float keep_unsnapped_deg    = 4.0f;    // also try last_good as tracked when snapping moved it more
@@ -165,7 +182,7 @@ struct RelocOutcome {
     DepthConsistency consistency;
     HypothesisSource source = HypothesisSource::LastGood;
     RelocReject      reject = RelocReject::None;
-    int              candidates = 0, coarse_solves = 0, refines = 0;
+    int              candidates = 0, coarse_solves = 0, refines = 0;   // refines: refine solves
     float            eig_ratio = 0.0f;       // weakestDirectionRatio of `result`
 };
 

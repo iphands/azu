@@ -14,6 +14,7 @@ const char* relocRejectName(RelocReject r) {
         case RelocReject::NoDepth:     return "no_depth";
         case RelocReject::Unsteady:    return "unsteady";
         case RelocReject::Unvisited:   return "unvisited";
+        case RelocReject::Unconverged: return "unconverged";
         case RelocReject::EmptyModel:  return "empty_model";
         case RelocReject::NoCandidate: return "no_candidate";
         case RelocReject::Fit:         return "fit";
@@ -260,9 +261,21 @@ std::vector<Relocalizer::Verified> Relocalizer::evaluate(const std::vector<Hypot
     // of the best-supported basin seen in this run.
     const int top = std::min(static_cast<int>(basins.size()), std::max(1, p_.refine_top));
     for (int i = 0; i < top; ++i) {
-        const ModelFrame& mr = be.render(basins[i].r.pose, RenderSize::Refine, false);
-        const ICPResult rr = be.solve(mr, basins[i].r.pose, req.icp);
+        ICPResult rr = be.solve(be.render(basins[i].r.pose, RenderSize::Refine, false), basins[i].r.pose, req.icp);
         ++out.refines;
+        // Only a basin that already fits Good can be accepted, so only that
+        // one is worth converging (the others mostly keep sliding).
+        const bool converge = rr.pose.allFinite() && classifyFit(rr) == TrackQuality::Good;
+        bool settled = !converge || p_.refine_rounds <= 1;
+        for (int round = 1; converge && round < p_.refine_rounds; ++round) {
+            const ICPResult next = be.solve(be.render(rr.pose, RenderSize::Refine, false), rr.pose, req.icp);
+            ++out.refines;
+            if (!next.pose.allFinite() || classifyFit(next) == TrackQuality::Failed) break;
+            const PoseGap step = poseGap(rr.pose, next.pose);
+            rr = next;
+            settled = step.trans_m < p_.refine_settled_m && step.rot_deg < p_.refine_settled_deg;
+            if (step.trans_m < p_.refine_converged_m && step.rot_deg < p_.refine_converged_deg) break;
+        }
         if (rr.pose.allFinite() && (!have_best_refined_ || rr.inliers > best_refined_.inliers)) {
             best_refined_ = rr;
             have_best_refined_ = true;
@@ -271,6 +284,8 @@ std::vector<Relocalizer::Verified> Relocalizer::evaluate(const std::vector<Hypot
         DepthConsistency c;
         if (classifyFit(rr) != TrackQuality::Good) {
             why = RelocReject::Fit;
+        } else if (!settled) {
+            why = RelocReject::Unconverged;
         } else if (!GravityContext::allowsReacquire(g.judge(rr.pose))) {
             why = RelocReject::Gravity;
         } else if (weakestDirectionRatio(rr.information) < p_.min_eig_ratio) {
