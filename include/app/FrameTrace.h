@@ -36,6 +36,8 @@ struct FrameTraceRow {
     float    ms_preprocess = 0.0f, ms_icp = 0.0f, ms_track = 0.0f;
     // integration
     float    ms_integrate = 0.0f, ms_raycast = 0.0f;
+    // gravity (tracking/Gravity.h): pose vs accelerometer, -1 = not measurable
+    float    tilt_err_deg = -1.0f;
 };
 
 class FrameTrace {

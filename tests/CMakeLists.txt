@@ -385,6 +385,13 @@ target_link_libraries(rolling_shutter_contract PRIVATE azu_test_core)
 add_test(NAME rolling_shutter_contract COMMAND rolling_shutter_contract)
 set_tests_properties(rolling_shutter_contract PROPERTIES LABELS cpu TIMEOUT 60)
 
+# big-fix-two T3.13: accelerometer mapping and the tilt gate.
+add_executable(gravity_contract gravity_contract.cpp)
+target_compile_definitions(gravity_contract PRIVATE ${AZU_TEST_DEFS})
+target_link_libraries(gravity_contract PRIVATE azu_test_core)
+add_test(NAME gravity_contract COMMAND gravity_contract)
+set_tests_properties(gravity_contract PROPERTIES LABELS cpu TIMEOUT 60)
+
 # big-fix-two T0.13: loss -> relocalization -> recovery, with a live preview
 # while lost.
 add_executable(pipeline_relocalization_contract pipeline_relocalization_contract.cpp)
@@ -393,6 +400,14 @@ target_include_directories(pipeline_relocalization_contract PRIVATE ${CMAKE_CURR
 target_link_libraries(pipeline_relocalization_contract PRIVATE azu_test_pipeline)
 add_test(NAME pipeline_relocalization_contract COMMAND pipeline_relocalization_contract)
 set_tests_properties(pipeline_relocalization_contract PROPERTIES LABELS cpu TIMEOUT 180)
+
+# big-fix-two T3.13: gravity-checked relocalization, probation, no replayed jump.
+add_executable(pipeline_gravity_contract pipeline_gravity_contract.cpp)
+target_compile_definitions(pipeline_gravity_contract PRIVATE ${AZU_TEST_DEFS})
+target_include_directories(pipeline_gravity_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(pipeline_gravity_contract PRIVATE azu_test_pipeline)
+add_test(NAME pipeline_gravity_contract COMMAND pipeline_gravity_contract)
+set_tests_properties(pipeline_gravity_contract PROPERTIES LABELS cpu TIMEOUT 240)
 
 # big-fix-two T0.4: end-to-end smoke through the REAL sensor path, with
 # libfakenect preloaded replaying a dump generated from the synthetic room.
@@ -1604,7 +1619,7 @@ endif()
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     foreach(_azu_scene_test icp_refpose_contract pipeline_trajectory_contract
                             pipeline_relocalization_contract pipeline_spin_contract
-                            rolling_shutter_contract)
+                            rolling_shutter_contract pipeline_gravity_contract)
         target_compile_options(${_azu_scene_test} PRIVATE -O2)
     endforeach()
 endif()

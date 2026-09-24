@@ -52,6 +52,7 @@ PipelineController::PipelineController(sensor::PreprocessBackend preferred_backe
     if (const char* rel = std::getenv("AZU_DEGENERACY_REL")) degeneracy_rel_ = std::strtof(rel, nullptr);
     if (const char* mm = std::getenv("AZU_MOTION_MODEL")) velocity_motion_model_ = std::string(mm) == "velocity";
     if (const char* rs = std::getenv("AZU_RS_READOUT_MS")) rs_readout_ms_ = std::strtof(rs, nullptr);
+    if (const char* g = std::getenv("AZU_GRAVITY_TILT_DEG")) gravity_gate_.max_tilt_deg = std::strtof(g, nullptr);
 }
 
 PipelineController::~PipelineController() {
@@ -988,6 +989,8 @@ void PipelineController::trackingLoopBody() {
     frame->frame_id = raw->frame_id;
     frame->rgb_valid = raw->rgb_valid;
     frame->timestamp_ms = raw->timestamp_depth;
+    const bool have_reading = raw->accel_valid;
+    const Eigen::Vector3f up_cam = tracking::accelUpInCamera(raw->accel);
 
     // Rolling-shutter unwarp with the constant-velocity step (experiment,
     // AZU_RS_READOUT_MS; sensor/RollingShutter.h).
@@ -1034,6 +1037,12 @@ void PipelineController::trackingLoopBody() {
     if (first_frame_) {
         first_frame_ = false;
         frame->pose = Eigen::Matrix4f::Identity();
+        // The first camera is the world, so its measured up is world up.
+        have_up_ = have_reading;
+        if (have_reading) {
+            up_world_ = up_cam.normalized();
+            up_ref_norm_ = up_cam.norm();
+        }
         const uint64_t origin_id = frame->frame_id;
         const double origin_t_ms = frame->timestamp_ms;
         // Sole ownership moves into the queue; the previous copy handed this
@@ -1156,6 +1165,17 @@ void PipelineController::trackingLoopBody() {
         gpu_lk = std::unique_lock<std::mutex>(gpu_mutex_);
     std::unique_lock<std::mutex> tracker_lk(tracker_mutex_);
 
+    const auto judgeGravity = [&](const Eigen::Matrix4f& pose, float* tilt_deg) {
+        return tracking::judgeGravity(pose, have_up_, up_world_, up_ref_norm_, have_reading, up_cam,
+                                      gravity_gate_, tilt_deg);
+    };
+    // While lost, a pose may not contradict gravity, and a reading bent by a
+    // hand that is accelerating cannot vouch for one. Without any reading (no
+    // accelerometer, synthetic input) there is nothing to check.
+    const auto gravityAllowsReacquire = [](tracking::GravityVerdict v) {
+        return v == tracking::GravityVerdict::Agree || v == tracking::GravityVerdict::Unknown;
+    };
+
     if (is_lost) {
       // RELOCALIZATION: score many starting poses cheaply at the coarsest
       // pyramid level, then refine the best one with the normal parameters.
@@ -1198,8 +1218,9 @@ void PipelineController::trackingLoopBody() {
       for (const auto& h_pose : hypotheses) {
           const tracking::ICPResult res = solve(h_pose);
           const bool graded =
-              tracking::classifyTracking(res, prev_pose) != tracking::TrackQuality::Failed;
-          // Prefer any gradable result; among equals, the most inliers.
+              tracking::classifyTracking(res, prev_pose) != tracking::TrackQuality::Failed &&
+              gravityAllowsReacquire(judgeGravity(res.pose, nullptr));
+          // Prefer any gradable result (fit and gravity); among equals, the most inliers.
           if ((graded && !best_graded) ||
               (graded == best_graded && res.inliers > best_coarse.inliers)) {
               best_coarse = res;
@@ -1257,6 +1278,19 @@ void PipelineController::trackingLoopBody() {
     // relocalization hypothesis is usually a wrong basin (cap_001: re-acquired
     // at 35 mm RMS with a 17 deg tilt error, then integrated a rotated copy).
     if (is_lost && quality == tracking::TrackQuality::Poor) quality = tracking::TrackQuality::Failed;
+    // ...and only on a pose that agrees with gravity (cap_001: re-acquired at
+    // 87-93 deg tilt error, likely the floor fitted to a wall, then integrated it).
+    float tilt_err = -1.0f;
+    const tracking::GravityVerdict gravity = judgeGravity(icp_result.pose, &tilt_err);
+    if (is_lost && quality != tracking::TrackQuality::Failed && !gravityAllowsReacquire(gravity)) {
+        quality = tracking::TrackQuality::Failed;
+    }
+    // While tracking, a Good fit that disagrees with gravity follows the camera
+    // but is not integrated (correct poses stay under ~7 deg: cap_001 p99 6.9).
+    if (!is_lost && quality == tracking::TrackQuality::Good &&
+        gravity == tracking::GravityVerdict::Disagree) {
+        quality = tracking::TrackQuality::Poor;
+    }
 
     if (trace_.isOpen()) {
         FrameTraceRow row;
@@ -1279,6 +1313,7 @@ void PipelineController::trackingLoopBody() {
         row.model_frame_id = model_ref->source_frame_id;
         row.outside_volume = outsideVolumeFraction(*frame, icp_result.pose, hp.tsdf);
         row.degenerate_dofs = degenerate_dofs;
+        row.tilt_err_deg = tilt_err;
         row.ms_preprocess = ms_preprocess;
         row.ms_icp = ms_icp;
         row.ms_track = duration<float, std::milli>(steady_clock::now() - t_frame).count();
@@ -1372,6 +1407,13 @@ void PipelineController::trackingLoopBody() {
             frames_since_tracked_ = 0;
             frame->pose = icp_result.pose;
             state_.store(PipelineState::Running);
+            // First frame had no reading: take the reference from the first
+            // Good frame that has one.
+            if (!have_up_ && have_reading && quality == tracking::TrackQuality::Good) {
+                up_world_ = (icp_result.pose.block<3,3>(0,0) * up_cam).normalized();
+                up_ref_norm_ = up_cam.norm();
+                have_up_ = true;
+            }
 
             if (integrate) {
                 // Enqueue for integration (retain-latest, sole owner moves in).

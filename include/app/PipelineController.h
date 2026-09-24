@@ -16,6 +16,7 @@
 #include "sensor/KinectSensor.h"
 #include "sensor/FrameData.h"
 #include "sensor/Preprocessor.h"
+#include "tracking/Gravity.h"
 #include "tracking/ICPTracker.h"
 #include "tsdf/TSDFVolume.h"
 #include "meshing/MarchingCubes.h"
@@ -212,6 +213,14 @@ private:
     bool                       velocity_motion_model_ = false;   // AZU_MOTION_MODEL=velocity (opt-in)
     float                      rs_readout_ms_ = 0.0f;            // AZU_RS_READOUT_MS (experiment, 0 = off)
     std::vector<uint16_t>      rs_buf_;
+    // Gravity (tracking/Gravity.h), tracking thread only: up in world axes and
+    // the accelerometer's rest magnitude, from the first frame when it carries
+    // a reading (else the first Good frame that does). AZU_GRAVITY_TILT_DEG
+    // sets the relocalization gate; 0 turns it off.
+    bool                       have_up_ = false;
+    Eigen::Vector3f            up_world_{0.0f, -1.0f, 0.0f};
+    float                      up_ref_norm_ = 0.0f;
+    tracking::GravityGate      gravity_gate_;
     mutable std::mutex         pose_mutex_;
 
     // Metrics
