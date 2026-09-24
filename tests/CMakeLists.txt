@@ -378,6 +378,13 @@ target_link_libraries(tracking_policy_contract PRIVATE azu_test_core)
 add_test(NAME tracking_policy_contract COMMAND tracking_policy_contract)
 set_tests_properties(tracking_policy_contract PROPERTIES LABELS cpu TIMEOUT 60)
 
+add_executable(rolling_shutter_contract rolling_shutter_contract.cpp)
+target_compile_definitions(rolling_shutter_contract PRIVATE ${AZU_TEST_DEFS})
+target_include_directories(rolling_shutter_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(rolling_shutter_contract PRIVATE azu_test_core)
+add_test(NAME rolling_shutter_contract COMMAND rolling_shutter_contract)
+set_tests_properties(rolling_shutter_contract PROPERTIES LABELS cpu TIMEOUT 60)
+
 # big-fix-two T0.13: loss -> relocalization -> recovery, with a live preview
 # while lost.
 add_executable(pipeline_relocalization_contract pipeline_relocalization_contract.cpp)
@@ -1596,7 +1603,8 @@ endif()
 # timeouts. Same -O2 Debug harness tuning as azu_test_core/azu_test_pipeline.
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     foreach(_azu_scene_test icp_refpose_contract pipeline_trajectory_contract
-                            pipeline_relocalization_contract pipeline_spin_contract)
+                            pipeline_relocalization_contract pipeline_spin_contract
+                            rolling_shutter_contract)
         target_compile_options(${_azu_scene_test} PRIVATE -O2)
     endforeach()
 endif()

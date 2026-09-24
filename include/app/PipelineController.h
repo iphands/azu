@@ -210,6 +210,8 @@ private:
     Eigen::Matrix4f            velocity_{Eigen::Matrix4f::Identity()};
     int                        frames_since_tracked_ = 0;
     bool                       velocity_motion_model_ = false;   // AZU_MOTION_MODEL=velocity (opt-in)
+    float                      rs_readout_ms_ = 0.0f;            // AZU_RS_READOUT_MS (experiment, 0 = off)
+    std::vector<uint16_t>      rs_buf_;
     mutable std::mutex         pose_mutex_;
 
     // Metrics

@@ -5,6 +5,7 @@
 #include "export/PLYExporter.h"
 #include "utils/Logger.h"
 #include "utils/Timer.h"
+#include "sensor/RollingShutter.h"
 #include "sensor/SuperResolution.h"
 #include <QCoreApplication>
 #include <algorithm>
@@ -50,6 +51,7 @@ PipelineController::PipelineController(sensor::PreprocessBackend preferred_backe
     if (const char* trace = std::getenv("AZU_TRACE")) trace_path_ = trace;
     if (const char* rel = std::getenv("AZU_DEGENERACY_REL")) degeneracy_rel_ = std::strtof(rel, nullptr);
     if (const char* mm = std::getenv("AZU_MOTION_MODEL")) velocity_motion_model_ = std::string(mm) == "velocity";
+    if (const char* rs = std::getenv("AZU_RS_READOUT_MS")) rs_readout_ms_ = std::strtof(rs, nullptr);
 }
 
 PipelineController::~PipelineController() {
@@ -985,6 +987,20 @@ void PipelineController::trackingLoopBody() {
     frame->rgb_valid = raw->rgb_valid;
     frame->timestamp_ms = raw->timestamp_depth;
 
+    // Rolling-shutter unwarp with the constant-velocity step (experiment,
+    // AZU_RS_READOUT_MS; sensor/RollingShutter.h).
+    if (rs_readout_ms_ != 0.0f && !first_frame_ && state_.load() != PipelineState::TrackingLost) {
+        Eigen::Matrix4f step;
+        {
+            std::lock_guard<std::mutex> lk(pose_mutex_);
+            step = last_pose_.inverse() * current_pose_;
+        }
+        rs_buf_.resize(raw->depth.size());
+        sensor::unwarpRollingShutter(raw->depth.data(), rs_buf_.data(), sensor::DEPTH_WIDTH,
+                                     sensor::DEPTH_HEIGHT, intrinsics_, step, rs_readout_ms_ * 1e-3f,
+                                     1.0f / 29.97f, hp.min_depth, hp.max_depth);
+        raw->depth.swap(rs_buf_);
+    }
     if (preprocessor_) {
         std::lock_guard<std::mutex> pp_lk(preprocessor_mutex_);
         preprocessor_->process(*raw, hp.min_depth, hp.max_depth);
