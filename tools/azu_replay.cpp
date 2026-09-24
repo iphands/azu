@@ -18,9 +18,11 @@
 // last frame registered against a model fused from only the first frames).
 //
 // usage: azu_replay <recording_dir> [--out DIR] [--backend auto|cpu|cuda]
-//                   [--preset helmet|chair|room|human] [--intrinsics device|legacy]
+//                   [--preset room|helmet|chair|human|none] [--intrinsics device|legacy]
 //                   [--volume front|centred] [--res N] [--voxel M]
 //                   [--min-depth M] [--max-depth M] [--max-frames N] [--quiet]
+// The preset defaults to room (recordings are turns in place); `none` keeps
+// the pipeline defaults with a front-anchored 256^3 x 1 cm object volume.
 #include "FakenectRecording.h"
 #include "app/PipelineController.h"
 #include "gui/FusionUiModel.h"
@@ -53,7 +55,7 @@ using Clock = std::chrono::steady_clock;
 constexpr double kGravity    = 9.80665;
 
 struct Options {
-    std::string dir, out = "replay-out", backend = "auto", volume = "front", preset;
+    std::string dir, out = "replay-out", backend = "auto", volume = "front", preset = "room";
     std::string intrinsics = "device";
     int res = 0, max_frames = 0;
     float voxel = 0.0f, min_depth = 0.0f, max_depth = 0.0f;
@@ -124,7 +126,7 @@ int main(int argc, char** argv) {
     if (!parseArgs(argc, argv, opt)) {
         std::fprintf(stderr,
                      "usage: azu_replay <recording_dir> [--out DIR] [--backend auto|cpu|cuda]\n"
-                     "                  [--preset helmet|chair|room|human] [--intrinsics device|legacy]\n"
+                     "                  [--preset room|helmet|chair|human|none] [--intrinsics device|legacy]\n"
                      "                  [--volume front|centred] [--res N] [--voxel M]\n"
                      "                  [--min-depth M] [--max-depth M] [--max-frames N] [--quiet]\n");
         return 2;
@@ -145,7 +147,7 @@ int main(int argc, char** argv) {
     // --preset applies the GUI preset (volume placement included); --volume,
     // --res, --voxel and the depth band then override it only when given.
     bool placed_by_preset = false;
-    if (!opt.preset.empty()) {
+    if (opt.preset != "none") {
         const std::pair<const char*, gui::FusionPreset> names[] = {
             {"helmet", gui::FusionPreset::kHelmet}, {"chair", gui::FusionPreset::kChair},
             {"room", gui::FusionPreset::kRoom}, {"human", gui::FusionPreset::kHuman}};
@@ -157,7 +159,7 @@ int main(int argc, char** argv) {
             }
         }
         if (!found) {
-            std::fprintf(stderr, "unknown --preset %s (helmet|chair|room|human)\n", opt.preset.c_str());
+            std::fprintf(stderr, "unknown --preset %s (room|helmet|chair|human|none)\n", opt.preset.c_str());
             return 2;
         }
     }
@@ -203,9 +205,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     const std::string backend_label = pc.metricsSnapshot().backend;
-    std::printf("replay %s: backend %s, volume %s %d^3 x %.3f m (%.2f m), depth %.2f-%.2f m, "
+    std::printf("replay %s: backend %s, preset %s, volume %s %d^3 x %.3f m (%.2f m), depth %.2f-%.2f m, "
                 "fx %.1f (%s)\n",
-                opt.dir.c_str(), backend_label.c_str(), opt.volume.c_str(), hp.tsdf.resolution,
+                opt.dir.c_str(), backend_label.c_str(), opt.preset.c_str(), opt.volume.c_str(), hp.tsdf.resolution,
                 hp.tsdf.voxel_size, extent, hp.min_depth, hp.max_depth, K.fx, intr_source.c_str());
 
     // ---- pairing through the real sensor code
