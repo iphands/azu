@@ -111,15 +111,12 @@ Run run(const azu_test::SyntheticScene& scene, int bad_from, int bad_to, float r
         else if (i < 30) truth = away;
         else             truth = last_good * offset * smooth(i - 30);
         const bool bad = i >= bad_from && i < bad_to;
-        const uint64_t before = pc.trackedFrameCountForTests();
+        // Lockstep: the frame is graded, and if integrated also raycast, before
+        // the next one (a fixed settle time let a pre-loss integration land late
+        // under load and look like the re-acquired frame).
         pc.injectRawFrameForTests(rawFrom(scene.renderDepth(truth), static_cast<uint64_t>(i + 1),
                                           bad ? Eigen::Matrix4f(truth * roll) : truth));
-        const auto deadline = std::chrono::steady_clock::now() + 3s;
-        while (i > 0 && pc.trackedFrameCountForTests() == before &&
-               std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(2ms);
-        }
-        std::this_thread::sleep_for(60ms);   // let an enqueued frame integrate
+        CHECK(pc.waitIdle(10s), "frame handled in time");
         const auto m = pc.metricsSnapshot();
         r.integrated.push_back(m.integrated_frames);
         if (m.state == PipelineState::TrackingLost) r.entered_lost = true;
@@ -156,7 +153,7 @@ int main() {
                     a.integrated[at + 3], a.integrated[at + 4], a.integrated[at + 5]);
         CHECK(a.integrated[at + 2] == a.integrated[at - 1],
               "C: the re-acquired frame and the next two are not integrated");
-        CHECK(a.integrated[at + 6] > a.integrated[at + 2], "C: integration resumes after probation");
+        CHECK(a.integrated[at + 3] > a.integrated[at + 2], "C: integration resumes right after probation");
     } else {
         CHECK(false, "C: recovery early enough to observe probation");
     }
